@@ -51,6 +51,7 @@ def from_pretrained(
     else:
         # Convert and save
         if path_backend == "torch":
+            from nequix.torch_impl.model import load_model as load_model_torch
             from nequix.torch_impl.utils import convert_model_torch_to_jax
 
             torch_model, torch_config = load_model_torch(model_path, use_kernel)
