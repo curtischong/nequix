@@ -1,6 +1,6 @@
 [project]
 name = "nequix"
-version = "0.4.3"
+version = "0.4.4"
 description = "Nequix source code"
 readme = "README.md"
 authors = [
@@ -69,6 +69,7 @@ torch = [
   "setuptools",
 ]
 torch-sim = [
+  "nequix[torch]",
   "torch-sim-atomistic>=0.5.2; python_version >= '3.12'",
   "torch>=2.8.0; python_version >= '3.12'",
 ]
