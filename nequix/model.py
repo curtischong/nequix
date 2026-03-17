@@ -11,22 +11,6 @@ import jraph
 
 from nequix.layer_norm import RMSLayerNorm
 
-try:
-    import torch  # noqa: F401
-except ImportError:
-    # allow openequivariance to be imported without torch, but only if it is not
-    # installed; otherwise, the torch backend won't work if users want to use
-    # both torch and jax.
-    os.environ["OEQ_NOTORCH"] = "1"
-
-try:
-    import openequivariance as oeq
-    import openequivariance_extjax  # noqa: F401
-
-    OEQ_AVAILABLE = True
-except ImportError:
-    OEQ_AVAILABLE = False
-
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
     prefactor = 2.0 / r_max
@@ -179,14 +163,26 @@ class NequixConvolution(eqx.Module):
         self.tp_irreps = tp_irreps
 
         if kernel:
-            instructions = [instructions[i] for i in inv]
-            if not OEQ_AVAILABLE:
+            try:
+                import torch  # noqa: F401
+            except ImportError:
+                # allow openequivariance to be imported without torch, but only if it is not
+                # installed; otherwise, the torch backend won't work if users want to use
+                # both torch and jax.
+                os.environ["OEQ_NOTORCH"] = "1"
+
+            try:
+                import openequivariance as oeq
+                import openequivariance_extjax  # noqa: F401
+            except ImportError:
                 raise ImportError(
                     "OpenEquivariance with JAX support is required for kernel=True. "
                     "Install both packages:\n"
                     "  uv pip install 'openequivariance[jax]'\n"
                     "  uv pip install 'openequivariance_extjax' --no-build-isolation"
                 )
+
+            instructions = [instructions[i] for i in inv]
             problem = oeq.TPProblem(
                 str(input_irreps),
                 str(sh_irreps),

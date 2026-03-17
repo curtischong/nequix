@@ -8,7 +8,7 @@ from ase.build import bulk
 
 from nequix.calculator import NequixCalculator
 from nequix.data import atomic_numbers_to_indices
-from nequix.model import OEQ_AVAILABLE
+from tests.test_calculator import OEQ_AVAILABLE
 
 try:
     from jax_md import quantity, space
