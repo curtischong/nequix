@@ -4,7 +4,14 @@ import torch
 import ase.build
 
 from nequix.calculator import NequixCalculator
-from nequix.model import OEQ_AVAILABLE
+
+try:
+    import openequivariance  # noqa: F401
+    import openequivariance_extjax  # noqa: F401
+
+    OEQ_AVAILABLE = True
+except (ImportError, AssertionError):
+    OEQ_AVAILABLE = False
 
 skip_no_oeq = pytest.mark.skipif(not OEQ_AVAILABLE, reason="OpenEquivariance not installed")
 
