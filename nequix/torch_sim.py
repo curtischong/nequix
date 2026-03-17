@@ -17,7 +17,6 @@ try:
     import torch_sim as ts
     from torch_sim.models.interface import ModelInterface
     from torch_sim.neighbors import torchsim_nl
-    from torch_sim.typing import StateDict
 except ImportError:
     raise ImportError(
         "torch-sim is not installed. Please install it using `pip install torch-sim-atomistic`."
@@ -81,7 +80,7 @@ class NequixTorchSimModel(ModelInterface):
             z_table[z] = idx
         self._z_to_species = z_table
 
-    def forward(self, state: ts.SimState | StateDict) -> dict[str, torch.Tensor]:
+    def forward(self, state: ts.SimState) -> dict[str, torch.Tensor]:
         """Compute energies, forces, and stresses for the given atomic systems.
 
         Args:
