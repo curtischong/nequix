@@ -8,7 +8,6 @@ from pathlib import Path
 from pprint import pformat
 
 import ase
-import ase.db
 from atompack import Database
 from ase.geometry import complete_cell
 from ase.stress import voigt_6_to_full_3x3_stress
@@ -195,36 +194,6 @@ class ConcatDataset(Dataset):
         return self.datasets[ds_idx]._get_graph_dict(idx)
 
 
-# aselmdb dataset for loading omat/omal/odac/salex databases from fairchem
-# based on https://github.com/facebookresearch/fairchem/blob/ccc1416/src/fairchem/core/datasets/ase_datasets.py#L382
-class AseDBDataset(Dataset):
-    def __init__(
-        self, file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
-    ):
-        super().__init__(backend=backend)
-        self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
-        self.file_path = Path(file_path)
-        self.cutoff = cutoff
-        if self.file_path.is_dir():
-            files = sorted(self.file_path.rglob("*.aselmdb"))
-            self.dbs = [ase.db.connect(fp, readonly=True, use_lock_file=False) for fp in files]
-        else:
-            self.dbs = [ase.db.connect(file_path, readonly=True, use_lock_file=False)]
-        self.db_ids = [db.ids for db in self.dbs]
-        self.id_cumulative = np.cumsum([len(ids) for ids in self.db_ids])
-
-    def __len__(self):
-        return self.id_cumulative[-1]
-
-    def _get_graph_dict(self, idx: int):
-        db_idx = bisect.bisect(self.id_cumulative, idx)
-        if db_idx > 0:
-            idx = idx - self.id_cumulative[db_idx - 1]
-        atoms = self.dbs[db_idx]._get_row(self.db_ids[db_idx][idx]).toatoms()
-        graph = preprocess_graph(atoms, self.atomic_indices, self.cutoff, True)
-        return graph
-
-
 class AtomPackDataset(Dataset):
     """Random-access AtomPack dataset, reopened independently in each worker process."""
 
@@ -257,8 +226,10 @@ class AtomPackDataset(Dataset):
             self._database_pid = pid
         return self._database
 
-    def _get_graph_dict(self, idx: int):
-        molecule = self._get_database().get_molecule(idx)
+    def _get_molecule(self, idx: int):
+        return self._get_database().get_molecule(idx)
+
+    def _molecule_to_graph_dict(self, molecule, idx: int):
         if molecule.energy is None or molecule.forces is None:
             raise ValueError(
                 f"AtomPack training record {idx} in {self.file_path} must contain energy and forces"
@@ -267,9 +238,7 @@ class AtomPackDataset(Dataset):
         positions = np.asarray(molecule.positions)
         atomic_numbers = np.asarray(molecule.atomic_numbers)
         pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
-        raw_cell = (
-            np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
-        )
+        raw_cell = np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
         cell = complete_cell(raw_cell)
         src, dst, shift = matscipy.neighbours.neighbour_list(
             "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
@@ -299,19 +268,15 @@ class AtomPackDataset(Dataset):
             graph["stress"] = stress.astype(np.float32)
         return graph
 
+    def _get_graph_dict(self, idx: int):
+        return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
+
 
 def dataset_from_path(
     file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
 ) -> Dataset:
-    """Prefer an explicit or sibling AtomPack file, with ASE DB compatibility as fallback."""
-    path = Path(file_path)
-    atompack_path = path if path.suffix == ".atp" else path.with_suffix(".atp")
-    if atompack_path.is_file():
-        dataset_type = AtomPackDataset
-        file_path = str(atompack_path)
-    else:
-        dataset_type = AseDBDataset
-    return dataset_type(
+    """Open an AtomPack training dataset."""
+    return AtomPackDataset(
         file_path=file_path,
         atomic_numbers=atomic_numbers,
         cutoff=cutoff,

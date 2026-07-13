@@ -1,9 +1,14 @@
 import numpy as np
 import pytest
+from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io import write
 from atompack import Database, Molecule
 
 from nequix.data import AtomPackDataset, Dataset, dataset_from_path
+from nequix.pft.data import PhononDataset
 from nequix.train_utils import wandb_run_name
+from scripts.preprocess_data import preprocess
 
 
 class _RangeDataset(Dataset):
@@ -46,8 +51,7 @@ def test_atompack_dataset_builds_graph(tmp_path):
     )
     database.flush()
 
-    # The extensionless split path should prefer its sibling train.atp file.
-    dataset = dataset_from_path(str(path.with_suffix("")), [1, 8], cutoff=1.5, backend="dict")
+    dataset = dataset_from_path(str(path), [1, 8], cutoff=1.5, backend="dict")
     graph = dataset[0]
 
     assert isinstance(dataset, AtomPackDataset)
@@ -56,6 +60,49 @@ def test_atompack_dataset_builds_graph(tmp_path):
     assert graph["forces"].shape == (2, 3)
     assert graph["stress"].shape == (3, 3)
     assert graph["n_edge"].item() == 2
+
+
+def test_extxyz_preprocessor_writes_atompack(tmp_path):
+    input_path = tmp_path / "input.extxyz"
+    output_path = tmp_path / "output.atp"
+    atoms = Atoms("HO", positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=-2.5,
+        forces=np.zeros((2, 3), dtype=np.float32),
+    )
+    write(input_path, atoms)
+
+    preprocess(input_path, output_path, n_workers=1)
+
+    database = Database.open(str(output_path))
+    molecule = database.get_molecule(0)
+    assert len(database) == 1
+    assert molecule.energy == pytest.approx(-2.5)
+    np.testing.assert_allclose(molecule.forces, 0.0)
+
+
+def test_phonon_dataset_reads_hessian_from_atompack(tmp_path):
+    path = tmp_path / "phonons.atp"
+    hessian = np.arange(36, dtype=np.float32).reshape(6, 6)
+    molecule = Molecule.from_arrays(
+        positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        atomic_numbers=np.array([1, 8], dtype=np.uint8),
+        energy=-1.5,
+        forces=np.zeros((2, 3), dtype=np.float32),
+        cell=np.eye(3, dtype=np.float64) * 5.0,
+        pbc=(True, True, True),
+    )
+    molecule.set_property("hessian", hessian)
+    database = Database(str(path), overwrite=True)
+    database.add_molecule(molecule)
+    database.flush()
+
+    dataset = PhononDataset(str(path), [1, 8], cutoff=1.5, random_col=False)
+    graph = dataset[0]
+
+    np.testing.assert_array_equal(graph.nodes["vs"], [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(graph.nodes["hessian_col"], hessian[:, 0].reshape(2, 3))
 
 
 def test_wandb_name_includes_fraction_and_schedule():

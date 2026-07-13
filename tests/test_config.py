@@ -1,4 +1,6 @@
+import json
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -16,6 +18,14 @@ EXPECTED_TRAINERS = {
     "nequix-omat-1": "jax",
 }
 
+DATA_PATH_KEYS = {
+    "train_path",
+    "valid_path",
+    "val_path",
+    "extra_train_path",
+    "extra_val_path",
+}
+
 
 def test_all_training_configs_are_registered():
     assert {name: config.trainer for name, config in RUNS.items()} == EXPECTED_TRAINERS
@@ -27,11 +37,21 @@ def test_config_dict_flattens_model_and_sequence_values():
     assert "model_config" not in config
     assert config["cutoff"] == 6.0
     assert config["hidden_irreps"] == "128x0e + 64x1o + 32x2e + 32x3o"
-    assert config["train_path"] == ["data/mptrj-aselmdb"] * 8 + ["data/salex/train"]
+    assert config["train_path"] == ["data/mptrj.atp"] * 8 + ["data/salex/train.atp"]
     assert config["atomic_numbers"][:3] == [1, 2, 3]
     assert config["finetune_from"] == "models/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
     assert all(value is not None for value in config.values())
+
+
+def test_bundled_model_metadata_uses_atompack_paths():
+    model_dir = Path(__file__).parents[1] / "models"
+    for model_path in model_dir.glob("*.nqx"):
+        with model_path.open("rb") as model_file:
+            config = json.loads(model_file.readline())
+        for key in DATA_PATH_KEYS & config.keys():
+            paths = config[key] if isinstance(config[key], list) else [config[key]]
+            assert all(path.endswith(".atp") for path in paths), (model_path, key, paths)
 
 
 @pytest.mark.parametrize("name", EXPECTED_TRAINERS)

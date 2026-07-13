@@ -11,7 +11,7 @@ import jraph
 import optax
 from nequix.config import PFTTrainerConfig, config_dict
 from nequix.data import (
-    AseDBDataset,
+    AtomPackDataset,
     ConcatDataset,
     DataLoader,
     dataset_stats,
@@ -218,7 +218,7 @@ def train(run_config: PFTTrainerConfig):
     opt_state = optim.init(model)
 
     if "displacement" in config and config["displacement"]:
-        train_dataset = AseDBDataset(
+        train_dataset = AtomPackDataset(
             file_path=config["train_path"],
             atomic_numbers=original_config["atomic_numbers"],
             cutoff=original_config["cutoff"],
@@ -241,7 +241,7 @@ def train(run_config: PFTTrainerConfig):
     if isinstance(config["extra_train_path"], list):
         extra_train_dataset = ConcatDataset(
             [
-                AseDBDataset(
+                AtomPackDataset(
                     file_path=path,
                     atomic_numbers=original_config["atomic_numbers"],
                     cutoff=original_config["cutoff"],
@@ -250,7 +250,7 @@ def train(run_config: PFTTrainerConfig):
             ]
         )
     else:
-        extra_train_dataset = AseDBDataset(
+        extra_train_dataset = AtomPackDataset(
             file_path=config["extra_train_path"],
             atomic_numbers=original_config["atomic_numbers"],
             cutoff=original_config["cutoff"],
@@ -260,7 +260,7 @@ def train(run_config: PFTTrainerConfig):
             valid_frac=config["extra_val_frac"]
         )
     else:
-        extra_val_dataset = AseDBDataset(
+        extra_val_dataset = AtomPackDataset(
             file_path=config["extra_val_path"],
             cutoff=original_config["cutoff"],
             atomic_numbers=original_config["atomic_numbers"],

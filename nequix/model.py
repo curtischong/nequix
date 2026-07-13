@@ -373,6 +373,25 @@ class Nequix(eqx.Module):
         senders: jax.Array,
         receivers: jax.Array,
     ):
+        node_energies, _ = self.node_energies_and_penultimate_features(
+            displacements, species, senders, receivers
+        )
+        return node_energies
+
+    def node_energies_and_penultimate_features(
+        self,
+        displacements: jax.Array,
+        species: jax.Array,
+        senders: jax.Array,
+        receivers: jax.Array,
+    ) -> tuple[jax.Array, e3nn.IrrepsArray]:
+        """Return energies and the features feeding the final scalar convolution.
+
+        The penultimate equivariant features are useful for auxiliary pre-training
+        heads. Keeping those heads outside :class:`Nequix` means their parameters can
+        be discarded while the energy backbone remains checkpoint-compatible with a
+        normal conservative model.
+        """
         # input features are one-hot encoded species
         features = e3nn.IrrepsArray(
             e3nn.Irreps(f"{self.n_species}x0e"), jax.nn.one_hot(species, self.n_species)
@@ -399,7 +418,10 @@ class Nequix(eqx.Module):
             normalization="component",
         )
 
-        for layer in self.layers:
+        penultimate_features = None
+        for i, layer in enumerate(self.layers):
+            if i == len(self.layers) - 1:
+                penultimate_features = features
             features = layer(
                 features,
                 species,
@@ -419,7 +441,8 @@ class Nequix(eqx.Module):
         # add isolated atom energies to each node as prior
         node_energies = node_energies + jax.lax.stop_gradient(self.atom_energies[species, None])
 
-        return node_energies.array
+        assert penultimate_features is not None
+        return node_energies.array, penultimate_features
 
     def __call__(self, data: jraph.GraphsTuple):
         if data.globals["cell"] is None:
@@ -491,6 +514,68 @@ class Nequix(eqx.Module):
             stress = jnp.where(graph_mask[:, None, None], stress, 0.0)
 
         return graph_energies[:, 0], -minus_forces, stress
+
+
+class DirectForceNequix(eqx.Module):
+    """Training-only direct-force head attached to a conservative Nequix backbone.
+
+    The force head consumes the equivariant features immediately before the
+    backbone's final scalar-only convolution. It is intentionally separate from the
+    backbone so a direct-force pre-training checkpoint can hand off ordinary Nequix
+    weights to conservative fine-tuning.
+    """
+
+    backbone: Nequix
+    force_readout: e3nn.equinox.Linear
+
+    def __init__(self, backbone: Nequix, hidden_irreps: str, *, key: jax.Array):
+        if len(backbone.layers) < 2:
+            raise ValueError("direct-force pre-training requires at least two model layers")
+        force_irreps = e3nn.Irreps(hidden_irreps)
+        if force_irreps.count("1o") == 0:
+            raise ValueError("direct-force pre-training requires 1o hidden features")
+
+        self.backbone = backbone
+        self.force_readout = e3nn.equinox.Linear(
+            irreps_in=force_irreps,
+            irreps_out="1o",
+            key=key,
+        )
+
+    def __call__(self, data: jraph.GraphsTuple):
+        positions = data.nodes["positions"]
+        displacements = positions[data.senders] - positions[data.receivers]
+        if data.globals["cell"] is not None:
+            cell_per_edge = jnp.repeat(
+                data.globals["cell"],
+                data.n_edge,
+                axis=0,
+                total_repeat_length=data.edges["shifts"].shape[0],
+            )
+            displacements = displacements + jnp.einsum(
+                "ij,ijk->ik", data.edges["shifts"], cell_per_edge
+            )
+
+        node_energies, features = self.backbone.node_energies_and_penultimate_features(
+            displacements,
+            data.nodes["species"],
+            data.senders,
+            data.receivers,
+        )
+        forces = self.force_readout(features).array
+        forces = jnp.where(jraph.get_node_padding_mask(data)[:, None], forces, 0.0)
+        graph_energies = jraph.segment_sum(
+            node_energies,
+            node_graph_idx(data),
+            num_segments=data.n_node.shape[0],
+            indices_are_sorted=True,
+        )
+        return graph_energies[:, 0], forces, None
+
+
+def conservative_backbone(model: Nequix | DirectForceNequix) -> Nequix:
+    """Return the inference model, dropping any training-only direct-force head."""
+    return model.backbone if isinstance(model, DirectForceNequix) else model
 
 
 def replace_normalization(

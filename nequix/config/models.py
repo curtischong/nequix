@@ -347,12 +347,14 @@ class TrainerConfig:
     energy_weight: float = 20.0
     force_weight: float = 20.0
     stress_weight: float = 5.0
+    force_mode: Literal["conservative", "direct"] = "conservative"
     loss_type: str = "mae"
     log_every: int = 100
     ema_decay: float = 0.999
     state_path: str | None = None
     resume_from: str | None = None
     finetune_from: str | None = None
+    checkpoint_path: str | None = None
     cache_dir: str | None = None
     run_name: str | None = None
     wandb_run_name: str | None = None

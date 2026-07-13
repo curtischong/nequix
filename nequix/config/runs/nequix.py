@@ -15,7 +15,7 @@ _MP = TrainerConfig(
     name="nequix-mp-1",
     trainer="jax",
     state_path="state.pkl",
-    train_path="data/mptrj-aselmdb",
+    train_path="data/mptrj.atp",
     valid_frac=0.05,
     dataset_name="mptrj",
     atomic_numbers=ATOMIC_NUMBERS,
@@ -37,9 +37,9 @@ _OMAT = replace(
     trainer="jax",
     state_path="checkpoints/nequix-omat-1-jax.pkl",
     resume_from="checkpoints/nequix-omat-1-jax.pkl",
-    train_path="data/omat/train",
+    train_path="data/omat/train.atp",
     valid_frac=None,
-    valid_path="data/omat/val",
+    valid_path="data/omat/val.atp",
     dataset_name="omat24",
     atom_energies=OMAT_ATOM_ENERGIES,
     avg_n_edges=736.2363228968411,
@@ -53,7 +53,29 @@ _OMAT = replace(
     n_epochs=6,
 )
 
-_OAM_TRAIN_PATHS = ("data/mptrj-aselmdb",) * 8 + ("data/salex/train",)
+_OMAT_CURRICULUM_DIRECT = replace(
+    _OMAT,
+    name="nequix-omat-foundation-direct",
+    state_path="checkpoints/nequix-omat-foundation-direct.pkl",
+    resume_from="checkpoints/nequix-omat-foundation-direct.pkl",
+    checkpoint_path="checkpoints/nequix-omat-foundation-direct.nqx",
+    force_mode="direct",
+    stress_weight=0.0,
+    n_epochs=2,
+)
+
+_OMAT_CURRICULUM_CONSERVATIVE = replace(
+    _OMAT,
+    name="nequix-omat-foundation-conservative",
+    state_path="checkpoints/nequix-omat-foundation-conservative.pkl",
+    resume_from="checkpoints/nequix-omat-foundation-conservative.pkl",
+    finetune_from="checkpoints/nequix-omat-foundation-direct.nqx",
+    checkpoint_path="checkpoints/nequix-omat-foundation-conservative.nqx",
+    force_mode="conservative",
+    n_epochs=2,
+)
+
+_OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
 _OAM = replace(
     _OMAT,
@@ -62,7 +84,7 @@ _OAM = replace(
     resume_from="checkpoints/nequix-oam-1-jax.pkl",
     finetune_from="models/nequix-omat-1.nqx",
     train_path=_OAM_TRAIN_PATHS,
-    valid_path="data/salex/val",
+    valid_path="data/salex/val.atp",
     dataset_name="oam",
     atom_energies=OAM_ATOM_ENERGIES,
     shift=-4.3250839528546265,
@@ -73,4 +95,10 @@ _OAM = replace(
 )
 
 
-RUNS: list[TrainerConfig] = [_MP, _OMAT, _OAM]
+RUNS: list[TrainerConfig] = [
+    _MP,
+    _OMAT,
+    _OMAT_CURRICULUM_DIRECT,
+    _OMAT_CURRICULUM_CONSERVATIVE,
+    _OAM,
+]

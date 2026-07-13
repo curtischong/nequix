@@ -1,35 +1,44 @@
-import multiprocessing
 import argparse
+import multiprocessing
 from pathlib import Path
 
-import ase.db
 import ase.io
-import numpy as np
+from atompack import Database, from_ase
 from tqdm import tqdm
 
 
-def save_atoms_to_ase_db(args):
-    db_file, file_list, worker_id = args
-    with ase.db.connect(db_file) as db:
-        for file in tqdm(file_list, position=worker_id):
-            atoms_list = ase.io.read(file, index=":")
-            for atoms in atoms_list:
-                db.write(atoms, data=atoms.info)
+def read_molecules(file_path):
+    atoms_list = ase.io.read(file_path, index=":")
+    return [from_ase(atoms, copy_info=False, copy_arrays=False) for atoms in atoms_list]
 
 
 def preprocess(file_path, output_path, n_workers=16):
     file_path = Path(file_path)
     output_path = Path(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix != ".atp":
+        raise ValueError(f"AtomPack output path must end in .atp: {output_path}")
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if file_path.is_dir():
         file_paths = sorted(file_path.rglob("*.extxyz"))
-        chunks = np.array_split(file_paths, n_workers)
-        db_files = [output_path / f"data_{i:04d}.aselmdb" for i in range(n_workers)]
-        tasks = [(db_files[i], chunks[i], i) for i in range(n_workers) if len(chunks[i])]
-        with multiprocessing.Pool(n_workers) as p:
-            p.map(save_atoms_to_ase_db, tasks)
     else:
-        save_atoms_to_ase_db((output_path / "data_0000.aselmdb", [file_path], 0))
+        file_paths = [file_path]
+    if not file_paths:
+        raise ValueError(f"No extxyz files found in {file_path}")
+
+    database = Database(str(output_path), overwrite=True)
+    if n_workers == 1 or len(file_paths) == 1:
+        molecule_groups = map(read_molecules, file_paths)
+        for molecules in tqdm(molecule_groups, total=len(file_paths)):
+            database.add_molecules(molecules)
+    else:
+        with multiprocessing.Pool(min(n_workers, len(file_paths))) as pool:
+            molecule_groups = pool.imap(read_molecules, file_paths)
+            for molecules in tqdm(molecule_groups, total=len(file_paths)):
+                database.add_molecules(molecules)
+    database.flush()
 
 
 def main():

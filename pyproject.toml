@@ -23,7 +23,6 @@ dependencies = [
     "h5py>=3.14.0",
     "wandb-osh>=1.2.2",
     "cloudpickle>=3.1.1",
-    "ase-db-backends",
     "atompack-db>=0.4.0",
 ]
 
@@ -57,7 +56,6 @@ dev = [
 line-length = 100
 
 [tool.uv.sources]
-ase-db-backends = { git = "https://gitlab.com/ase/ase-db-backends.git" }
 jax-md = { git = "https://github.com/jax-md/jax-md.git" }
 
 [project.optional-dependencies]

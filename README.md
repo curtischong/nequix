@@ -85,14 +85,12 @@ Run `uv run train --help` to list every available config name. New runs can reus
 existing recipe with `dataclasses.replace`, so shared model and dataset settings stay
 in one place without YAML inheritance or path handling.
 
-Training and validation paths ending in `.atp` are read directly with AtomPack. An
-existing sibling `.atp` file is also preferred automatically (for example,
-`train_path="data/omat/train"` uses `data/omat/train.atp` when present and otherwise
-retains the ASE DB fallback). The training subset is controlled with `train_frac` and
-sampled deterministically using `seed`. When `dataset_name` is set, W&B names include
-the data schedule. For example, `dataset_name="1m"`, `train_frac=0.25`,
-`n_epochs=4`, and `run_name="nequix_orig"` produce the W&B run name
-`1m25_4ep_nequix_orig`. Set `wandb_run_name` to override the generated name.
+Training and validation data is read exclusively from AtomPack `.atp` files. The
+training subset is controlled with `train_frac` and sampled deterministically using
+`seed`. When `dataset_name` is set, W&B names include the data schedule. For example,
+`dataset_name="1m"`, `train_frac=0.25`, `n_epochs=4`, and
+`run_name="nequix_orig"` produce the W&B run name `1m25_4ep_nequix_orig`. Set
+`wandb_run_name` to override the generated name.
 
 For JAX training with kernels:
 
@@ -126,10 +124,10 @@ https://figshare.com/files/43302033 into `data/` then run the following to extra
 bash data/download_mptrj.sh
 ```
 
-Preprocess the data into `.aselmdb` files:
+Preprocess the data into an AtomPack file:
 
 ```bash
-uv run scripts/preprocess_data.py data/mptrj-gga-ggapu data/mptrj-aselmdb
+uv run scripts/preprocess_data.py data/mptrj-gga-ggapu data/mptrj.atp
 ```
 
 Then start the training run:
@@ -167,14 +165,8 @@ Data for the PBE MDR phonon database was originally downloaded and preprocessed 
 ```bash
 bash data/download_pbe_mdr.sh
 uv run data/split_pbe_mdr.py
-uv run scripts/preprocess_data_phonopy.py data/pbe-mdr/train data/pbe-mdr/train-aselmdb
-uv run scripts/preprocess_data_phonopy.py data/pbe-mdr/val data/pbe-mdr/val-aselmdb
-```
-
-However we provide preprocessed data which can be downloaded with
-
-```bash
-bash data/download_pbe_mdr_preprocessed.sh
+uv run scripts/preprocess_data_phonopy.py data/mdr-pbe/train data/pbe-mdr/train.atp
+uv run scripts/preprocess_data_phonopy.py data/mdr-pbe/val data/pbe-mdr/val.atp
 ```
 
 To run PFT without co-training run:
@@ -183,7 +175,7 @@ To run PFT without co-training run:
 uv run train nequix-mp-1-pft-no-cotrain
 ```
 
-To run PFT *with* co-training run (note this requires `mptrj-aselmdb` preprocessed): 
+To run PFT *with* co-training (this also requires `data/mptrj.atp`):
 
 ```bash
 uv run train nequix-mp-1-pft
@@ -199,19 +191,15 @@ Both PFT training runs take about 140 hours on a single A100. Note that PFT trai
 
 ## Training OMat/OAM base models
 
-To reproduce our training runs for the OMat and OAM base models run the following. First download OMat and sAlex data:
+To reproduce our training runs for the OMat and OAM base models, prepare the
+following AtomPack files:
 
-
-```bash
-./data/download_omat.sh <path to storage location>
-```
-
-Then symlink to `./data`
-
-```bash
-ln -s <path to storage location>/omat ./data/omat
-ln -s <path to storage location>/salex ./data/salex
-ln -s <path to storage location>/mptrj-aselmdb ./data/mptrj-aselmdb
+```text
+data/omat/train.atp
+data/omat/val.atp
+data/salex/train.atp
+data/salex/val.atp
+data/mptrj.atp
 ```
 
 To train the OMat model, run:

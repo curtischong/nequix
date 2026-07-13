@@ -10,9 +10,9 @@ _MP_PFT = PFTTrainerConfig(
     state_path="checkpoints/nequix-mp-1-pft.pkl",
     resume_from="checkpoints/nequix-mp-1-pft.pkl",
     finetune_from="models/nequix-mp-1.nqx",
-    train_path="data/pbe-mdr/train-aselmdb",
-    val_path="data/pbe-mdr/val-aselmdb",
-    extra_train_path="data/mptrj-aselmdb",
+    train_path="data/pbe-mdr/train.atp",
+    val_path="data/pbe-mdr/val.atp",
+    extra_train_path="data/mptrj.atp",
     extra_val_frac=0.05,
     avg_n_edges=5418.453349001175,
     avg_n_nodes=104.9225616921269,
@@ -30,7 +30,7 @@ _MP_PFT_NO_COTRAIN = replace(
     energy_weight=20.0,
 )
 
-_OAM_TRAIN_PATHS = ("data/mptrj-aselmdb",) * 8 + ("data/salex/train",)
+_OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
 _OAM_PFT = replace(
     _MP_PFT,
@@ -40,7 +40,7 @@ _OAM_PFT = replace(
     finetune_from="models/nequix-oam-1.nqx",
     extra_train_path=_OAM_TRAIN_PATHS,
     extra_val_frac=None,
-    extra_val_path="data/salex/val",
+    extra_val_path="data/salex/val.atp",
     extra_energy_weight=750.0,
     n_epochs=200,
     val_every=5,
