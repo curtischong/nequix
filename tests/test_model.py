@@ -10,7 +10,9 @@ import pytest
 
 from nequix.layer_norm import RMSLayerNorm
 from nequix.model import (
+    DirectForceNequix,
     Nequix,
+    conservative_backbone,
     load_model,
     replace_normalization,
     save_model,
@@ -84,6 +86,29 @@ def test_model():
     assert energy.shape == batch_padded.globals["energy"].shape
     assert forces.shape == batch_padded.nodes["forces"].shape
     assert stress is None
+
+
+def test_direct_force_training_head_uses_checkpoint_compatible_backbone():
+    hidden_irreps = "8x0e+8x1o"
+    backbone = Nequix(
+        jax.random.key(0),
+        n_species=2,
+        lmax=1,
+        hidden_irreps=hidden_irreps,
+        n_layers=2,
+        radial_basis_size=4,
+        radial_mlp_size=8,
+        radial_mlp_layers=2,
+    )
+    model = DirectForceNequix(backbone, hidden_irreps, key=jax.random.key(1))
+    batch = jraph.pad_with_graphs(dummy_graph(), n_node=4, n_edge=4, n_graph=2)
+
+    energy, forces, stress = eqx.filter_jit(model)(batch)
+
+    assert energy.shape == batch.globals["energy"].shape
+    assert forces.shape == batch.nodes["forces"].shape
+    assert stress is None
+    assert conservative_backbone(model) is backbone
 
 
 @pytest.mark.parametrize("centering", [True, False])

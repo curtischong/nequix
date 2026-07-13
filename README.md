@@ -207,6 +207,23 @@ To train the OMat model, run:
 uv run train nequix-omat-1
 ```
 
+The OMat recipes run validation every 10,000 optimizer steps within each epoch,
+as well as at the end of every epoch. Set `val_every_steps` to a different
+positive interval (or `None` for epoch-end-only validation) in a derived config.
+
+For the two-stage OMat foundation-model curriculum (two direct-force epochs,
+then two conservative-force epochs), run:
+
+```bash
+./scripts/train_omat_foundation_curriculum.sh
+```
+
+Both stages use all of `data/omat/train.atp`. Each has an independent resumable
+training-state checkpoint under `checkpoints/`. The second stage initializes from
+the best first-stage backbone checkpoint but deliberately creates a fresh optimizer
+and learning-rate schedule for the new objective. The final best checkpoint is
+`checkpoints/nequix-omat-foundation-conservative.nqx`.
+
 To fine-tune the OAM model, copy the best JAX OMat checkpoint to
 `models/nequix-omat-1.nqx` and run
 ```bash

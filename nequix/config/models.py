@@ -350,6 +350,7 @@ class TrainerConfig:
     force_mode: Literal["conservative", "direct"] = "conservative"
     loss_type: str = "mae"
     log_every: int = 100
+    val_every_steps: int | None = None
     ema_decay: float = 0.999
     state_path: str | None = None
     resume_from: str | None = None

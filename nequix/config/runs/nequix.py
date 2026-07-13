@@ -51,6 +51,7 @@ _OMAT = replace(
     shift=-3.513482726416955,
     batch_size=128,
     n_epochs=6,
+    val_every_steps=10_000,
 )
 
 _OMAT_CURRICULUM_DIRECT = replace(
@@ -92,6 +93,7 @@ _OAM = replace(
     warmup_epochs=0.0,
     warmup_factor=0.0,
     n_epochs=3,
+    val_every_steps=None,
 )
 
 

@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import e3nn_jax as e3nn
@@ -641,7 +642,9 @@ def weight_decay_mask(model):
 
 def save_model(path: str, model: eqx.Module, config: dict):
     """Save a model and its config to a file."""
-    with open(path, "wb") as f:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
         config_str = json.dumps(config)
         f.write((config_str + "\n").encode())
         eqx.tree_serialise_leaves(f, model)

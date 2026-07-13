@@ -9,7 +9,14 @@ from tqdm import tqdm
 
 def read_molecules(file_path):
     atoms_list = ase.io.read(file_path, index=":")
-    return [from_ase(atoms, copy_info=False, copy_arrays=False) for atoms in atoms_list]
+    molecules = [from_ase(atoms, copy_info=False, copy_arrays=False) for atoms in atoms_list]
+    # Magnetic moments are not training targets, and ASE represents them as a
+    # scalar for one-atom structures but an array otherwise. AtomPack requires
+    # one schema per property, so discard this unused, shape-varying result.
+    for molecule in molecules:
+        if molecule.has_property("magmoms"):
+            molecule.delete_property("magmoms")
+    return molecules
 
 
 def preprocess(file_path, output_path, n_workers=16):

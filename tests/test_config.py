@@ -15,6 +15,8 @@ EXPECTED_TRAINERS = {
     "nequix-mp-1-pft-no-cotrain": "pft",
     "nequix-oam-1": "jax",
     "nequix-oam-1-pft": "pft",
+    "nequix-omat-foundation-conservative": "jax",
+    "nequix-omat-foundation-direct": "jax",
     "nequix-omat-1": "jax",
 }
 
@@ -41,7 +43,24 @@ def test_config_dict_flattens_model_and_sequence_values():
     assert config["atomic_numbers"][:3] == [1, 2, 3]
     assert config["finetune_from"] == "models/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
+    assert "val_every_steps" not in config
     assert all(value is not None for value in config.values())
+
+
+def test_omat_foundation_curriculum_configs():
+    omat = config_dict(RUNS["nequix-omat-1"])
+    direct = config_dict(RUNS["nequix-omat-foundation-direct"])
+    conservative = config_dict(RUNS["nequix-omat-foundation-conservative"])
+
+    assert omat["val_every_steps"] == 10_000
+    assert direct["val_every_steps"] == conservative["val_every_steps"] == 10_000
+    assert direct["train_frac"] == conservative["train_frac"] == 1.0
+    assert direct["n_epochs"] == conservative["n_epochs"] == 2
+    assert direct["force_mode"] == "direct"
+    assert direct["stress_weight"] == 0.0
+    assert conservative["force_mode"] == "conservative"
+    assert conservative["finetune_from"] == direct["checkpoint_path"]
+    assert conservative["resume_from"] != direct["resume_from"]
 
 
 def test_bundled_model_metadata_uses_atompack_paths():

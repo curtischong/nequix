@@ -24,7 +24,9 @@ from nequix.data import (
     prefetch,
 )
 from nequix.model import (
+    DirectForceNequix,
     Nequix,
+    conservative_backbone,
     load_model,
     replace_normalization,
     save_model,
@@ -72,7 +74,7 @@ def loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="hu
             loss_fns[config["force"]](forces, batch.nodes["forces"]) * node_mask[:, None]
         ) / (3 * jnp.sum(node_mask))
 
-    if stress_weight > 0 and batch.globals["stress"] is not None:
+    if stress_weight > 0 and stress is not None and batch.globals["stress"] is not None:
         stress_loss = jnp.sum(
             loss_fns[config["stress"]](stress, batch.globals["stress"]) * graph_mask[:, None, None]
         ) / (9 * jnp.sum(graph_mask))
@@ -98,7 +100,7 @@ def loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="hu
     )
 
     # MAE stress
-    if batch.globals["stress"] is not None:
+    if stress is not None and batch.globals["stress"] is not None:
         stress_mae_per_atom = jnp.sum(
             jnp.abs(stress - batch.globals["stress"])
             / jnp.where(batch.n_node > 0, batch.n_node, 1.0)[:, None, None]
@@ -149,6 +151,8 @@ def save_training_state(
     training_runtime_seconds=0.0,
     validation_runtime_seconds=0.0,
 ):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "model": model,
         "ema_model": ema_model,
@@ -161,7 +165,7 @@ def save_training_state(
         "training_runtime_seconds": training_runtime_seconds,
         "validation_runtime_seconds": validation_runtime_seconds,
     }
-    with open(path, "wb") as f:
+    with path.open("wb") as f:
         cloudpickle.dump(state, f)
 
 
@@ -187,6 +191,11 @@ def train(run_config: TrainerConfig):
     if run_config.trainer != "jax":
         raise ValueError(f"JAX trainer cannot run {run_config.trainer!r} config {run_config.name!r}")
     config = config_dict(run_config)
+    if config["force_mode"] not in {"conservative", "direct"}:
+        raise ValueError(f"force mode {config['force_mode']!r} is not supported")
+    val_every_steps = config.get("val_every_steps")
+    if val_every_steps is not None and val_every_steps <= 0:
+        raise ValueError("val_every_steps must be greater than zero")
 
     # use TMPDIR for slurm jobs if available
     config["cache_dir"] = config.get("cache_dir") or os.environ.get("TMPDIR")
@@ -285,6 +294,7 @@ def train(run_config: TrainerConfig):
         atom_energies=atom_energies,
         kernel=config["kernel"],
     )
+    resume_exists = "resume_from" in config and Path(config["resume_from"]).exists()
     if "finetune_from" in config and Path(config["finetune_from"]).exists():
         model, checkpoint_config = load_model(config["finetune_from"], config["kernel"])
         if checkpoint_config["atomic_numbers"] != config["atomic_numbers"]:
@@ -294,6 +304,15 @@ def train(run_config: TrainerConfig):
             atom_energies=atom_energies,
             shift=stats["shift"],
             scale=stats["scale"],
+        )
+    elif "finetune_from" in config and not resume_exists:
+        raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config['finetune_from']}")
+
+    if config["force_mode"] == "direct":
+        model = DirectForceNequix(
+            model,
+            config["hidden_irreps"],
+            key=jax.random.fold_in(key, 1),
         )
 
     param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
@@ -341,7 +360,7 @@ def train(run_config: TrainerConfig):
     training_runtime_seconds = 0.0
     validation_runtime_seconds = 0.0
 
-    if "resume_from" in config and Path(config["resume_from"]).exists():
+    if resume_exists:
         (
             model,
             ema_model,
@@ -391,6 +410,41 @@ def train(run_config: TrainerConfig):
             "runtime/validation_seconds": validation_runtime_seconds,
         }
 
+    def run_validation(epoch, step_in_epoch, training_seconds):
+        nonlocal best_val_loss, validation_runtime_seconds
+
+        validation_start = time.perf_counter()
+        ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
+        val_metrics = evaluate(
+            ema_model_single,
+            val_loader,
+            config["energy_weight"],
+            config["force_weight"],
+            config["stress_weight"],
+            config["loss_type"],
+        )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            checkpoint_model = conservative_backbone(ema_model_single)
+            save_model(Path(wandb.run.dir) / "checkpoint.nqx", checkpoint_model, config)
+            if "checkpoint_path" in config:
+                save_model(config["checkpoint_path"], checkpoint_model, config)
+
+        validation_runtime_seconds += time.perf_counter() - validation_start
+
+        logs = {f"val/{key}": value.item() for key, value in val_metrics.items()}
+        logs["epoch"] = epoch
+        logs["step_in_epoch"] = step_in_epoch
+        logs.update(runtime_metrics(training_seconds))
+        global_step = int(step.item())
+        wandb.log(logs, step=global_step)
+        print(
+            f"validation at epoch: {epoch}, step in epoch: {step_in_epoch}, "
+            f"global step: {global_step}, logs: {logs}"
+        )
+        wandb_sync()
+
     # @eqx.filter_jit
     @functools.partial(eqx.filter_pmap, in_axes=(0, 0, None, 0, 0), axis_name="device")
     def train_step(model, ema_model, step, opt_state, batch):
@@ -430,7 +484,9 @@ def train(run_config: TrainerConfig):
         train_segment_start = time.perf_counter()
         start_time = time.perf_counter()
         train_loader.loader.set_epoch(epoch)
-        for batch in prefetch(train_loader):
+        last_validation_step_in_epoch = None
+        step_in_epoch = 0
+        for step_in_epoch, batch in enumerate(prefetch(train_loader), start=1):
             batch_time = time.perf_counter() - start_time
             start_time = time.perf_counter()
             (model, ema_model, opt_state, total_loss, metrics) = train_step(
@@ -456,35 +512,17 @@ def train(run_config: TrainerConfig):
                 wandb.log(logs, step=step)
                 print(f"step: {step}, logs: {logs}")
                 wandb_sync()
+
+            if val_every_steps is not None and step_in_epoch % val_every_steps == 0:
+                training_runtime_seconds += time.perf_counter() - train_segment_start
+                run_validation(epoch, step_in_epoch, training_runtime_seconds)
+                last_validation_step_in_epoch = step_in_epoch
+                train_segment_start = time.perf_counter()
             start_time = time.perf_counter()
 
         training_runtime_seconds += time.perf_counter() - train_segment_start
-        validation_start = time.perf_counter()
-
-        ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
-        val_metrics = evaluate(
-            ema_model_single,
-            val_loader,
-            config["energy_weight"],
-            config["force_weight"],
-            config["stress_weight"],
-            config["loss_type"],
-        )
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model_single, config)
-
-        validation_runtime_seconds += time.perf_counter() - validation_start
-
-        logs = {}
-        for key, value in val_metrics.items():
-            logs[f"val/{key}"] = value.item()
-        logs["epoch"] = epoch
-        logs.update(runtime_metrics(training_runtime_seconds))
-        wandb.log(logs, step=step)
-        print(f"epoch: {epoch}, logs: {logs}")
-        wandb_sync()
+        if last_validation_step_in_epoch != step_in_epoch:
+            run_validation(epoch, step_in_epoch, training_runtime_seconds)
 
         save_training_state(
             Path(wandb.run.dir) / "state.pkl",

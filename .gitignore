@@ -11,9 +11,11 @@ data/2024-09-03-mp-trj/
 data/dataset_3BPA/
 data/cache/
 data/omat
+data/omat-1m
 data/salex
 data/pbe-mdr
 data/pbe-mdr-disp
+data/*.tar.gz
 tmp/
 .benchmarks/
 
