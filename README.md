@@ -74,50 +74,40 @@ Arguments
 
 ### Training
 
-Models are trained with the `nequix_train` command using a single `.yml`
-configuration file:
+Training configs are Python dataclasses registered by name in `nequix/config/runs`.
+The `train` command selects both the config and its JAX, Torch, or PFT trainer:
 
 ```bash
-nequix_train <config>.yml
+uv run train nequix-mp-1
 ```
+
+Run `uv run train --help` to list every available config name. New runs can reuse an
+existing recipe with `dataclasses.replace`, so shared model and dataset settings stay
+in one place without YAML inheritance or path handling.
 
 Training and validation paths ending in `.atp` are read directly with AtomPack. An
 existing sibling `.atp` file is also preferred automatically (for example,
-`train_path: data/omat/train` uses `data/omat/train.atp` when present and otherwise
+`train_path="data/omat/train"` uses `data/omat/train.atp` when present and otherwise
 retains the ASE DB fallback). The training subset is controlled with `train_frac` and
 sampled deterministically using `seed`. When `dataset_name` is set, W&B names include
-the data schedule; for example:
+the data schedule. For example, `dataset_name="1m"`, `train_frac=0.25`,
+`n_epochs=4`, and `run_name="nequix_orig"` produce the W&B run name
+`1m25_4ep_nequix_orig`. Set `wandb_run_name` to override the generated name.
 
-```yaml
-train_path: "data/omat24_1M/train.atp"
-valid_path: "data/omat24_1M/val.atp"
-dataset_name: "1m"
-train_frac: 0.25
-seed: 0
-n_epochs: 4
-run_name: "nequix_orig"
-stress_weight: 0.0  # the OMat AtomPack files do not contain stress labels
-```
-
-This produces the W&B run name `1m25_4ep_nequix_orig`. Set `wandb_run_name` to
-override the generated name.
-
-with kernels
+For JAX training with kernels:
 
 ```bash
 uv sync --extra oeq
 uv pip install openequivariance_extjax --no-build-isolation
-nequix_train <config>.yml
+uv run train nequix-mp-1
 ```
 
-or for Torch
+All shipped training configs, including OMat and OAM, use JAX. JAX automatically
+uses all visible devices, so these runs do not use `torchrun`:
 
 ```bash
-# Single GPU
-uv sync --extra torch
-uv run nequix/torch_impl/train.py <config>.yml
-# Multi-GPU
-uv run torchrun --nproc_per_node=<gpus> nequix/torch_impl/train.py <config>.yml
+uv run train nequix-omat-1
+uv run train nequix-oam-1
 ```
 
 To reproduce the training of Nequix-MP-1, first clone the repo and sync the environment:
@@ -144,7 +134,7 @@ uv run scripts/preprocess_data.py data/mptrj-gga-ggapu data/mptrj-aselmdb
 
 Then start the training run:
 ```bash
-nequix_train configs/nequix-mp-1.yml
+uv run train nequix-mp-1
 ```
 
 This will take less than 125 hours on a single 4 x A100 node (<25 hours with kernels). The `batch_size` in the
@@ -190,19 +180,19 @@ bash data/download_pbe_mdr_preprocessed.sh
 To run PFT without co-training run:
 
 ```bash
-uv run nequix/pft/train.py configs/nequix-mp-1-pft-no-cotrain.yml
+uv run train nequix-mp-1-pft-no-cotrain
 ```
 
 To run PFT *with* co-training run (note this requires `mptrj-aselmdb` preprocessed): 
 
 ```bash
-uv run nequix/pft/train.py configs/nequix-mp-1-pft.yml
+uv run train nequix-mp-1-pft
 ```
 
 To run PFT on the OAM base model, follow the data download instructions below and then run:
 
 ```bash
-uv run nequix/pft/train.py configs/nequix-oam-1-pft.yml
+uv run train nequix-oam-1-pft
 ```
 
 Both PFT training runs take about 140 hours on a single A100. Note that PFT training is only currently only supported with the JAX backend, which is both significantly faster and supported by the kernels. See [nequix-examples/pft](https://github.com/teddykoker/nequix-examples/blob/main/pft), which contains a small demo for PFT in PyTorch that can be adapted to other models. Feel free to reach out with questions.
@@ -226,17 +216,14 @@ ln -s <path to storage location>/mptrj-aselmdb ./data/mptrj-aselmdb
 
 To train the OMat model, run:
 ```bash
-uv run torchrun --nproc_per_node=4 nequix/torch_impl/train.py configs/nequix-omat-1.yml
+uv run train nequix-omat-1
 ```
 
-This takes roughly 60 hours on a 4 x A100 node. To fine-tune the OAM model, copy
-the OMat model to `models/nequix-omat-1.pt` and run
+To fine-tune the OAM model, copy the best JAX OMat checkpoint to
+`models/nequix-omat-1.nqx` and run
 ```bash
-uv run torchrun --nproc_per_node=4 nequix/torch_impl/train.py configs/nequix-oam-1.yml
+uv run train nequix-oam-1
 ```
-This takes roughly 10 hours on a 4 x A100 node.
-
-
 ## Citation
 
 ```bibtex

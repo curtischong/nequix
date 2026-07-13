@@ -1,4 +1,3 @@
-import argparse
 import copy
 import os
 from datetime import timedelta
@@ -8,13 +7,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import yaml
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.loader import DataLoader
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
+from nequix.config import TrainerConfig, config_dict
 from nequix.data import ConcatDataset, dataset_from_path
 from nequix.train_utils import wandb_run_name
 from nequix.torch_impl.model import (
@@ -204,10 +203,13 @@ def load_training_state(path, model, ema_model, optimizer, scheduler):
     )
 
 
-def train(config_path: str):
-    """Train a Nequack model from a config file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+def train(run_config: TrainerConfig):
+    """Train a Torch Nequix model from a registered Python config."""
+    if run_config.trainer != "torch":
+        raise ValueError(
+            f"Torch trainer cannot run {run_config.trainer!r} config {run_config.name!r}"
+        )
+    config = config_dict(run_config)
 
     # use TMPDIR for slurm jobs if available
     config["cache_dir"] = config.get("cache_dir") or os.environ.get("TMPDIR")
@@ -411,7 +413,7 @@ def train(config_path: str):
             TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
         )
 
-        run_name = wandb_run_name(config_path, config)
+        run_name = wandb_run_name(run_config.name, config)
         wandb_config = {
             **config,
             "train_size": len(train_dataset),
@@ -654,10 +656,9 @@ def cleanup_ddp():
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("config_path", type=str)
-    args = parser.parse_args()
-    train(args.config_path)
+    from nequix.cli import main as cli_main
+
+    cli_main()
 
 
 if __name__ == "__main__":

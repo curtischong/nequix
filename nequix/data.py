@@ -5,6 +5,7 @@ import queue
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
+from pprint import pformat
 
 import ase
 import ase.db
@@ -15,7 +16,6 @@ import jax
 import jraph
 import matscipy.neighbours
 import numpy as np
-import yaml
 from tqdm import tqdm
 
 
@@ -512,8 +512,8 @@ def average_atom_energies(dataset: Dataset) -> list[float]:
     E0s = np.linalg.lstsq(A, B, rcond=None)[0].tolist()
     idx_to_atomic_number = {v: k for k, v in atomic_indices.items()}
     atom_energies = {idx_to_atomic_number[i]: e0 for i, e0 in enumerate(E0s)}
-    print("computed energies, add to config yml file to avoid recomputing:")
-    print(yaml.dump({"atom_energies": atom_energies}))
+    print("computed energies; add these atom_energies to the Python run config:")
+    print(pformat(atom_energies, sort_dicts=True))
     return E0s
 
 
@@ -584,6 +584,6 @@ def dataset_stats(dataset: Dataset, atom_energies: list[float], num_workers: int
         "max_n_nodes": int(max_nodes),
         "max_n_edges": int(max_edges),
     }
-    print("computed dataset statistics, add to config yml file to avoid recomputing:")
-    print(yaml.dump(stats))
+    print("computed dataset statistics; add these values to the Python run config:")
+    print(pformat(stats, sort_dicts=True))
     return stats

@@ -1,4 +1,3 @@
-import argparse
 import functools
 import os
 import time
@@ -11,10 +10,10 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
-import yaml
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
+from nequix.config import TrainerConfig, config_dict
 from nequix.data import (
     ConcatDataset,
     DataLoader,
@@ -24,7 +23,13 @@ from nequix.data import (
     dataset_stats,
     prefetch,
 )
-from nequix.model import Nequix, load_model, save_model, weight_decay_mask
+from nequix.model import (
+    Nequix,
+    load_model,
+    replace_normalization,
+    save_model,
+    weight_decay_mask,
+)
 from nequix.train_utils import wandb_run_name
 
 
@@ -177,10 +182,11 @@ def load_training_state(path):
     )
 
 
-def train(config_path: str):
-    """Train a Nequix model from a config file. See configs/nequix-mp-1.yaml for an example."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+def train(run_config: TrainerConfig):
+    """Train a JAX Nequix model from a registered Python config."""
+    if run_config.trainer != "jax":
+        raise ValueError(f"JAX trainer cannot run {run_config.trainer!r} config {run_config.name!r}")
+    config = config_dict(run_config)
 
     # use TMPDIR for slurm jobs if available
     config["cache_dir"] = config.get("cache_dir") or os.environ.get("TMPDIR")
@@ -280,10 +286,15 @@ def train(config_path: str):
         kernel=config["kernel"],
     )
     if "finetune_from" in config and Path(config["finetune_from"]).exists():
-        if "atom_energies" in config:
-            # TODO
-            raise NotImplementedError("Updating atom energies not implemented for JAX backend")
-        model, _ = load_model(config["finetune_from"])
+        model, checkpoint_config = load_model(config["finetune_from"], config["kernel"])
+        if checkpoint_config["atomic_numbers"] != config["atomic_numbers"]:
+            raise ValueError("fine-tuning checkpoint and run config use different elements")
+        model = replace_normalization(
+            model,
+            atom_energies=atom_energies,
+            shift=stats["shift"],
+            scale=stats["scale"],
+        )
 
     param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
 
@@ -344,7 +355,7 @@ def train(config_path: str):
             validation_runtime_seconds,
         ) = load_training_state(config["resume_from"])
 
-    run_name = wandb_run_name(config_path, config)
+    run_name = wandb_run_name(run_config.name, config)
     wandb_config = {
         **config,
         "train_size": len(train_dataset),
@@ -511,10 +522,9 @@ def train(config_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("config_path", type=str)
-    args = parser.parse_args()
-    train(args.config_path)
+    from nequix.cli import main as cli_main
+
+    cli_main()
 
 
 if __name__ == "__main__":

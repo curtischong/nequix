@@ -1,4 +1,3 @@
-import argparse
 import itertools
 import time
 from collections import defaultdict
@@ -10,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
-import yaml
+from nequix.config import PFTTrainerConfig, config_dict
 from nequix.data import (
     AseDBDataset,
     ConcatDataset,
@@ -188,9 +187,10 @@ def evaluate(
     return total_metrics
 
 
-def train(config_path):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+def train(run_config: PFTTrainerConfig):
+    if run_config.trainer != "pft":
+        raise ValueError(f"PFT trainer cannot run config {run_config.name!r}")
+    config = config_dict(run_config)
 
     model, original_config = load_model(config["finetune_from"], config["kernel"])
 
@@ -499,7 +499,6 @@ def train(config_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("config_path", type=str)
-    args = parser.parse_args()
-    train(args.config_path)
+    from nequix.cli import main
+
+    main()

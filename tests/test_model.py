@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 
 from nequix.layer_norm import RMSLayerNorm
-from nequix.model import Nequix, load_model, save_model, weight_decay_mask
+from nequix.model import (
+    Nequix,
+    load_model,
+    replace_normalization,
+    save_model,
+    weight_decay_mask,
+)
 
 
 def dummy_graph():
@@ -182,3 +188,37 @@ def test_weight_decay_mask():
     assert not mask.layers[0].radial_mlp.layers[0].bias
     assert not any(mask.layers[0].layer_norm.affine_weight)
     assert not mask.layers[0].layer_norm.affine_bias
+
+
+def test_replace_normalization_preserves_weights():
+    model = Nequix(
+        jax.random.key(0),
+        n_species=2,
+        lmax=1,
+        hidden_irreps="8x0e+8x1o",
+        n_layers=1,
+        shift=1.0,
+        scale=2.0,
+        atom_energies=[3.0, 4.0],
+    )
+
+    updated = replace_normalization(
+        model,
+        atom_energies=[5.0, 6.0],
+        shift=7.0,
+        scale=8.0,
+    )
+
+    assert model.shift == 1.0
+    assert model.scale == 2.0
+    np.testing.assert_allclose(model.atom_energies, [3.0, 4.0])
+    assert updated.shift == 7.0
+    assert updated.scale == 8.0
+    np.testing.assert_allclose(updated.atom_energies, [5.0, 6.0])
+    assert jax.tree.all(
+        jax.tree.map(
+            lambda old, new: jnp.array_equal(old, new),
+            eqx.filter(model.layers, eqx.is_array),
+            eqx.filter(updated.layers, eqx.is_array),
+        )
+    )

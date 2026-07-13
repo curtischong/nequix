@@ -19,7 +19,6 @@ dependencies = [
     "ase>=3.24.0",
     "tqdm>=4.67.1",
     "wandb>=0.19.11",
-    "pyyaml>=6.0.2",
     "matscipy>=1.1.1",
     "h5py>=3.14.0",
     "wandb-osh>=1.2.2",
@@ -34,7 +33,7 @@ Repository = "https://github.com/atomicarchitects/nequix"
 
 
 [project.scripts]
-nequix_train = "nequix.train:main"
+train = "nequix.cli:main"
 
 [build-system]
 requires = ["hatchling"]

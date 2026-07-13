@@ -8,12 +8,12 @@ def _format_percentage(fraction: float) -> str:
     return f"{percentage:g}".replace(".", "p")
 
 
-def wandb_run_name(config_path: str, config: dict) -> str:
+def wandb_run_name(config_name: str, config: dict) -> str:
     """Build the data-schedule-prefixed run name used by the training configs."""
     if config.get("wandb_run_name"):
         return config["wandb_run_name"]
 
-    run_name = config.get("run_name", Path(config_path).stem)
+    run_name = config.get("run_name", Path(config_name).stem)
     dataset_name = config.get("dataset_name")
     if not dataset_name:
         return run_name

@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import os
@@ -490,6 +491,34 @@ class Nequix(eqx.Module):
             stress = jnp.where(graph_mask[:, None, None], stress, 0.0)
 
         return graph_energies[:, 0], -minus_forces, stress
+
+
+def replace_normalization(
+    model: Nequix,
+    *,
+    atom_energies: Sequence[float],
+    shift: float,
+    scale: float,
+) -> Nequix:
+    """Return a model with new energy references while preserving learned weights.
+
+    ``shift`` and ``scale`` are static Equinox fields, so they cannot be changed with
+    ``eqx.tree_at``. A shallow copy safely gives the returned model a new PyTree
+    definition; the learned parameter arrays remain shared until training updates them.
+    """
+    if len(atom_energies) != model.n_species:
+        raise ValueError(
+            f"expected {model.n_species} isolated-atom energies, got {len(atom_energies)}"
+        )
+
+    updated = copy.copy(model)
+    object.__setattr__(updated, "shift", float(shift))
+    object.__setattr__(updated, "scale", float(scale))
+    return eqx.tree_at(
+        lambda candidate: candidate.atom_energies,
+        updated,
+        jnp.asarray(atom_energies, dtype=model.atom_energies.dtype),
+    )
 
 
 def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:

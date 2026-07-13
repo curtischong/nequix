@@ -66,4 +66,4 @@ def test_wandb_name_includes_fraction_and_schedule():
         "run_name": "nequix_orig",
     }
 
-    assert wandb_run_name("unused.yml", config) == "1m25_4ep_nequix_orig"
+    assert wandb_run_name("unused", config) == "1m25_4ep_nequix_orig"
