@@ -1,13 +1,16 @@
-import multiprocessing
-from abc import ABC, abstractmethod
-import queue
 import bisect
+import multiprocessing
+import os
+import queue
 import threading
+from abc import ABC, abstractmethod
 from pathlib import Path
 
 import ase
 import ase.db
+from atompack import Database
 from ase.geometry import complete_cell
+from ase.stress import voigt_6_to_full_3x3_stress
 import jax
 import jraph
 import matscipy.neighbours
@@ -144,11 +147,28 @@ class Dataset(ABC):
         n_tr = int(round(n * (1 - valid_frac)))
         return IndexDataset(self, perm[:n_tr]), IndexDataset(self, perm[n_tr:])
 
+    def subset(self, fraction: float, seed: int = 0):
+        """Return a deterministic random fraction of this dataset."""
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"dataset fraction must be in (0, 1], got {fraction}")
+        if fraction == 1.0:
+            return self
+
+        size = int(len(self) * fraction)
+        if size == 0:
+            raise ValueError(
+                f"dataset fraction {fraction} selects no items from a dataset of size {len(self)}"
+            )
+        indices = np.random.default_rng(seed).permutation(len(self))[:size]
+        return IndexDataset(self, indices)
+
 
 class IndexDataset(Dataset):
     def __init__(self, base: Dataset, indices: np.ndarray):
         super().__init__(backend=base.backend)
         self.base, self.indices = base, np.asarray(indices, dtype=int)
+        if hasattr(base, "atomic_indices"):
+            self.atomic_indices = base.atomic_indices
 
     def __len__(self):
         return self.indices.size
@@ -162,6 +182,8 @@ class ConcatDataset(Dataset):
         super().__init__(backend=datasets[0].backend)
         self.datasets = datasets
         self.len_cumulative = np.cumsum([len(ds) for ds in datasets])
+        if hasattr(datasets[0], "atomic_indices"):
+            self.atomic_indices = datasets[0].atomic_indices
 
     def __len__(self):
         return self.len_cumulative[-1]
@@ -201,6 +223,100 @@ class AseDBDataset(Dataset):
         atoms = self.dbs[db_idx]._get_row(self.db_ids[db_idx][idx]).toatoms()
         graph = preprocess_graph(atoms, self.atomic_indices, self.cutoff, True)
         return graph
+
+
+class AtomPackDataset(Dataset):
+    """Random-access AtomPack dataset, reopened independently in each worker process."""
+
+    def __init__(
+        self, file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
+    ):
+        super().__init__(backend=backend)
+        self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
+        self.file_path = Path(file_path)
+        self.cutoff = cutoff
+        database = Database.open(str(self.file_path))
+        self._length = len(database)
+        del database
+        self._database = None
+        self._database_pid = None
+
+    def __len__(self):
+        return self._length
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_database"] = None
+        state["_database_pid"] = None
+        return state
+
+    def _get_database(self):
+        pid = os.getpid()
+        if self._database is None or self._database_pid != pid:
+            self._database = Database.open(str(self.file_path))
+            self._database_pid = pid
+        return self._database
+
+    def _get_graph_dict(self, idx: int):
+        molecule = self._get_database().get_molecule(idx)
+        if molecule.energy is None or molecule.forces is None:
+            raise ValueError(
+                f"AtomPack training record {idx} in {self.file_path} must contain energy and forces"
+            )
+
+        positions = np.asarray(molecule.positions)
+        atomic_numbers = np.asarray(molecule.atomic_numbers)
+        pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
+        raw_cell = (
+            np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
+        )
+        cell = complete_cell(raw_cell)
+        src, dst, shift = matscipy.neighbours.neighbour_list(
+            "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
+        )
+
+        stress = molecule.stress
+        if stress is not None:
+            stress = np.asarray(stress)
+            if stress.shape == (6,):
+                stress = voigt_6_to_full_3x3_stress(stress)
+
+        graph = {
+            "n_node": np.array([len(atomic_numbers)], dtype=np.int32),
+            "n_edge": np.array([len(src)], dtype=np.int32),
+            "senders": dst.astype(np.int32),
+            "receivers": src.astype(np.int32),
+            "species": np.array(
+                [self.atomic_indices[int(number)] for number in atomic_numbers], dtype=np.int32
+            ),
+            "positions": positions.astype(np.float32),
+            "shifts": shift.astype(np.float32),
+            "cell": raw_cell.astype(np.float32) if pbc.all() else None,
+            "forces": np.asarray(molecule.forces, dtype=np.float32),
+            "energy": np.array([molecule.energy], dtype=np.float32),
+        }
+        if stress is not None:
+            graph["stress"] = stress.astype(np.float32)
+        return graph
+
+
+def dataset_from_path(
+    file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
+) -> Dataset:
+    """Prefer an explicit or sibling AtomPack file, with ASE DB compatibility as fallback."""
+    path = Path(file_path)
+    atompack_path = path if path.suffix == ".atp" else path.with_suffix(".atp")
+    if atompack_path.is_file():
+        dataset_type = AtomPackDataset
+        file_path = str(atompack_path)
+    else:
+        dataset_type = AseDBDataset
+    return dataset_type(
+        file_path=file_path,
+        atomic_numbers=atomic_numbers,
+        cutoff=cutoff,
+        backend=backend,
+    )
 
 
 def _dataloader_worker(dataset, index_queue, output_queue):

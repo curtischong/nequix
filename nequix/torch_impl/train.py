@@ -15,7 +15,8 @@ from torch_geometric.loader import DataLoader
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
-from nequix.data import AseDBDataset, ConcatDataset
+from nequix.data import ConcatDataset, dataset_from_path
+from nequix.train_utils import wandb_run_name
 from nequix.torch_impl.model import (
     NequixTorch,
     get_optimizer_param_groups,
@@ -146,6 +147,8 @@ def save_training_state(
     epoch,
     best_val_loss,
     wandb_run_id=None,
+    training_runtime_seconds=0.0,
+    validation_runtime_seconds=0.0,
 ):
     # Extract state dict from DDP wrapper if needed
     model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -163,6 +166,8 @@ def save_training_state(
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "wandb_run_id": wandb_run_id,
+        "training_runtime_seconds": training_runtime_seconds,
+        "validation_runtime_seconds": validation_runtime_seconds,
     }
     torch.save(state, path)
 
@@ -194,6 +199,8 @@ def load_training_state(path, model, ema_model, optimizer, scheduler):
         state["epoch"],
         state["best_val_loss"],
         state.get("wandb_run_id"),
+        state.get("training_runtime_seconds", 0.0),
+        state.get("validation_runtime_seconds", 0.0),
     )
 
 
@@ -220,35 +227,31 @@ def train(config_path: str):
         world_size = 1
         print(f"Using device: {device}")
 
+    def make_dataset(path):
+        return dataset_from_path(
+            file_path=path,
+            atomic_numbers=config["atomic_numbers"],
+            cutoff=config["cutoff"],
+            backend="torch",
+        )
+
     if isinstance(config["train_path"], list):
         train_dataset = ConcatDataset(
-            [
-                AseDBDataset(
-                    file_path=path,
-                    atomic_numbers=config["atomic_numbers"],
-                    cutoff=config["cutoff"],
-                    backend="torch",
-                )
-                for path in config["train_path"]
-            ]
+            [make_dataset(path) for path in config["train_path"]]
         )
     else:
-        train_dataset = AseDBDataset(
-            file_path=config["train_path"],
-            atomic_numbers=config["atomic_numbers"],
-            cutoff=config["cutoff"],
-            backend="torch",
-        )
+        train_dataset = make_dataset(config["train_path"])
     if "valid_frac" in config:
-        train_dataset, val_dataset = train_dataset.split(valid_frac=config["valid_frac"])
+        train_dataset, val_dataset = train_dataset.split(
+            valid_frac=config["valid_frac"], seed=config.get("seed", 42)
+        )
     else:
         assert "valid_path" in config, "valid_path must be specified if valid_frac is not provided"
-        val_dataset = AseDBDataset(
-            file_path=config["valid_path"],
-            atomic_numbers=config["atomic_numbers"],
-            cutoff=config["cutoff"],
-            backend="torch",
-        )
+        val_dataset = make_dataset(config["valid_path"])
+
+    train_dataset = train_dataset.subset(
+        float(config.get("train_frac", 1.0)), seed=config.get("seed", 0)
+    )
 
     if "atom_energies" in config:
         atom_energies = [config["atom_energies"][n] for n in config["atomic_numbers"]]
@@ -278,7 +281,7 @@ def train(config_path: str):
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
-            seed=42,
+            seed=config.get("seed", 42),
         )
         train_loader = DataLoader(
             train_dataset,
@@ -305,8 +308,8 @@ def train(config_path: str):
     )
 
     # Set the seeds
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    torch.manual_seed(config.get("seed", 42))
+    torch.cuda.manual_seed(config.get("seed", 42))
 
     model = NequixTorch(
         n_species=len(config["atomic_numbers"]),
@@ -382,6 +385,8 @@ def train(config_path: str):
     start_epoch = 0
     best_val_loss = float("inf")
     wandb_run_id = None
+    training_runtime_seconds = 0.0
+    validation_runtime_seconds = 0.0
     wandb_sync = lambda: None  # noqa: E731
 
     # Load checkpoint if resuming and checkpoint exists
@@ -396,6 +401,8 @@ def train(config_path: str):
             start_epoch,
             best_val_loss,
             wandb_run_id,
+            training_runtime_seconds,
+            validation_runtime_seconds,
         ) = load_training_state(config["resume_from"], model, ema_model, optimizer, scheduler)
 
     # Only initialize wandb on rank 0
@@ -404,15 +411,43 @@ def train(config_path: str):
             TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
         )
 
-        wandb_init_kwargs = {"project": "nequix", "config": config}
+        run_name = wandb_run_name(config_path, config)
+        wandb_config = {
+            **config,
+            "train_size": len(train_dataset),
+            "val_size": len(val_dataset),
+        }
+        wandb_init_kwargs = {
+            "project": config.get("wandb_project", "nequix"),
+            "name": run_name,
+            "config": wandb_config,
+        }
+        if config.get("wandb_entity"):
+            wandb_init_kwargs["entity"] = config["wandb_entity"]
+        if config.get("wandb_mode"):
+            wandb_init_kwargs["mode"] = config["wandb_mode"]
         if wandb_run_id:
             wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
 
-        wandb.init(**wandb_init_kwargs)
+        wandb_run = wandb.init(**wandb_init_kwargs)
+        wandb_run.define_metric("runtime/training_seconds", summary="last")
+        wandb_run.define_metric("runtime/training_hours", summary="last")
+        wandb_run.define_metric("runtime/validation_seconds", summary="last")
+        for metric_glob in ("train/*", "val/*"):
+            wandb_run.define_metric(metric_glob, step_metric="runtime/training_hours")
 
         if hasattr(wandb, "run") and wandb.run is not None:
             wandb.run.summary["param_count"] = param_count
+            wandb.run.summary["train_size"] = len(train_dataset)
+            wandb.run.summary["val_size"] = len(val_dataset)
             wandb_run_id = getattr(wandb.run, "id", None)
+
+    def runtime_metrics(training_seconds):
+        return {
+            "runtime/training_seconds": training_seconds,
+            "runtime/training_hours": training_seconds / 3600.0,
+            "runtime/validation_seconds": validation_runtime_seconds,
+        }
 
     def train_step(model, ema_model, batch, step):
         model.train()
@@ -461,6 +496,8 @@ def train(config_path: str):
         return total_loss, metrics
 
     if "resume_from" in config and checkpoint_steps_through_epoch > 0:
+        if not hasattr(train_loader.sampler, "set_start_iter"):
+            raise ValueError("mid-epoch resume requires the distributed stateful sampler")
         train_loader.sampler.set_start_iter(checkpoint_steps_through_epoch)
 
     for epoch in range(start_epoch, config["n_epochs"]):
@@ -468,19 +505,20 @@ def train(config_path: str):
         if is_distributed:
             train_loader.sampler.set_epoch(epoch)
 
-        start_time = time.time()
+        train_segment_start = time.perf_counter()
+        start_time = time.perf_counter()
 
         for steps_through_epoch, batch in enumerate(
             train_loader, start=checkpoint_steps_through_epoch
         ):
-            batch_time = time.time() - start_time
-            start_time = time.time()
+            batch_time = time.perf_counter() - start_time
+            start_time = time.perf_counter()
 
             batch = batch.to(device)
 
             total_loss, metrics = train_step(model, ema_model, batch, global_step)
 
-            train_time = time.time() - start_time
+            train_time = time.perf_counter() - start_time
             global_step += 1
 
             if global_step % config["log_every"] == 0:
@@ -505,6 +543,10 @@ def train(config_path: str):
                     logs["train/batch_size"] = (
                         batch.num_graphs if hasattr(batch, "num_graphs") else 1
                     )
+                    current_training_seconds = (
+                        training_runtime_seconds + time.perf_counter() - train_segment_start
+                    )
+                    logs.update(runtime_metrics(current_training_seconds))
                     wandb.log(logs, step=global_step)
                     print(f"step: {global_step}, logs: {logs}")
                     wandb_sync()
@@ -520,6 +562,8 @@ def train(config_path: str):
                         epoch,
                         best_val_loss,
                         wandb_run_id=wandb_run_id,
+                        training_runtime_seconds=current_training_seconds,
+                        validation_runtime_seconds=validation_runtime_seconds,
                     )
 
                     if "state_path" in config:
@@ -534,12 +578,17 @@ def train(config_path: str):
                             epoch,
                             best_val_loss,
                             wandb_run_id=wandb_run_id,
+                            training_runtime_seconds=current_training_seconds,
+                            validation_runtime_seconds=validation_runtime_seconds,
                         )
 
-            start_time = time.time()
+            start_time = time.perf_counter()
+
+        training_runtime_seconds += time.perf_counter() - train_segment_start
 
         # reset sampler to start of epoch
-        train_loader.sampler.set_start_iter(0)
+        if hasattr(train_loader.sampler, "set_start_iter"):
+            train_loader.sampler.set_start_iter(0)
         checkpoint_steps_through_epoch = 0
 
         if is_distributed:
@@ -548,6 +597,7 @@ def train(config_path: str):
 
         if rank == 0:
             # TODO: multi gpu validation, evaluate subset on each rank and aggregate metrics
+            validation_start = time.perf_counter()
             val_metrics = evaluate(
                 ema_model,
                 val_loader,
@@ -563,18 +613,28 @@ def train(config_path: str):
                 if hasattr(wandb, "run") and wandb.run is not None:
                     save_model(Path(wandb.run.dir) / "checkpoint.pt", model_to_save, config)
 
+            validation_runtime_seconds += time.perf_counter() - validation_start
+
             logs = {}
             for key, value in val_metrics.items():
                 logs[f"val/{key}"] = value
             logs["epoch"] = epoch
+            logs.update(runtime_metrics(training_runtime_seconds))
             if hasattr(wandb, "run") and wandb.run is not None:
                 wandb.log(logs, step=global_step)
+                wandb.run.summary.update(runtime_metrics(training_runtime_seconds))
             print(f"epoch: {epoch}, logs: {logs}")
             wandb_sync()
 
         if is_distributed:
             # wait for validation to finish
             torch.distributed.barrier()
+
+    if rank == 0:
+        if hasattr(wandb, "run") and wandb.run is not None:
+            wandb.run.summary.update(runtime_metrics(training_runtime_seconds))
+        wandb_sync()
+        wandb.finish()
 
     if is_distributed and epoch == config["n_epochs"] - 1:
         cleanup_ddp()

@@ -81,6 +81,27 @@ configuration file:
 nequix_train <config>.yml
 ```
 
+Training and validation paths ending in `.atp` are read directly with AtomPack. An
+existing sibling `.atp` file is also preferred automatically (for example,
+`train_path: data/omat/train` uses `data/omat/train.atp` when present and otherwise
+retains the ASE DB fallback). The training subset is controlled with `train_frac` and
+sampled deterministically using `seed`. When `dataset_name` is set, W&B names include
+the data schedule; for example:
+
+```yaml
+train_path: "data/omat24_1M/train.atp"
+valid_path: "data/omat24_1M/val.atp"
+dataset_name: "1m"
+train_frac: 0.25
+seed: 0
+n_epochs: 4
+run_name: "nequix_orig"
+stress_weight: 0.0  # the OMat AtomPack files do not contain stress labels
+```
+
+This produces the W&B run name `1m25_4ep_nequix_orig`. Set `wandb_run_name` to
+override the generated name.
+
 with kernels
 
 ```bash

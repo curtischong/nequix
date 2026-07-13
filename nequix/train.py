@@ -16,15 +16,16 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
 from nequix.data import (
-    AseDBDataset,
     ConcatDataset,
     DataLoader,
     ParallelLoader,
     average_atom_energies,
+    dataset_from_path,
     dataset_stats,
     prefetch,
 )
 from nequix.model import Nequix, load_model, save_model, weight_decay_mask
+from nequix.train_utils import wandb_run_name
 
 
 @eqx.filter_jit
@@ -66,7 +67,7 @@ def loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="hu
             loss_fns[config["force"]](forces, batch.nodes["forces"]) * node_mask[:, None]
         ) / (3 * jnp.sum(node_mask))
 
-    if stress_weight > 0:
+    if stress_weight > 0 and batch.globals["stress"] is not None:
         stress_loss = jnp.sum(
             loss_fns[config["stress"]](stress, batch.globals["stress"]) * graph_mask[:, None, None]
         ) / (9 * jnp.sum(graph_mask))
@@ -92,11 +93,14 @@ def loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="hu
     )
 
     # MAE stress
-    stress_mae_per_atom = jnp.sum(
-        jnp.abs(stress - batch.globals["stress"])
-        / jnp.where(batch.n_node > 0, batch.n_node, 1.0)[:, None, None]
-        * graph_mask[:, None, None]
-    ) / (9 * jnp.sum(graph_mask))
+    if batch.globals["stress"] is not None:
+        stress_mae_per_atom = jnp.sum(
+            jnp.abs(stress - batch.globals["stress"])
+            / jnp.where(batch.n_node > 0, batch.n_node, 1.0)[:, None, None]
+            * graph_mask[:, None, None]
+        ) / (9 * jnp.sum(graph_mask))
+    else:
+        stress_mae_per_atom = jnp.array(0.0)
 
     return total_loss, {
         "energy_mae_per_atom": energy_mae_per_atom,
@@ -128,7 +132,17 @@ def evaluate(
 
 
 def save_training_state(
-    path, model, ema_model, optim, opt_state, step, epoch, best_val_loss, wandb_run_id=None
+    path,
+    model,
+    ema_model,
+    optim,
+    opt_state,
+    step,
+    epoch,
+    best_val_loss,
+    wandb_run_id=None,
+    training_runtime_seconds=0.0,
+    validation_runtime_seconds=0.0,
 ):
     state = {
         "model": model,
@@ -139,6 +153,8 @@ def save_training_state(
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "wandb_run_id": wandb_run_id,
+        "training_runtime_seconds": training_runtime_seconds,
+        "validation_runtime_seconds": validation_runtime_seconds,
     }
     with open(path, "wb") as f:
         cloudpickle.dump(state, f)
@@ -156,6 +172,8 @@ def load_training_state(path):
         state["epoch"],
         state["best_val_loss"],
         state.get("wandb_run_id"),
+        state.get("training_runtime_seconds", 0.0),
+        state.get("validation_runtime_seconds", 0.0),
     )
 
 
@@ -167,35 +185,31 @@ def train(config_path: str):
     # use TMPDIR for slurm jobs if available
     config["cache_dir"] = config.get("cache_dir") or os.environ.get("TMPDIR")
 
+    def make_dataset(path):
+        return dataset_from_path(
+            file_path=path,
+            atomic_numbers=config["atomic_numbers"],
+            cutoff=config["cutoff"],
+            backend="jax",
+        )
+
     if isinstance(config["train_path"], list):
         train_dataset = ConcatDataset(
-            [
-                AseDBDataset(
-                    file_path=path,
-                    atomic_numbers=config["atomic_numbers"],
-                    cutoff=config["cutoff"],
-                    backend="jax",
-                )
-                for path in config["train_path"]
-            ]
+            [make_dataset(path) for path in config["train_path"]]
         )
     else:
-        train_dataset = AseDBDataset(
-            file_path=config["train_path"],
-            atomic_numbers=config["atomic_numbers"],
-            cutoff=config["cutoff"],
-            backend="jax",
-        )
+        train_dataset = make_dataset(config["train_path"])
     if "valid_frac" in config:
-        train_dataset, val_dataset = train_dataset.split(valid_frac=config["valid_frac"])
+        train_dataset, val_dataset = train_dataset.split(
+            valid_frac=config["valid_frac"], seed=config.get("seed", 42)
+        )
     else:
         assert "valid_path" in config, "valid_path must be specified if valid_frac is not provided"
-        val_dataset = AseDBDataset(
-            file_path=config["valid_path"],
-            atomic_numbers=config["atomic_numbers"],
-            cutoff=config["cutoff"],
-            backend="jax",
-        )
+        val_dataset = make_dataset(config["valid_path"])
+
+    train_dataset = train_dataset.subset(
+        float(config.get("train_frac", 1.0)), seed=config.get("seed", 0)
+    )
 
     if "atom_energies" in config:
         atom_energies = [config["atom_energies"][n] for n in config["atomic_numbers"]]
@@ -225,6 +239,7 @@ def train(config_path: str):
         max_n_edges=stats["max_n_edges"],
         avg_n_nodes=stats["avg_n_nodes"],
         avg_n_edges=stats["avg_n_edges"],
+        seed=config.get("seed", 0),
         num_workers=16,
     )
     train_loader = ParallelLoader(train_loader, num_devices)
@@ -312,6 +327,8 @@ def train(config_path: str):
     start_epoch = 0
     best_val_loss = float("inf")
     wandb_run_id = None
+    training_runtime_seconds = 0.0
+    validation_runtime_seconds = 0.0
 
     if "resume_from" in config and Path(config["resume_from"]).exists():
         (
@@ -323,15 +340,45 @@ def train(config_path: str):
             start_epoch,
             best_val_loss,
             wandb_run_id,
+            training_runtime_seconds,
+            validation_runtime_seconds,
         ) = load_training_state(config["resume_from"])
 
-    wandb_init_kwargs = {"project": "nequix", "config": config}
+    run_name = wandb_run_name(config_path, config)
+    wandb_config = {
+        **config,
+        "train_size": len(train_dataset),
+        "val_size": len(val_dataset),
+    }
+    wandb_init_kwargs = {
+        "project": config.get("wandb_project", "nequix"),
+        "name": run_name,
+        "config": wandb_config,
+    }
+    if config.get("wandb_entity"):
+        wandb_init_kwargs["entity"] = config["wandb_entity"]
+    if config.get("wandb_mode"):
+        wandb_init_kwargs["mode"] = config["wandb_mode"]
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
-    wandb.init(**wandb_init_kwargs)
+    wandb_run = wandb.init(**wandb_init_kwargs)
+    wandb_run.define_metric("runtime/training_seconds", summary="last")
+    wandb_run.define_metric("runtime/training_hours", summary="last")
+    wandb_run.define_metric("runtime/validation_seconds", summary="last")
+    for metric_glob in ("train/*", "val/*"):
+        wandb_run.define_metric(metric_glob, step_metric="runtime/training_hours")
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary["param_count"] = param_count
+        wandb.run.summary["train_size"] = len(train_dataset)
+        wandb.run.summary["val_size"] = len(val_dataset)
         wandb_run_id = getattr(wandb.run, "id", None)
+
+    def runtime_metrics(training_seconds):
+        return {
+            "runtime/training_seconds": training_seconds,
+            "runtime/training_hours": training_seconds / 3600.0,
+            "runtime/validation_seconds": validation_runtime_seconds,
+        }
 
     # @eqx.filter_jit
     @functools.partial(eqx.filter_pmap, in_axes=(0, 0, None, 0, 0), axis_name="device")
@@ -369,15 +416,16 @@ def train(config_path: str):
         )
 
     for epoch in range(start_epoch, config["n_epochs"]):
-        start_time = time.time()
+        train_segment_start = time.perf_counter()
+        start_time = time.perf_counter()
         train_loader.loader.set_epoch(epoch)
         for batch in prefetch(train_loader):
-            batch_time = time.time() - start_time
-            start_time = time.time()
+            batch_time = time.perf_counter() - start_time
+            start_time = time.perf_counter()
             (model, ema_model, opt_state, total_loss, metrics) = train_step(
                 model, ema_model, step, opt_state, batch
             )
-            train_time = time.time() - start_time
+            train_time = time.perf_counter() - start_time
             step = step + 1
             if step % config["log_every"] == 0:
                 logs = {}
@@ -390,10 +438,17 @@ def train(config_path: str):
                 logs["train/batch_size"] = (
                     jax.vmap(jraph.get_graph_padding_mask)(batch).sum().item()
                 )
+                current_training_seconds = (
+                    training_runtime_seconds + time.perf_counter() - train_segment_start
+                )
+                logs.update(runtime_metrics(current_training_seconds))
                 wandb.log(logs, step=step)
                 print(f"step: {step}, logs: {logs}")
                 wandb_sync()
-            start_time = time.time()
+            start_time = time.perf_counter()
+
+        training_runtime_seconds += time.perf_counter() - train_segment_start
+        validation_start = time.perf_counter()
 
         ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
         val_metrics = evaluate(
@@ -409,6 +464,17 @@ def train(config_path: str):
             best_val_loss = val_metrics["loss"]
             save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model_single, config)
 
+        validation_runtime_seconds += time.perf_counter() - validation_start
+
+        logs = {}
+        for key, value in val_metrics.items():
+            logs[f"val/{key}"] = value.item()
+        logs["epoch"] = epoch
+        logs.update(runtime_metrics(training_runtime_seconds))
+        wandb.log(logs, step=step)
+        print(f"epoch: {epoch}, logs: {logs}")
+        wandb_sync()
+
         save_training_state(
             Path(wandb.run.dir) / "state.pkl",
             model,
@@ -419,6 +485,8 @@ def train(config_path: str):
             epoch + 1,
             best_val_loss,
             wandb_run_id=wandb_run_id,
+            training_runtime_seconds=training_runtime_seconds,
+            validation_runtime_seconds=validation_runtime_seconds,
         )
 
         if "state_path" in config:
@@ -432,15 +500,14 @@ def train(config_path: str):
                 epoch + 1,
                 best_val_loss,
                 wandb_run_id=wandb_run_id,
+                training_runtime_seconds=training_runtime_seconds,
+                validation_runtime_seconds=validation_runtime_seconds,
             )
 
-        logs = {}
-        for key, value in val_metrics.items():
-            logs[f"val/{key}"] = value.item()
-        logs["epoch"] = epoch
-        wandb.log(logs, step=step)
-        print(f"epoch: {epoch}, logs: {logs}")
-        wandb_sync()
+    final_runtime_metrics = runtime_metrics(training_runtime_seconds)
+    if hasattr(wandb, "run") and wandb.run is not None:
+        wandb.run.summary.update(final_runtime_metrics)
+    wandb.finish()
 
 
 def main():
