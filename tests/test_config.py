@@ -43,6 +43,7 @@ def test_config_dict_flattens_model_and_sequence_values():
     assert config["atomic_numbers"][:3] == [1, 2, 3]
     assert config["finetune_from"] == "models/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
+    assert config["autobatch"] is True
     assert "val_every_steps" not in config
     assert all(value is not None for value in config.values())
 

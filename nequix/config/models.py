@@ -343,6 +343,7 @@ class TrainerConfig:
     grad_clip_norm: float = 100.0
     weight_decay: float = 1.0e-3
     batch_size: int = 128
+    autobatch: bool = True
     n_epochs: int = 100
     energy_weight: float = 20.0
     force_weight: float = 20.0
@@ -421,8 +422,4 @@ def config_dict(config: RunConfig) -> dict[str, Any]:
     model_config = values.pop("model_config", None)
     if model_config is not None:
         values.update(model_config)
-    return {
-        key: _plain_value(value)
-        for key, value in values.items()
-        if value is not None
-    }
+    return {key: _plain_value(value) for key, value in values.items() if value is not None}

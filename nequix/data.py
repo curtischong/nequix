@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import queue
 import threading
+from collections import deque
 from abc import ABC, abstractmethod
 from pathlib import Path
 from pprint import pformat
@@ -313,6 +314,8 @@ class DataLoader:
         buffer_factor=1.1,
         num_workers=4,
         prefetch_factor=2,
+        packing="next_fit",
+        packing_lookahead=64,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -322,11 +325,17 @@ class DataLoader:
         self.idxs = np.arange(len(self.dataset))
         self.idx = 0
         self._generator = None  # created in __iter__
-        self.n_node = max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes) + 1
-        self.n_edge = max(batch_size * avg_n_edges * buffer_factor, max_n_edges)
-        self.n_graph = n_graph if n_graph is not None else batch_size + 1
+        self.n_node = int(max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes)) + 1
+        self.n_edge = int(max(batch_size * avg_n_edges * buffer_factor, max_n_edges))
+        self.n_graph = int(n_graph if n_graph is not None else batch_size + 1)
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
+        if packing not in {"next_fit", "best_fit"}:
+            raise ValueError(f"unknown packing strategy {packing!r}")
+        if packing_lookahead < 1:
+            raise ValueError("packing_lookahead must be at least one")
+        self.packing = packing
+        self.packing_lookahead = packing_lookahead
 
         self._started = False
         self.index_queue = None
@@ -399,12 +408,21 @@ class DataLoader:
         self.idx = 0
         if self.shuffle:
             self.idxs = self.rng.permutation(np.arange(len(self.dataset)))
-        self._generator = jraph.dynamically_batch(
-            self.make_generator(),
-            n_node=self.n_node,
-            n_edge=self.n_edge,
-            n_graph=self.n_graph,
-        )
+        if self.packing == "best_fit":
+            self._generator = best_fit_dynamic_batch(
+                self.make_generator(),
+                n_node=self.n_node,
+                n_edge=self.n_edge,
+                n_graph=self.n_graph,
+                lookahead=self.packing_lookahead,
+            )
+        else:
+            self._generator = jraph.dynamically_batch(
+                self.make_generator(),
+                n_node=self.n_node,
+                n_edge=self.n_edge,
+                n_graph=self.n_graph,
+            )
         return self
 
     def __next__(self):
@@ -419,10 +437,145 @@ class ParallelLoader:
     def __iter__(self):
         it = iter(self.loader)
         while True:
-            try:
-                yield jax.tree.map(lambda *x: np.stack(x), *[next(it) for _ in range(self.n)])
-            except StopIteration:
+            batches = []
+            for _ in range(self.n):
+                try:
+                    batches.append(next(it))
+                except StopIteration:
+                    break
+            if not batches:
                 return
+            batches.extend(_empty_padded_batch(batches[0]) for _ in range(self.n - len(batches)))
+            yield jax.tree.map(lambda *x: np.stack(x), *batches)
+
+
+def _graph_size(graph):
+    return (
+        int(np.asarray(graph.n_node).size),
+        int(np.asarray(graph.n_node).sum()),
+        int(np.asarray(graph.n_edge).sum()),
+    )
+
+
+def bounded_best_fit_indices(sizes, capacity, lookahead=64):
+    """Pack ordered items with deterministic, bounded-lookahead best fit.
+
+    ``capacity`` and every entry in ``sizes`` are ``(graphs, nodes, edges)``.
+    Items may move only within the rolling lookahead window, and each input
+    index is returned exactly once.
+    """
+    capacity = tuple(int(value) for value in capacity)
+    if capacity[0] < 1 or capacity[1] < 1 or capacity[2] < 0:
+        raise ValueError(
+            f"graph/node capacities must be positive and edges nonnegative: {capacity}"
+        )
+    if lookahead < 1:
+        raise ValueError("lookahead must be at least one")
+
+    sizes = [tuple(int(value) for value in size) for size in sizes]
+    for index, size in enumerate(sizes):
+        if any(value < 0 for value in size):
+            raise ValueError(f"item {index} has a negative size: {size}")
+        if any(value > limit for value, limit in zip(size, capacity)):
+            raise ValueError(f"item {index} with size {size} exceeds capacity {capacity}")
+
+    waiting = deque()
+    next_index = 0
+
+    def refill():
+        nonlocal next_index
+        while len(waiting) < lookahead and next_index < len(sizes):
+            waiting.append(next_index)
+            next_index += 1
+
+    refill()
+    while waiting:
+        used = (0, 0, 0)
+        packed = []
+        while True:
+            fitting = []
+            for position, index in enumerate(waiting):
+                added = tuple(a + b for a, b in zip(used, sizes[index]))
+                if all(value <= limit for value, limit in zip(added, capacity)):
+                    # Best fit minimizes normalized space left. The original
+                    # stream position is a stable tie-breaker.
+                    residual = sum(
+                        (limit - value) / limit
+                        for value, limit in zip(added, capacity)
+                        if limit > 0
+                    )
+                    fitting.append((residual, position, index, added))
+            if not fitting:
+                break
+            _, position, index, used = min(fitting)
+            del waiting[position]
+            packed.append(index)
+            refill()
+        if not packed:  # guarded by the individual-size check above
+            raise RuntimeError("best-fit packer made no progress")
+        yield packed
+
+
+def best_fit_dynamic_batch(graphs, n_node, n_edge, n_graph, lookahead=64):
+    """Batch graphs into a single static shape using bounded best-fit packing."""
+    # Jraph needs one spare graph and one spare node for its padding graph.
+    capacity = (int(n_graph) - 1, int(n_node) - 1, int(n_edge))
+    waiting = deque()
+    exhausted = False
+
+    def refill():
+        nonlocal exhausted
+        while len(waiting) < lookahead and not exhausted:
+            try:
+                graph = next(graphs)
+            except StopIteration:
+                exhausted = True
+                break
+            size = _graph_size(graph)
+            if any(value > limit for value, limit in zip(size, capacity)):
+                raise ValueError(f"graph with size {size} exceeds batch capacity {capacity}")
+            waiting.append((graph, size))
+
+    graphs = iter(graphs)
+    refill()
+    while waiting:
+        used = (0, 0, 0)
+        packed = []
+        while True:
+            fitting = []
+            for position, (graph, size) in enumerate(waiting):
+                added = tuple(a + b for a, b in zip(used, size))
+                if all(value <= limit for value, limit in zip(added, capacity)):
+                    residual = sum(
+                        (limit - value) / limit
+                        for value, limit in zip(added, capacity)
+                        if limit > 0
+                    )
+                    fitting.append((residual, position, graph, added))
+            if not fitting:
+                break
+            _, position, graph, used = min(fitting, key=lambda item: (item[0], item[1]))
+            del waiting[position]
+            packed.append(graph)
+            refill()
+        if not packed:
+            raise RuntimeError("best-fit graph packer made no progress")
+        yield jraph.pad_with_graphs(
+            jraph.batch_np(packed),
+            n_node=int(n_node),
+            n_edge=int(n_edge),
+            n_graph=int(n_graph),
+        )
+
+
+def _empty_padded_batch(batch):
+    """Return an all-padding batch with the same arrays and static shape."""
+    empty = jax.tree.map(np.zeros_like, batch)
+    n_node = np.zeros_like(batch.n_node)
+    n_edge = np.zeros_like(batch.n_edge)
+    n_node[0] = sum(np.asarray(batch.n_node))
+    n_edge[0] = sum(np.asarray(batch.n_edge))
+    return empty._replace(n_node=n_node, n_edge=n_edge)
 
 
 # simple threaded prefetching for dataloader (lets us build our dyanamic batches async)
