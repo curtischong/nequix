@@ -429,7 +429,7 @@ def train(run_config: TrainerConfig):
         avg_n_edges=stats["avg_n_edges"],
         seed=config.get("seed", 0),
         num_workers=16,
-        packing="best_fit" if config.get("autobatch", True) else "next_fit",
+        packing="best_fit",
     )
     if (
         per_device_train_loader.n_node != selected_shape.n_node
@@ -447,7 +447,7 @@ def train(run_config: TrainerConfig):
         avg_n_nodes=stats["avg_n_nodes"],
         avg_n_edges=stats["avg_n_edges"],
         num_workers=16,
-        packing="best_fit" if config.get("autobatch", True) else "next_fit",
+        packing="best_fit",
     )
     if val_loader.n_node != selected_shape.n_node or val_loader.n_edge != selected_shape.n_edge:
         raise RuntimeError("selected autobatch shape does not match the validation loader shape")
@@ -526,12 +526,11 @@ def train(run_config: TrainerConfig):
         "autobatch_cached": tune_result.cached,
     }
     wandb_init_kwargs = {
+        "entity": "curtischong",
         "project": config.get("wandb_project", "nequix"),
         "name": run_name,
         "config": wandb_config,
     }
-    if config.get("wandb_entity"):
-        wandb_init_kwargs["entity"] = config["wandb_entity"]
     if config.get("wandb_mode"):
         wandb_init_kwargs["mode"] = config["wandb_mode"]
     if wandb_run_id:

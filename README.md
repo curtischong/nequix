@@ -138,10 +138,11 @@ uv run train nequix-mp-1
 This will take less than 125 hours on a single 4 x A100 node (<25 hours with kernels). Standard JAX training
 automatically benchmarks safe per-device capacities in isolated subprocesses and
 caches the fastest fixed padded shape for the detected hardware, model, and data.
-The configured `batch_size` is the initial probe and fallback. Set
-`autobatch=False` to use that fixed per-device capacity directly. You can run on
-any number of GPUs, although hyperparameters like learning rate are often
-sensitive to global batch size.
+Probing starts with one example and grows geometrically using
+`autobatch_memory_scaling_factor` (default `1.6`), matching TorchSim's
+`memory_scaling_factor` control. The batch size is selected automatically rather
+than configured. You can run on any number of GPUs, although hyperparameters like
+learning rate are often sensitive to the resulting global batch size.
 
 ## Phonon fine-tuning (PFT)
 

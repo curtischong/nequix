@@ -27,7 +27,6 @@ _MP = TrainerConfig(
     max_n_nodes=444,
     scale=0.8066479563713074,
     shift=0.16502578765761478,
-    batch_size=64,
     n_epochs=100,
 )
 
@@ -49,7 +48,6 @@ _OMAT = replace(
     max_n_nodes=236,
     scale=0.8080419656942678,
     shift=-3.513482726416955,
-    batch_size=128,
     n_epochs=6,
     val_every_steps=10_000,
 )

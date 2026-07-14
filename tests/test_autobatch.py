@@ -130,9 +130,11 @@ def test_cache_key_invalidates_for_hardware_model_and_dataset_changes(tmp_path):
     assert key != autobatch_cache_key(config, stats, 101, _hardware())
     assert key != autobatch_cache_key(config, stats, 100, _hardware(40 * 1024**3))
     assert key != autobatch_cache_key({**config, "force_mode": "direct"}, stats, 100, _hardware())
+    assert key != autobatch_cache_key(
+        {**config, "autobatch_memory_scaling_factor": 2.0}, stats, 100, _hardware()
+    )
 
-    shape = batch_shape(config["batch_size"], stats)
-    result = tune_batch_shape(shape, stats, 100, 1, lambda candidate: ProbeResult(candidate, "ok"))
+    result = tune_batch_shape(stats, 100, 1, lambda candidate: ProbeResult(candidate, "ok"))
     cache_path = tmp_path / "autobatch.json"
     cache_tune_result(cache_path, key, result)
     loaded = cached_tune_result(cache_path, key)
@@ -142,11 +144,10 @@ def test_cache_key_invalidates_for_hardware_model_and_dataset_changes(tmp_path):
     assert cached_tune_result(cache_path, "different") is None
 
 
-def test_probe_failure_and_oom_fall_back_to_configured_shape():
-    initial = batch_shape(4, _stats())
+def test_probe_failure_and_oom_fall_back_to_single_example_shape():
+    initial = batch_shape(1, _stats())
 
     failed = tune_batch_shape(
-        initial,
         _stats(),
         dataset_size=100,
         device_count=1,
@@ -160,37 +161,48 @@ def test_probe_failure_and_oom_fall_back_to_configured_shape():
             return ProbeResult(shape, "ok", graphs_per_second=10.0)
         return ProbeResult(shape, "oom", error="RESOURCE_EXHAUSTED")
 
-    oom = tune_batch_shape(initial, _stats(), 100, 1, oom_after_baseline)
+    oom = tune_batch_shape(_stats(), 100, 1, oom_after_baseline)
     assert oom.shape == initial
     assert any(probe.status == "oom" for probe in oom.probes)
-    assert "configured capacity" in oom.warning
+    assert "single-example capacity" in oom.warning
 
 
 def test_tuner_selects_only_a_measurably_faster_safe_candidate():
-    initial = batch_shape(4, _stats())
-
     def probe(shape):
         if shape.batch_size > 12:
             return ProbeResult(shape, "oom")
-        speed = {4: 10.0, 8: 14.0, 12: 13.0}.get(shape.batch_size, 11.0)
+        speed = {1: 5.0, 2: 8.0, 4: 10.0, 8: 14.0, 12: 13.0}.get(
+            shape.batch_size, 11.0
+        )
         return ProbeResult(shape, "ok", graphs_per_second=speed)
 
-    result = tune_batch_shape(initial, _stats(), 100, 1, probe)
+    result = tune_batch_shape(
+        _stats(), 100, 1, probe, memory_scaling_factor=2.0
+    )
     assert result.shape.batch_size == 8
     assert result.warning is None
 
 
-def test_autobatch_false_is_exact_fixed_shape_without_hardware_probe(monkeypatch):
-    config = {**_config(), "autobatch": False, "batch_size": 7}
-    monkeypatch.setattr(
-        "nequix.autobatch.query_gpu_hardware",
-        lambda: pytest.fail("fixed batching must not inspect GPUs"),
-    )
+def test_training_falls_back_to_one_example_without_detected_gpu(monkeypatch):
+    config = _config()
+    monkeypatch.setattr("nequix.autobatch.query_gpu_hardware", lambda: {"gpus": []})
 
-    result = tune_training_batch(config, _stats(), list(range(10)), [0.0])
+    with pytest.warns(RuntimeWarning, match="single-example capacity"):
+        result = tune_training_batch(config, _stats(), list(range(10)), [0.0])
 
-    assert result.shape == batch_shape(7, _stats())
+    assert result.shape == batch_shape(1, _stats())
     assert not result.probes
+
+
+def test_memory_scaling_factor_must_be_greater_than_one():
+    with pytest.raises(ValueError, match="greater than one"):
+        tune_batch_shape(
+            _stats(),
+            100,
+            1,
+            lambda shape: ProbeResult(shape, "ok"),
+            memory_scaling_factor=1.0,
+        )
 
 
 class _ToyModel(eqx.Module):

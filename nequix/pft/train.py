@@ -389,7 +389,11 @@ def train(run_config: PFTTrainerConfig):
             wandb_run_id,
         ) = load_training_state(config["resume_from"])
 
-    wandb_init_kwargs = {"project": "nequix-phonon", "config": config}
+    wandb_init_kwargs = {
+        "entity": "curtischong",
+        "project": "nequix-phonon",
+        "config": config,
+    }
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
     wandb.init(**wandb_init_kwargs)

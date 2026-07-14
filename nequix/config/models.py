@@ -342,8 +342,7 @@ class TrainerConfig:
     warmup_factor: float = 0.2
     grad_clip_norm: float = 100.0
     weight_decay: float = 1.0e-3
-    batch_size: int = 128
-    autobatch: bool = True
+    autobatch_memory_scaling_factor: float = 1.6
     n_epochs: int = 100
     energy_weight: float = 20.0
     force_weight: float = 20.0
@@ -361,7 +360,6 @@ class TrainerConfig:
     run_name: str | None = None
     wandb_run_name: str | None = None
     wandb_project: str | None = None
-    wandb_entity: str | None = None
     wandb_mode: str | None = None
 
 

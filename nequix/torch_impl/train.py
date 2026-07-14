@@ -420,12 +420,11 @@ def train(run_config: TrainerConfig):
             "val_size": len(val_dataset),
         }
         wandb_init_kwargs = {
+            "entity": "curtischong",
             "project": config.get("wandb_project", "nequix"),
             "name": run_name,
             "config": wandb_config,
         }
-        if config.get("wandb_entity"):
-            wandb_init_kwargs["entity"] = config["wandb_entity"]
         if config.get("wandb_mode"):
             wandb_init_kwargs["mode"] = config["wandb_mode"]
         if wandb_run_id:

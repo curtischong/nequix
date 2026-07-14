@@ -19,7 +19,7 @@ import jax
 import jaxlib
 
 
-_CACHE_SCHEMA = 1
+_CACHE_SCHEMA = 2
 _MODEL_SHAPE_KEYS = (
     "atomic_numbers",
     "hidden_irreps",
@@ -87,7 +87,7 @@ class TuneResult:
 
 
 def batch_shape(batch_size: int, stats: dict, buffer_factor: float = 1.1) -> BatchShape:
-    """Return the single padded shape used by the legacy batch-size heuristic."""
+    """Return the padded shape for an internal autobatch candidate."""
     batch_size = int(batch_size)
     if batch_size < 1:
         raise ValueError("batch_size must be at least one")
@@ -166,7 +166,7 @@ def autobatch_cache_key(config: dict, stats: dict, dataset_size: int, hardware: 
         "dataset_size": int(dataset_size),
         "dataset_stats": {key: stats.get(key) for key in _DATASET_STAT_KEYS},
         "dataset_config": {key: config.get(key) for key in ("train_path", "train_frac", "seed")},
-        "initial_batch_size": config.get("batch_size"),
+        "autobatch_memory_scaling_factor": config.get("autobatch_memory_scaling_factor", 1.6),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -184,7 +184,7 @@ def default_cache_path() -> Path:
     if override:
         return Path(override).expanduser()
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return root / "nequix" / "autobatch-v1.json"
+    return root / "nequix" / "autobatch-v2.json"
 
 
 def _load_cache(path: Path) -> dict:
@@ -245,16 +245,19 @@ def cache_tune_result(path: Path, key: str, result: TuneResult):
 
 
 def tune_batch_shape(
-    initial_shape: BatchShape,
     stats: dict,
     dataset_size: int,
     device_count: int,
     probe: Callable[[BatchShape], ProbeResult],
     *,
-    max_multiplier: int = 8,
+    memory_scaling_factor: float = 1.6,
     minimum_speedup: float = 0.02,
 ) -> TuneResult:
     """Probe a safe capacity range and choose measured graph throughput."""
+    if not math.isfinite(memory_scaling_factor) or memory_scaling_factor <= 1:
+        raise ValueError("autobatch_memory_scaling_factor must be greater than one")
+
+    initial_shape = batch_shape(1, stats)
     probes = []
 
     def run(candidate_batch_size):
@@ -272,27 +275,27 @@ def tune_batch_shape(
             shape=initial_shape,
             probes=tuple(probes),
             warning=(
-                "autobatch probing failed at the configured capacity; "
-                "using the configured fixed capacity"
+                "autobatch probing failed at the minimum capacity; "
+                "using a single-example capacity"
             ),
         )
 
     per_device_examples = max(1, math.ceil(dataset_size / max(device_count, 1)))
-    upper_limit = max(
-        initial_shape.batch_size,
-        min(initial_shape.batch_size * max_multiplier, per_device_examples),
-    )
+    upper_limit = per_device_examples
     last_safe = baseline
     first_unsafe = None
     candidate = initial_shape.batch_size
     while candidate < upper_limit:
-        candidate = min(candidate * 2, upper_limit)
+        candidate = min(
+            max(round(candidate * memory_scaling_factor), candidate + 1),
+            upper_limit,
+        )
         result = run(candidate)
         if result.status == "failed":
             return TuneResult(
                 shape=initial_shape,
                 probes=tuple(probes),
-                warning="autobatch probing failed; using the configured fixed capacity",
+                warning="autobatch probing failed; using a single-example capacity",
             )
         if result.safe:
             last_safe = result
@@ -313,7 +316,7 @@ def tune_batch_shape(
                 return TuneResult(
                     shape=initial_shape,
                     probes=tuple(probes),
-                    warning="autobatch probing failed; using the configured fixed capacity",
+                    warning="autobatch probing failed; using a single-example capacity",
                 )
             if result.safe:
                 low = middle
@@ -327,8 +330,8 @@ def tune_batch_shape(
             shape=initial_shape,
             probes=tuple(probes),
             warning=(
-                "no autobatch candidate was measurably faster than the configured capacity; "
-                "using the configured fixed capacity"
+                "no autobatch candidate was measurably faster than one example; "
+                "using a single-example capacity"
             ),
         )
     return TuneResult(shape=best.shape, probes=tuple(probes))
@@ -378,13 +381,14 @@ def subprocess_probe(payload: dict, shape: BatchShape, timeout: float = 1800) ->
 
 def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResult:
     """Load or measure the fixed batch shape for a standard JAX training run."""
-    initial = batch_shape(config["batch_size"], stats)
-    if not config.get("autobatch", True):
-        return TuneResult(shape=initial)
+    initial = batch_shape(1, stats)
+    memory_scaling_factor = float(config.get("autobatch_memory_scaling_factor", 1.6))
+    if not math.isfinite(memory_scaling_factor) or memory_scaling_factor <= 1:
+        raise ValueError("autobatch_memory_scaling_factor must be greater than one")
 
     hardware = query_gpu_hardware()
     if not hardware["gpus"]:
-        message = "autobatch could not identify an NVIDIA GPU; using the configured fixed capacity"
+        message = "autobatch could not identify an NVIDIA GPU; using a single-example capacity"
         warnings.warn(message, RuntimeWarning)
         return TuneResult(shape=initial, warning=message)
 
@@ -403,12 +407,11 @@ def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResu
         "atom_energies": atom_energies,
     }
     result = tune_batch_shape(
-        initial,
         stats,
         len(train_dataset),
         len(hardware["gpus"]),
         lambda shape: subprocess_probe(payload, shape),
-        max_multiplier=int(os.environ.get("NEQUIX_AUTOBATCH_MAX_MULTIPLIER", 8)),
+        memory_scaling_factor=memory_scaling_factor,
         minimum_speedup=float(os.environ.get("NEQUIX_AUTOBATCH_MIN_SPEEDUP", 0.02)),
     )
     result = replace(result, cache_key=key)
