@@ -3,8 +3,9 @@ import multiprocessing
 import os
 import queue
 import threading
-from collections import deque
 from abc import ABC, abstractmethod
+from collections import deque
+from itertools import islice
 from pathlib import Path
 from typing import Callable
 
@@ -124,6 +125,107 @@ def atomic_numbers_to_indices(atomic_numbers: list[int]) -> dict[int, int]:
     return {n: i for i, n in enumerate(sorted(atomic_numbers))}
 
 
+def _record_to_graph_dict(
+    record: dict,
+    senders: np.ndarray,
+    receivers: np.ndarray,
+    shifts: np.ndarray,
+) -> dict:
+    graph = {
+        "n_node": np.array([len(record["species"])], dtype=np.int32),
+        "n_edge": np.array([len(senders)], dtype=np.int32),
+        "senders": np.asarray(senders, dtype=np.int32),
+        "receivers": np.asarray(receivers, dtype=np.int32),
+        "species": record["species"],
+        "positions": record["positions"],
+        "shifts": np.asarray(shifts, dtype=np.float32),
+        "cell": record["cell"],
+        "forces": record["forces"],
+        "energy": record["energy"],
+    }
+    if record.get("stress") is not None:
+        graph["stress"] = record["stress"]
+    return graph
+
+
+def _matscipy_graph(record: dict, cutoff: float) -> dict:
+    src, dst, shifts = matscipy.neighbours.neighbour_list(
+        "ijS",
+        positions=record["positions"],
+        cell=record["neighbor_cell"],
+        pbc=record["pbc"],
+        cutoff=cutoff,
+    )
+    return _record_to_graph_dict(record, dst, src, shifts)
+
+
+def build_alchemi_graphs(records: list[dict], cutoff: float, max_neighbors: int) -> list:
+    """Build graphs for a batch of raw records with AlchemiOps on a Torch GPU."""
+    if not records:
+        return []
+    if max_neighbors < 1:
+        raise ValueError("max_neighbors must be at least one")
+
+    import torch
+    from nvalchemiops.torch.neighbors import batch_naive_neighbor_list
+
+    atom_counts = np.asarray([len(record["positions"]) for record in records], dtype=np.int32)
+    positions = np.concatenate([record["positions"] for record in records])
+    cells = np.stack([record["neighbor_cell"] for record in records]).astype(np.float32)
+    pbc = np.stack([record["pbc"] for record in records])
+    system_idx = np.repeat(np.arange(len(records), dtype=np.int32), atom_counts)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("the Alchemi training neighbor list requires a CUDA GPU")
+    device = torch.device("cuda")
+    # AlchemiOps compiles this wrapper. Dynamic shapes in torch.bincount can
+    # make Dynamo fail after another compiled Torch workload has run, so allow
+    # the documented eager fallback for data loading.
+    previous_suppress_errors = torch._dynamo.config.suppress_errors
+    torch._dynamo.config.suppress_errors = True
+    try:
+        neighbor_list, neighbor_ptr, shifts = batch_naive_neighbor_list(
+            torch.from_numpy(positions).to(device),
+            cutoff,
+            batch_idx=torch.from_numpy(system_idx).to(device),
+            cell=torch.from_numpy(cells).to(device),
+            pbc=torch.from_numpy(pbc).to(device),
+            max_neighbors=max_neighbors,
+            return_neighbor_list=True,
+        )
+    finally:
+        torch._dynamo.config.suppress_errors = previous_suppress_errors
+    neighbor_list = neighbor_list.cpu().numpy()
+    neighbor_ptr = neighbor_ptr.cpu().numpy()
+    shifts = shifts.cpu().numpy()
+
+    graphs = []
+    atom_offset = 0
+    for record, atom_count in zip(records, atom_counts):
+        next_atom_offset = atom_offset + int(atom_count)
+        edge_start = int(neighbor_ptr[atom_offset])
+        edge_end = int(neighbor_ptr[next_atom_offset])
+        graphs.append(
+            dict_to_graphstuple(
+                _record_to_graph_dict(
+                    record,
+                    neighbor_list[1, edge_start:edge_end] - atom_offset,
+                    neighbor_list[0, edge_start:edge_end] - atom_offset,
+                    shifts[edge_start:edge_end],
+                )
+            )
+        )
+        atom_offset = next_atom_offset
+    return graphs
+
+
+def alchemi_graph_generator(records, cutoff: float, batch_size: int, max_neighbors: int):
+    """Convert raw records to graphs in large GPU neighbor-list batches."""
+    records = iter(records)
+    while chunk := list(islice(records, batch_size)):
+        yield from build_alchemi_graphs(chunk, cutoff, max_neighbors)
+
+
 class Dataset(ABC):
     def __init__(self, backend: str = "jax"):
         self.backend = backend
@@ -132,6 +234,13 @@ class Dataset(ABC):
     def __len__(self) -> int: ...
     @abstractmethod
     def _get_graph_dict(self, idx: int) -> dict: ...
+
+    def _get_record_dict(self, idx: int) -> dict:
+        raise TypeError(f"{type(self).__name__} does not expose raw atom records")
+
+    def get_record(self, idx: int) -> dict:
+        """Return a raw record suitable for batched neighbor construction."""
+        return self._get_record_dict(idx)
 
     def __getitem__(self, idx: int):
         graph = self._get_graph_dict(idx)
@@ -174,6 +283,9 @@ class IndexDataset(Dataset):
     def _get_graph_dict(self, i: int):
         return self.base._get_graph_dict(int(self.indices[i]))
 
+    def _get_record_dict(self, i: int):
+        return self.base.get_record(int(self.indices[i]))
+
 
 class ConcatDataset(Dataset):
     def __init__(self, datasets: list[Dataset]):
@@ -189,6 +301,12 @@ class ConcatDataset(Dataset):
         if ds_idx > 0:
             idx = idx - self.len_cumulative[ds_idx - 1]
         return self.datasets[ds_idx]._get_graph_dict(idx)
+
+    def _get_record_dict(self, idx: int):
+        ds_idx = bisect.bisect(self.len_cumulative, idx)
+        if ds_idx > 0:
+            idx = idx - self.len_cumulative[ds_idx - 1]
+        return self.datasets[ds_idx].get_record(idx)
 
 
 class AtomPackDataset(Dataset):
@@ -226,7 +344,7 @@ class AtomPackDataset(Dataset):
     def _get_molecule(self, idx: int):
         return self._get_database().get_molecule(idx)
 
-    def _molecule_to_graph_dict(self, molecule, idx: int):
+    def _molecule_to_record_dict(self, molecule, idx: int):
         if molecule.energy is None or molecule.forces is None:
             raise ValueError(
                 f"AtomPack training record {idx} in {self.file_path} must contain energy and forces"
@@ -237,9 +355,6 @@ class AtomPackDataset(Dataset):
         pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
         raw_cell = np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
         cell = complete_cell(raw_cell)
-        src, dst, shift = matscipy.neighbours.neighbour_list(
-            "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
-        )
 
         stress = molecule.stress
         if stress is not None:
@@ -247,29 +362,32 @@ class AtomPackDataset(Dataset):
             if stress.shape == (6,):
                 stress = voigt_6_to_full_3x3_stress(stress)
 
-        graph = {
-            "n_node": np.array([len(atomic_numbers)], dtype=np.int32),
-            "n_edge": np.array([len(src)], dtype=np.int32),
-            "senders": dst.astype(np.int32),
-            "receivers": src.astype(np.int32),
+        record = {
             "species": np.array(
                 [self.atomic_indices[int(number)] for number in atomic_numbers], dtype=np.int32
             ),
             "positions": positions.astype(np.float32),
-            "shifts": shift.astype(np.float32),
+            "neighbor_cell": cell,
+            "pbc": pbc.astype(bool),
             "cell": raw_cell.astype(np.float32) if pbc.all() else None,
             "forces": np.asarray(molecule.forces, dtype=np.float32),
             "energy": np.array([molecule.energy], dtype=np.float32),
         }
         if stress is not None:
-            graph["stress"] = stress.astype(np.float32)
-        return graph
+            record["stress"] = stress.astype(np.float32)
+        return record
+
+    def _molecule_to_graph_dict(self, molecule, idx: int):
+        return _matscipy_graph(self._molecule_to_record_dict(molecule, idx), self.cutoff)
+
+    def _get_record_dict(self, idx: int):
+        return self._molecule_to_record_dict(self._get_molecule(idx), idx)
 
     def _get_graph_dict(self, idx: int):
         return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
 
 
-def _dataloader_worker(dataset, index_queue, output_queue):
+def _dataloader_worker(dataset, index_queue, output_queue, raw_records=False):
     while True:
         try:
             index = index_queue.get(timeout=0)
@@ -277,7 +395,12 @@ def _dataloader_worker(dataset, index_queue, output_queue):
             continue
         if index is None:
             break
-        output_queue.put((index, dataset[index]))
+        if raw_records and isinstance(index, (list, tuple, np.ndarray)):
+            indices = [int(value) for value in index]
+            output_queue.put((indices, [dataset.get_record(value) for value in indices]))
+        else:
+            item = dataset.get_record(index) if raw_records else dataset[index]
+            output_queue.put((index, item))
 
 
 def padded_shape(
@@ -314,6 +437,11 @@ class DataLoader:
         prefetch_factor=2,
         packing="next_fit",
         packing_lookahead=64,
+        neighbor_backend="matscipy",
+        neighbor_cutoff=None,
+        neighbor_batch_size=1024,
+        neighbor_max_neighbors=512,
+        record_batch_size=64,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -335,6 +463,21 @@ class DataLoader:
             raise ValueError("packing_lookahead must be at least one")
         self.packing = packing
         self.packing_lookahead = packing_lookahead
+        if neighbor_backend not in {"alchemi", "matscipy"}:
+            raise ValueError(f"unknown neighbor backend {neighbor_backend!r}")
+        if neighbor_backend == "alchemi" and neighbor_cutoff is None:
+            raise ValueError("neighbor_cutoff is required for the Alchemi backend")
+        if neighbor_batch_size < 1:
+            raise ValueError("neighbor_batch_size must be at least one")
+        if neighbor_max_neighbors < 1:
+            raise ValueError("neighbor_max_neighbors must be at least one")
+        if record_batch_size < 1:
+            raise ValueError("record_batch_size must be at least one")
+        self.neighbor_backend = neighbor_backend
+        self.neighbor_cutoff = neighbor_cutoff
+        self.neighbor_batch_size = neighbor_batch_size
+        self.neighbor_max_neighbors = neighbor_max_neighbors
+        self.record_batch_size = record_batch_size
 
         self._started = False
         self.index_queue = None
@@ -356,20 +499,35 @@ class DataLoader:
         for _ in range(self.num_workers):
             worker = multiprocessing.Process(
                 target=_dataloader_worker,
-                args=(self.dataset, self.index_queue, self.output_queue),
+                args=(
+                    self.dataset,
+                    self.index_queue,
+                    self.output_queue,
+                    self.neighbor_backend == "alchemi",
+                ),
             )
             worker.daemon = True
             worker.start()
             self.workers.append(worker)
+
+    def start_workers(self):
+        """Start data workers before an accelerator runtime creates threads."""
+        self._start_workers()
 
     def set_epoch(self, epoch):
         self.rng = np.random.default_rng(seed=hash((self.seed, epoch)) % 2**32)
 
     def _prefetch(self):
         prefetch_limit = self.idx + self.prefetch_factor * self.num_workers * self.batch_size
-        while self.prefetch_idx < len(self.dataset) and self.prefetch_idx < prefetch_limit:
-            self.index_queue.put(self.idxs[self.prefetch_idx])
-            self.prefetch_idx += 1
+        prefetch_limit = min(prefetch_limit, len(self.dataset))
+        while self.prefetch_idx < prefetch_limit:
+            if self.neighbor_backend == "alchemi":
+                next_prefetch_idx = min(self.prefetch_idx + self.record_batch_size, prefetch_limit)
+                self.index_queue.put(self.idxs[self.prefetch_idx : next_prefetch_idx].tolist())
+                self.prefetch_idx = next_prefetch_idx
+            else:
+                self.index_queue.put(self.idxs[self.prefetch_idx])
+                self.prefetch_idx += 1
 
     def make_generator(self):
         cache = {}
@@ -381,7 +539,7 @@ class DataLoader:
 
             self._prefetch()
 
-            real_idx = self.idxs[self.idx]
+            real_idx = int(self.idxs[self.idx])
 
             if real_idx in cache:
                 item = cache[real_idx]
@@ -393,11 +551,13 @@ class DataLoader:
                     except queue.Empty:
                         continue
 
-                    if index == real_idx:
-                        item = data
-                        break
+                    if isinstance(index, list):
+                        cache.update(zip(index, data))
                     else:
-                        cache[index] = data
+                        cache[int(index)] = data
+                    if real_idx in cache:
+                        item = cache.pop(real_idx)
+                        break
 
             yield item
             self.idx += 1
@@ -407,9 +567,17 @@ class DataLoader:
         self.idx = 0
         if self.shuffle:
             self.idxs = self.rng.permutation(np.arange(len(self.dataset)))
+        graphs = self.make_generator()
+        if self.neighbor_backend == "alchemi":
+            graphs = alchemi_graph_generator(
+                graphs,
+                cutoff=self.neighbor_cutoff,
+                batch_size=self.neighbor_batch_size,
+                max_neighbors=self.neighbor_max_neighbors,
+            )
         if self.packing == "best_fit":
             self._generator = best_fit_dynamic_batch(
-                self.make_generator(),
+                graphs,
                 n_node=self.n_node,
                 n_edge=self.n_edge,
                 n_graph=self.n_graph,
@@ -417,7 +585,7 @@ class DataLoader:
             )
         else:
             self._generator = jraph.dynamically_batch(
-                self.make_generator(),
+                graphs,
                 n_node=self.n_node,
                 n_edge=self.n_edge,
                 n_graph=self.n_graph,

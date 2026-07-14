@@ -114,6 +114,9 @@ class TrainerConfig:
     valid_path: str | None = None
     dataset_name: str | None = None
     train_frac: float = 1.0
+    neighbor_backend: Literal["alchemi", "matscipy"] = "alchemi"
+    neighbor_batch_size: int = 1024
+    neighbor_max_neighbors: int = 512
     seed: int = 0
     optimizer: str = "muon"
     learning_rate: float = 0.01

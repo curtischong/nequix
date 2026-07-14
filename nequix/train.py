@@ -426,7 +426,6 @@ def train(run_config: TrainerConfig):
     selected_shape = tune_result.shape
     print(probe_summary(tune_result))
 
-    num_devices = len(jax.devices())
     per_device_train_loader = DataLoader(
         train_dataset,
         batch_size=selected_shape.batch_size,
@@ -439,8 +438,11 @@ def train(run_config: TrainerConfig):
         seed=config.seed,
         num_workers=16,
         packing="best_fit",
+        neighbor_backend=config.neighbor_backend,
+        neighbor_cutoff=config.model_config.cutoff,
+        neighbor_batch_size=config.neighbor_batch_size,
+        neighbor_max_neighbors=config.neighbor_max_neighbors,
     )
-    train_loader = ParallelLoader(per_device_train_loader, num_devices)
     val_loader = DataLoader(
         val_dataset,
         batch_size=selected_shape.batch_size,
@@ -452,7 +454,17 @@ def train(run_config: TrainerConfig):
         avg_n_edges=config.avg_n_edges,
         num_workers=16,
         packing="best_fit",
+        neighbor_backend=config.neighbor_backend,
+        neighbor_cutoff=config.model_config.cutoff,
+        neighbor_batch_size=config.neighbor_batch_size,
+        neighbor_max_neighbors=config.neighbor_max_neighbors,
     )
+    # Fork the NumPy-only database workers before either JAX or Torch creates
+    # accelerator runtime threads in this process.
+    per_device_train_loader.start_workers()
+    val_loader.start_workers()
+    num_devices = len(jax.devices())
+    train_loader = ParallelLoader(per_device_train_loader, num_devices)
 
     wandb_sync = (
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None

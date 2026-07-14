@@ -33,10 +33,6 @@ def _block_step(output):
 
 def run_probe(config: TrainerConfig, dataset, shape: BatchShape) -> ProbeResult:
     stats = config.dataset_stats()
-    devices = list(jax.devices())
-    if not devices or devices[0].platform != "gpu":
-        return ProbeResult(shape=shape, status="failed", error="probe did not find a JAX GPU")
-
     loader = DataLoader(
         dataset,
         batch_size=shape.batch_size,
@@ -48,7 +44,15 @@ def run_probe(config: TrainerConfig, dataset, shape: BatchShape) -> ProbeResult:
         avg_n_edges=stats["avg_n_edges"],
         num_workers=min(4, max(1, len(dataset))),
         packing="best_fit",
+        neighbor_backend=config.neighbor_backend,
+        neighbor_cutoff=config.model_config.cutoff,
+        neighbor_batch_size=config.neighbor_batch_size,
+        neighbor_max_neighbors=config.neighbor_max_neighbors,
     )
+    loader.start_workers()
+    devices = list(jax.devices())
+    if not devices or devices[0].platform != "gpu":
+        return ProbeResult(shape=shape, status="failed", error="probe did not find a JAX GPU")
 
     parallel_loader = ParallelLoader(loader, len(devices))
     warmup_steps = 3

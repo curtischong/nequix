@@ -33,6 +33,9 @@ def test_config_values_preserves_typed_config_structure():
     assert config["finetune_from"] == "checkpoints/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
     assert config["autobatch_memory_scaling_factor"] == 1.6
+    assert config["neighbor_backend"] == "alchemi"
+    assert config["neighbor_batch_size"] == 1024
+    assert config["neighbor_max_neighbors"] == 512
     assert "autobatch" not in config
     assert config["val_every_steps"] is None
 

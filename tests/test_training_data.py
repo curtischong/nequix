@@ -8,7 +8,7 @@ from ase.io import write
 from atompack import Database, Molecule
 
 from nequix.config import RUNS
-from nequix.data import AtomPackDataset, Dataset
+from nequix.data import AtomPackDataset, Dataset, build_alchemi_graphs
 from nequix.pft.data import PhononDataset
 from nequix.train import wandb_run_name
 from scripts.preprocess_ase_db import preprocess as preprocess_ase_db
@@ -63,6 +63,57 @@ def test_atompack_dataset_builds_graph(tmp_path):
     assert graph["forces"].shape == (2, 3)
     assert graph["stress"].shape == (3, 3)
     assert graph["n_edge"].item() == 2
+
+
+def _sorted_edge_rows(graph):
+    rows = np.column_stack((graph.receivers, graph.senders, graph.edges["shifts"]))
+    return rows[np.lexsort(rows.T[::-1])]
+
+
+def _has_torch_gpu():
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _has_torch_gpu(), reason="AlchemiOps requires a CUDA GPU")
+def test_alchemi_graphs_match_matscipy(tmp_path):
+    path = tmp_path / "train.atp"
+    database = Database(str(path), overwrite=True)
+    for distance in (1.0, 1.25):
+        database.add_molecule(
+            Molecule.from_arrays(
+                positions=np.array([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]], dtype=np.float32),
+                atomic_numbers=np.array([1, 8], dtype=np.uint8),
+                energy=-1.5,
+                forces=np.zeros((2, 3), dtype=np.float32),
+                cell=np.eye(3, dtype=np.float64) * 5.0,
+                stress=np.eye(3, dtype=np.float32),
+                pbc=(True, True, True),
+            )
+        )
+    database.flush()
+
+    dataset = AtomPackDataset(str(path), [1, 8], cutoff=1.5, backend="jax")
+    expected = [dataset[index] for index in range(len(dataset))]
+    actual = build_alchemi_graphs(
+        [dataset.get_record(index) for index in range(len(dataset))],
+        cutoff=1.5,
+        max_neighbors=32,
+    )
+
+    for actual_graph, expected_graph in zip(actual, expected):
+        np.testing.assert_array_equal(
+            _sorted_edge_rows(actual_graph), _sorted_edge_rows(expected_graph)
+        )
+        np.testing.assert_array_equal(
+            actual_graph.nodes["species"], expected_graph.nodes["species"]
+        )
+        np.testing.assert_allclose(actual_graph.nodes["forces"], expected_graph.nodes["forces"])
+        np.testing.assert_allclose(actual_graph.globals["energy"], expected_graph.globals["energy"])
 
 
 def test_extxyz_preprocessor_writes_atompack(tmp_path):

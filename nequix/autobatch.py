@@ -21,7 +21,7 @@ import jaxlib
 from nequix.config import TrainerConfig
 from nequix.data import padded_shape
 
-_CACHE_SCHEMA = 2
+_CACHE_SCHEMA = 3
 _OOM_MARKERS = (
     "out of memory",
     "resource_exhausted",
@@ -172,6 +172,9 @@ def autobatch_cache_key(config: TrainerConfig, dataset_size: int, hardware: dict
             "train_path": config.train_path,
             "train_frac": config.train_frac,
             "seed": config.seed,
+            "neighbor_backend": config.neighbor_backend,
+            "neighbor_batch_size": config.neighbor_batch_size,
+            "neighbor_max_neighbors": config.neighbor_max_neighbors,
         },
         "autobatch_memory_scaling_factor": config.autobatch_memory_scaling_factor,
         "autobatch_minimum_speedup": config.autobatch_minimum_speedup,

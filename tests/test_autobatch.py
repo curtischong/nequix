@@ -136,6 +136,10 @@ def test_cache_key_invalidates_for_hardware_model_and_dataset_changes(tmp_path):
     assert key != autobatch_cache_key(
         replace(config, autobatch_minimum_speedup=0.1), 100, _hardware()
     )
+    assert key != autobatch_cache_key(
+        replace(config, neighbor_backend="matscipy"), 100, _hardware()
+    )
+    assert key != autobatch_cache_key(replace(config, neighbor_batch_size=256), 100, _hardware())
 
     result = tune_batch_shape(_stats(), 100, 1, lambda candidate: ProbeResult(candidate, "ok"))
     cache_path = tmp_path / "autobatch.json"
@@ -174,14 +178,10 @@ def test_tuner_selects_only_a_measurably_faster_safe_candidate():
     def probe(shape):
         if shape.batch_size > 12:
             return ProbeResult(shape, "oom")
-        speed = {1: 5.0, 2: 8.0, 4: 10.0, 8: 14.0, 12: 13.0}.get(
-            shape.batch_size, 11.0
-        )
+        speed = {1: 5.0, 2: 8.0, 4: 10.0, 8: 14.0, 12: 13.0}.get(shape.batch_size, 11.0)
         return ProbeResult(shape, "ok", graphs_per_second=speed)
 
-    result = tune_batch_shape(
-        _stats(), 100, 1, probe, memory_scaling_factor=2.0
-    )
+    result = tune_batch_shape(_stats(), 100, 1, probe, memory_scaling_factor=2.0)
     assert result.shape.batch_size == 8
     assert result.warning is None
 

@@ -107,6 +107,12 @@ uv run train nequix-omat-1
 uv run train nequix-oam-1
 ```
 
+Standard JAX training builds neighbor lists with the batched NVIDIA ALCHEMI
+Toolkit-Ops backend by default. `neighbor_batch_size` controls how many raw
+AtomPack records are grouped into each GPU neighbor-list call, and
+`neighbor_max_neighbors` sets its fixed per-atom capacity. Set
+`neighbor_backend="matscipy"` on a `TrainerConfig` to use the legacy CPU path.
+
 To reproduce the training of Nequix-MP-1, first clone the repo and sync the environment:
 
 ```bash
