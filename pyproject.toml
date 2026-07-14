@@ -24,6 +24,7 @@ dependencies = [
     "wandb-osh>=1.2.2",
     "cloudpickle>=3.1.1",
     "atompack-db>=0.4.0",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -44,6 +45,7 @@ include = ["nequix/*"]
 
 [dependency-groups]
 dev = [
+    "ase-db-backends>=0.1.0",
     "ipython>=8.36.0",
     "jax-md",
     "pandas>=2.3.1",

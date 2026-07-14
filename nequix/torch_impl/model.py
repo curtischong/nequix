@@ -707,8 +707,8 @@ def load_model(
         if not isinstance(state_dict, dict):
             raise ValueError("invalid Nequix Torch state dictionary")
 
-        # e3nn tensor-product buffers are deterministic runtime artifacts. They are
-        # regenerated for the selected execution backend and are never serialized.
+        # filter out tp weights since these can be recomputed, and aren't used
+        # in the kernel version
         complete_state = model.state_dict()
         expected_keys = {key for key in complete_state if ".tp." not in key}
         if set(state_dict) != expected_keys:
