@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
+from nequix.autobatch import peak_device_memory_bytes
 from nequix.config import PFTTrainerConfig, config_values
 from nequix.data import (
     AtomPackDataset,
@@ -17,9 +18,10 @@ from nequix.data import (
     prefetch,
 )
 from nequix.model import load_model, node_graph_idx, save_model, weight_decay_mask
-from nequix.train import evaluate as efs_evaluate
 from nequix.pft.data import PhononDataset
-from nequix.train import loss as efs_loss, save_training_state, load_training_state
+from nequix.run_summary import build_run_summary, print_run_summary_csv
+from nequix.train import evaluate as efs_evaluate
+from nequix.train import load_training_state, loss as efs_loss, save_training_state
 
 import wandb
 
@@ -187,9 +189,11 @@ def evaluate(
 
 
 def train(run_config: PFTTrainerConfig):
+    invocation_start = time.perf_counter()
     config = run_config
 
     model, metadata = load_model(config.finetune_from, config.kernel)
+    param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
 
     if config.optimizer == "muon":
         optim = optax.chain(
@@ -347,6 +351,8 @@ def train(run_config: PFTTrainerConfig):
     wandb_run_id = None
     training_runtime_seconds = 0.0
     validation_runtime_seconds = 0.0
+    final_val_metrics = {}
+    final_extra_val_metrics = {}
 
     if Path(config.resume_from).exists():
         (
@@ -365,15 +371,18 @@ def train(run_config: PFTTrainerConfig):
     wandb_init_kwargs = {
         "entity": config.wandb_entity,
         "project": config.wandb_project,
+        "name": config.name,
         "config": config_values(config),
     }
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
-    wandb.init(**wandb_init_kwargs)
+    wandb_run = wandb.init(**wandb_init_kwargs)
+    wandb_run_url = getattr(wandb_run, "url", None)
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb_run_id = getattr(wandb.run, "id", None)
 
     for epoch in range(start_epoch, config.n_epochs):
+        training_start = time.perf_counter()
         train_loader.set_epoch(epoch)
         extra_train_loader.set_epoch(epoch)
 
@@ -410,7 +419,11 @@ def train(run_config: PFTTrainerConfig):
                 wandb.log(logs, step=step)
                 print(f"step {step:03d} logs: {logs}")
 
+        jax.block_until_ready(model)
+        training_runtime_seconds += time.perf_counter() - training_start
+
         if epoch % config.val_every == 0 or epoch == config.n_epochs - 1:
+            validation_start = time.perf_counter()
             val_metrics = evaluate(
                 ema_model,
                 val_loader,
@@ -425,6 +438,29 @@ def train(run_config: PFTTrainerConfig):
                 best_val_loss = val_metrics["loss"]
                 save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model, metadata)
 
+            final_val_metrics = {key: value.mean().item() for key, value in val_metrics.items()}
+            logs = {f"val/{key}": value for key, value in final_val_metrics.items()}
+            logs["epoch"] = epoch
+            wandb.log(logs, step=step)
+            print(f"epoch {epoch:03d} val metrics: {logs}")
+
+            extra_val_metrics = efs_evaluate(
+                ema_model,
+                extra_val_loader,
+                energy_weight=config.extra_energy_weight,
+                force_weight=config.extra_force_weight,
+                stress_weight=config.extra_stress_weight,
+            )
+            final_extra_val_metrics = {
+                key: value.mean().item() for key, value in extra_val_metrics.items()
+            }
+            extra_logs = {
+                f"extra_val/{key}": value for key, value in final_extra_val_metrics.items()
+            }
+            wandb.log(extra_logs, step=step)
+            print(f"epoch {epoch:03d} extra val metrics: {extra_logs}")
+
+            validation_runtime_seconds += time.perf_counter() - validation_start
             save_training_state(
                 (Path(wandb.run.dir) / "state.pkl", config.state_path),
                 model,
@@ -439,26 +475,73 @@ def train(run_config: PFTTrainerConfig):
                 validation_runtime_seconds=validation_runtime_seconds,
             )
 
-            logs = {}
-            for k, v in val_metrics.items():
-                logs[f"val/{k}"] = v.mean().item()
-            logs["val/loss"] = val_metrics["loss"].mean().item()
-            logs["epoch"] = epoch
-            wandb.log(logs, step=step)
-            print(f"epoch {epoch:03d} val metrics: {logs}")
+    if not final_val_metrics:
+        validation_start = time.perf_counter()
+        val_metrics = evaluate(
+            ema_model,
+            val_loader,
+            config.energy_weight,
+            config.force_weight,
+            config.stress_weight,
+            config.hessian_weight,
+            config.checkpoint_grad_energy,
+        )
+        extra_val_metrics = efs_evaluate(
+            ema_model,
+            extra_val_loader,
+            energy_weight=config.extra_energy_weight,
+            force_weight=config.extra_force_weight,
+            stress_weight=config.extra_stress_weight,
+        )
+        final_val_metrics = {key: value.mean().item() for key, value in val_metrics.items()}
+        final_extra_val_metrics = {
+            key: value.mean().item() for key, value in extra_val_metrics.items()
+        }
+        validation_runtime_seconds += time.perf_counter() - validation_start
 
-            extra_val_metrics = efs_evaluate(
-                ema_model,
-                extra_val_loader,
-                energy_weight=config.extra_energy_weight,
-                force_weight=config.extra_force_weight,
-                stress_weight=config.extra_stress_weight,
-            )
-            for k, v in extra_val_metrics.items():
-                logs[f"extra_val/{k}"] = v.mean().item()
-            logs["extra_val/loss"] = extra_val_metrics["loss"].mean().item()
-            wandb.log(logs, step=step)
-            print(f"epoch {epoch:03d} extra val metrics: {logs}")
+    if hasattr(wandb, "run") and wandb.run is not None:
+        wandb.run.summary.update(
+            {
+                "runtime/training_seconds": training_runtime_seconds,
+                "runtime/validation_seconds": validation_runtime_seconds,
+            }
+        )
+    wandb.finish()
+
+    devices = jax.devices()
+    summary = build_run_summary(
+        config,
+        run_name=config.name,
+        trainer="pft",
+        final_metrics=final_val_metrics,
+        best_val_loss=best_val_loss,
+        steps_completed=int(step.item()),
+        epochs_completed=config.n_epochs,
+        train_size=len(train_dataset),
+        val_size=len(val_dataset),
+        param_count=param_count,
+        accelerator_count=len(devices),
+        accelerator_type=";".join(sorted({device.device_kind for device in devices})),
+        backend=jax.default_backend(),
+        training_runtime_seconds=training_runtime_seconds,
+        validation_runtime_seconds=validation_runtime_seconds,
+        invocation_runtime_seconds=time.perf_counter() - invocation_start,
+        peak_accelerator_memory_bytes=peak_device_memory_bytes(),
+        run_id=wandb_run_id,
+        run_url=wandb_run_url,
+        extra_values={
+            **{
+                f"final_extra_val_{key}": value
+                for key, value in final_extra_val_metrics.items()
+            },
+            "extra_train_size": len(extra_train_dataset),
+            "extra_val_size": len(extra_val_dataset),
+            "batch_size": config.batch_size,
+            "n_graph": config.n_graph,
+            "extra_batch_size": config.extra_batch_size,
+        },
+    )
+    print_run_summary_csv(summary)
 
 
 if __name__ == "__main__":
