@@ -286,11 +286,10 @@ def tune_batch_shape(
             "autobatch probing failed at the minimum capacity; using a single-example capacity"
         )
 
-    per_device_examples = max(1, math.ceil(dataset_size / max(device_count, 1)))
-    upper_limit = per_device_examples
-    last_safe = baseline
+    upper_limit = max(1, math.ceil(dataset_size / max(device_count, 1)))
+    largest_safe = initial_shape.batch_size
     first_unsafe = None
-    candidate = initial_shape.batch_size
+    candidate = largest_safe
     while candidate < upper_limit:
         candidate = min(
             max(round(candidate * memory_scaling_factor), candidate + 1),
@@ -300,29 +299,29 @@ def tune_batch_shape(
         if result.status == "failed":
             return fallback("autobatch probing failed; using a single-example capacity")
         if result.safe:
-            last_safe = result
+            largest_safe = candidate
         else:
-            first_unsafe = result
+            first_unsafe = candidate
             break
 
     # Resolve the safe boundary without compiling every integer batch size.
     if first_unsafe is not None:
-        low = last_safe.shape.batch_size
-        high = first_unsafe.shape.batch_size
         for _ in range(3):
-            if high - low <= max(2, initial_shape.batch_size // 8):
+            if first_unsafe - largest_safe <= 2:
                 break
-            middle = (low + high) // 2
+            middle = (largest_safe + first_unsafe) // 2
             result = run(middle)
             if result.status == "failed":
                 return fallback("autobatch probing failed; using a single-example capacity")
             if result.safe:
-                low = middle
+                largest_safe = middle
             else:
-                high = middle
+                first_unsafe = middle
 
-    safe = [result for result in probes if result.safe]
-    best = max(safe, key=lambda result: result.graphs_per_second)
+    best = max(
+        (result for result in probes if result.safe),
+        key=lambda result: result.graphs_per_second,
+    )
     if best.graphs_per_second <= baseline.graphs_per_second * (1 + minimum_speedup):
         return fallback(
             "no autobatch candidate was measurably faster than one example; "
