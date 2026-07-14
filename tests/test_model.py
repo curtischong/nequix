@@ -1,5 +1,6 @@
 import tempfile
 
+import cloudpickle
 import e3nn_jax as e3nn
 import equinox as eqx
 import jax
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 
 from nequix.layer_norm import RMSLayerNorm
+from nequix.config import ModelMetadata, NequixConfig
 from nequix.model import (
     DirectForceNequix,
     Nequix,
@@ -18,6 +20,7 @@ from nequix.model import (
     save_model,
     weight_decay_mask,
 )
+from nequix.train import load_training_state
 
 
 def dummy_graph():
@@ -88,7 +91,7 @@ def test_model():
     assert stress is None
 
 
-def test_direct_force_training_head_uses_checkpoint_compatible_backbone():
+def test_direct_force_training_head_reuses_conservative_backbone():
     hidden_irreps = "8x0e+8x1o"
     backbone = Nequix(
         jax.random.key(0),
@@ -147,6 +150,26 @@ def test_model_save_load():
 
     # Create model using config parameters
     atom_energies = [config["atom_energies"][n] for n in config["atomic_numbers"]]
+    metadata = ModelMetadata(
+        atomic_numbers=tuple(config["atomic_numbers"]),
+        atom_energies=tuple(atom_energies),
+        shift=config["shift"],
+        scale=config["scale"],
+        avg_n_neighbors=config["avg_n_neighbors"],
+        model_config=NequixConfig(
+            cutoff=config["cutoff"],
+            hidden_irreps=config["hidden_irreps"],
+            lmax=config["lmax"],
+            n_layers=config["n_layers"],
+            radial_basis_size=config["radial_basis_size"],
+            radial_mlp_size=config["radial_mlp_size"],
+            radial_mlp_layers=config["radial_mlp_layers"],
+            radial_polynomial_p=config["radial_polynomial_p"],
+            mlp_init_scale=config["mlp_init_scale"],
+            index_weights=config["index_weights"],
+            layer_norm=config["layer_norm"],
+        ),
+    )
     model = Nequix(
         key,
         n_species=len(config["atomic_numbers"]),
@@ -173,8 +196,9 @@ def test_model_save_load():
     original_energy, original_forces, original_stress = model(batch_padded)
 
     with tempfile.NamedTemporaryFile(suffix=".eqx") as tmp_file:
-        save_model(tmp_file.name, model, config)
-        loaded_model, _ = load_model(tmp_file.name)
+        save_model(tmp_file.name, model, metadata)
+        loaded_model, loaded_metadata = load_model(tmp_file.name)
+        assert loaded_metadata == metadata
         assert model.lmax == loaded_model.lmax
         assert model.cutoff == loaded_model.cutoff
         assert model.n_species == loaded_model.n_species
@@ -188,6 +212,23 @@ def test_model_save_load():
         np.testing.assert_allclose(original_energy, loaded_energy)
         np.testing.assert_allclose(original_forces, loaded_forces)
         np.testing.assert_allclose(original_stress, loaded_stress)
+
+
+def test_model_loader_rejects_flat_legacy_header(tmp_path):
+    path = tmp_path / "legacy.nqx"
+    path.write_bytes(b'{"atomic_numbers": [1], "cutoff": 5.0}\n')
+
+    with pytest.raises(ValueError, match="invalid Nequix model header"):
+        load_model(path)
+
+
+def test_training_state_loader_rejects_unversioned_state(tmp_path):
+    path = tmp_path / "unversioned.pkl"
+    with path.open("wb") as state_file:
+        cloudpickle.dump({}, state_file)
+
+    with pytest.raises(ValueError, match="invalid Nequix training state"):
+        load_training_state(path)
 
 
 def test_weight_decay_mask():

@@ -3,19 +3,17 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from nequix.config import RUNS, RunConfig
+from nequix.config import PFTTrainerConfig, RUNS, RunConfig, TrainerConfig
 
 
 def run(config: RunConfig) -> None:
-    """Dispatch a named config to its JAX, Torch, or PFT trainer."""
-    if config.trainer == "jax":
+    """Dispatch a named config to its JAX or PFT trainer."""
+    if isinstance(config, TrainerConfig):
         from nequix.train import train
-    elif config.trainer == "torch":
-        from nequix.torch_impl.train import train
-    elif config.trainer == "pft":
+    elif isinstance(config, PFTTrainerConfig):
         from nequix.pft.train import train
-    else:  # pragma: no cover - guarded by the config type and registry tests.
-        raise ValueError(f"unsupported trainer: {config.trainer}")
+    else:  # pragma: no cover - guarded by the config registry.
+        raise TypeError(f"unsupported run config: {type(config).__name__}")
     train(config)
 
 

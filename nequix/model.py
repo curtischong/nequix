@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import jraph
 
 from nequix.layer_norm import RMSLayerNorm
+from nequix.config import ModelMetadata
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
@@ -389,9 +390,8 @@ class Nequix(eqx.Module):
         """Return energies and the features feeding the final scalar convolution.
 
         The penultimate equivariant features are useful for auxiliary pre-training
-        heads. Keeping those heads outside :class:`Nequix` means their parameters can
-        be discarded while the energy backbone remains checkpoint-compatible with a
-        normal conservative model.
+        heads. Keeping those heads outside :class:`Nequix` lets training discard the
+        auxiliary parameters and retain the conservative backbone.
         """
         # input features are one-hot encoded species
         features = e3nn.IrrepsArray(
@@ -522,8 +522,8 @@ class DirectForceNequix(eqx.Module):
 
     The force head consumes the equivariant features immediately before the
     backbone's final scalar-only convolution. It is intentionally separate from the
-    backbone so a direct-force pre-training checkpoint can hand off ordinary Nequix
-    weights to conservative fine-tuning.
+    backbone so direct-force pre-training can hand its Nequix weights to conservative
+    fine-tuning.
     """
 
     backbone: Nequix
@@ -640,39 +640,42 @@ def weight_decay_mask(model):
     return mask
 
 
-def save_model(path: str, model: eqx.Module, config: dict):
-    """Save a model and its config to a file."""
+def save_model(path: str | Path, model: Nequix, metadata: ModelMetadata) -> None:
+    """Save model weights with the current strict metadata schema."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
-        config_str = json.dumps(config)
-        f.write((config_str + "\n").encode())
+        f.write((json.dumps(metadata.to_header()) + "\n").encode())
         eqx.tree_serialise_leaves(f, model)
 
 
-def load_model(path: str, kernel: bool = False) -> tuple[Nequix, dict]:
-    """Load a model and its config from a file."""
+def load_model(path: str | Path, kernel: bool = False) -> tuple[Nequix, ModelMetadata]:
+    """Load weights written with the current Nequix model format."""
     with open(path, "rb") as f:
-        config = json.loads(f.readline().decode())
+        try:
+            metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid Nequix model header") from error
+        config = metadata.model_config
         model = Nequix(
             key=jax.random.key(0),
-            n_species=len(config["atomic_numbers"]),
-            hidden_irreps=config["hidden_irreps"],
-            lmax=config["lmax"],
-            cutoff=config["cutoff"],
-            n_layers=config["n_layers"],
-            radial_basis_size=config["radial_basis_size"],
-            radial_mlp_size=config["radial_mlp_size"],
-            radial_mlp_layers=config["radial_mlp_layers"],
-            radial_polynomial_p=config["radial_polynomial_p"],
-            mlp_init_scale=config["mlp_init_scale"],
-            index_weights=config["index_weights"],
-            layer_norm=config["layer_norm"],
-            shift=config["shift"],
-            scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"],
+            n_species=len(metadata.atomic_numbers),
+            hidden_irreps=config.hidden_irreps,
+            lmax=config.lmax,
+            cutoff=config.cutoff,
+            n_layers=config.n_layers,
+            radial_basis_size=config.radial_basis_size,
+            radial_mlp_size=config.radial_mlp_size,
+            radial_mlp_layers=config.radial_mlp_layers,
+            radial_polynomial_p=config.radial_polynomial_p,
+            mlp_init_scale=config.mlp_init_scale,
+            index_weights=config.index_weights,
+            layer_norm=config.layer_norm,
+            shift=metadata.shift,
+            scale=metadata.scale,
+            avg_n_neighbors=metadata.avg_n_neighbors,
+            atom_energies=metadata.atom_energies,
             kernel=kernel,
-            # NOTE: atom_energies will be in model weights
         )
         model = eqx.tree_deserialise_leaves(f, model)
-        return model, config
+        return model, metadata

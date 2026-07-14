@@ -66,14 +66,14 @@ def run_probe(payload) -> ProbeResult:
         avg_n_nodes=stats["avg_n_nodes"],
         avg_n_edges=stats["avg_n_edges"],
         num_workers=min(4, max(1, len(dataset))),
-        packing=payload.get("packing", "best_fit"),
+        packing=payload["packing"],
     )
     if loader.n_node != shape.n_node or loader.n_edge != shape.n_edge:
         return ProbeResult(shape=shape, status="failed", error="probe loader shape mismatch")
 
     parallel_loader = ParallelLoader(loader, len(devices))
-    warmup_steps = int(config.get("autobatch_probe_warmup_steps", 3))
-    timed_steps = int(config.get("autobatch_probe_timed_steps", 3))
+    warmup_steps = 3
+    timed_steps = 3
     batches = []
     for batch in parallel_loader:
         batches.append(batch)

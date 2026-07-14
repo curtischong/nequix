@@ -1,5 +1,5 @@
-import json
 import math
+from pathlib import Path
 from typing import Callable, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -9,6 +9,7 @@ from e3nn import o3
 from e3nn.util.jit import compile_mode
 
 from nequix.torch_impl.layer_norm import RMSLayerNorm
+from nequix.config import ModelMetadata
 
 
 def _broadcast(src: torch.Tensor, other: torch.Tensor, dim: int):
@@ -654,70 +655,64 @@ class NequixTorch(torch.nn.Module):
         return node_energies[:, 0], -minus_forces, stress
 
 
-def get_optimizer_param_groups(model, weight_decay):
-    decay_params = []
-    no_decay_params = []
+def save_model(path: str | Path, model: torch.nn.Module, metadata: ModelMetadata) -> None:
+    """Save model weights with the current strict metadata schema."""
+    import json
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue  # Skip frozen parameters
-
-        # Apply weight decay to weights of Linear layers only
-        # Exclude biases and all LayerNorm/BatchNorm parameters
-        if "bias" in name:
-            no_decay_params.append(param)
-        # weight does o3.Linear and weights does MLP
-        elif "weight" or "weights" in name:
-            # Linear layer weights
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
-
-    param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-    return param_groups
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_dict = {key: value for key, value in model.state_dict().items() if ".tp." not in key}
+    with path.open("wb") as f:
+        f.write((json.dumps(metadata.to_header()) + "\n").encode())
+        torch.save(state_dict, f)
 
 
-def save_model(path: str, model: torch.nn.Module, config: dict):
-    """Save a model and its config to a file."""
-    with open(path, "wb") as f:
-        config_str = json.dumps(config)
-        f.write((config_str + "\n").encode())
-        torch.save(model.state_dict(), f)
+def load_model(
+    path: str | Path, use_kernel: bool = False
+) -> tuple[NequixTorch, ModelMetadata]:
+    """Load weights written with the current Nequix model format."""
+    import json
 
-
-def load_model(path: str, use_kernel=False) -> tuple[NequixTorch, dict]:
-    """Load a model and its config from a file."""
     with open(path, "rb") as f:
-        config = json.loads(f.readline().decode())
+        try:
+            metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid Nequix model header") from error
+        config = metadata.model_config
         model = NequixTorch(
-            n_species=len(config["atomic_numbers"]),
-            hidden_irreps=config["hidden_irreps"],
-            lmax=config["lmax"],
-            cutoff=config["cutoff"],
-            n_layers=config["n_layers"],
-            radial_basis_size=config["radial_basis_size"],
-            radial_mlp_size=config["radial_mlp_size"],
-            radial_mlp_layers=config["radial_mlp_layers"],
-            radial_polynomial_p=config["radial_polynomial_p"],
-            mlp_init_scale=config["mlp_init_scale"],
-            index_weights=config["index_weights"],
-            layer_norm=config["layer_norm"],
-            shift=config["shift"],
-            scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"],
-            atom_energies=[config["atom_energies"][str(n)] for n in config["atomic_numbers"]],
+            n_species=len(metadata.atomic_numbers),
+            hidden_irreps=config.hidden_irreps,
+            lmax=config.lmax,
+            cutoff=config.cutoff,
+            n_layers=config.n_layers,
+            radial_basis_size=config.radial_basis_size,
+            radial_mlp_size=config.radial_mlp_size,
+            radial_mlp_layers=config.radial_mlp_layers,
+            radial_polynomial_p=config.radial_polynomial_p,
+            mlp_init_scale=config.mlp_init_scale,
+            index_weights=config.index_weights,
+            layer_norm=config.layer_norm,
+            shift=metadata.shift,
+            scale=metadata.scale,
+            avg_n_neighbors=metadata.avg_n_neighbors,
+            atom_energies=metadata.atom_energies,
             kernel=use_kernel,
         )
-        state_dict = torch.load(f, map_location="cpu")
+        state_dict = torch.load(f, map_location="cpu", weights_only=True)
+        if not isinstance(state_dict, dict):
+            raise ValueError("invalid Nequix Torch state dictionary")
 
-        # filter out tp weights since these can be recomputed, and aren't used
-        # in the kernel version
-        state_dict = {k: v for k, v in state_dict.items() if ".tp." not in k}
-        # allow missing .tp. weights for the non kernel version
-        model.load_state_dict(state_dict, strict=False)
+        # e3nn tensor-product buffers are deterministic runtime artifacts. They are
+        # regenerated for the selected execution backend and are never serialized.
+        complete_state = model.state_dict()
+        expected_keys = {key for key in complete_state if ".tp." not in key}
+        if set(state_dict) != expected_keys:
+            missing = sorted(expected_keys - set(state_dict))
+            unexpected = sorted(set(state_dict) - expected_keys)
+            raise ValueError(
+                f"invalid Nequix Torch weights; missing={missing}, unexpected={unexpected}"
+            )
+        complete_state.update(state_dict)
+        model.load_state_dict(complete_state, strict=True)
 
-        return model, config
+        return model, metadata

@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import jraph
 import numpy as np
 import pytest
+from dataclasses import replace
 
 from nequix.autobatch import (
     ProbeResult,
@@ -14,7 +15,7 @@ from nequix.autobatch import (
     tune_batch_shape,
     tune_training_batch,
 )
-from nequix.config import RUNS, config_dict
+from nequix.config import RUNS
 from nequix.data import (
     ParallelLoader,
     best_fit_dynamic_batch,
@@ -109,7 +110,7 @@ def _hardware(memory_bytes=80 * 1024**3):
 
 
 def _config():
-    return config_dict(RUNS["nequix-mp-1"])
+    return RUNS["nequix-mp-1"]
 
 
 def _stats():
@@ -129,9 +130,11 @@ def test_cache_key_invalidates_for_hardware_model_and_dataset_changes(tmp_path):
 
     assert key != autobatch_cache_key(config, stats, 101, _hardware())
     assert key != autobatch_cache_key(config, stats, 100, _hardware(40 * 1024**3))
-    assert key != autobatch_cache_key({**config, "force_mode": "direct"}, stats, 100, _hardware())
     assert key != autobatch_cache_key(
-        {**config, "autobatch_memory_scaling_factor": 2.0}, stats, 100, _hardware()
+        replace(config, force_mode="direct"), stats, 100, _hardware()
+    )
+    assert key != autobatch_cache_key(
+        replace(config, autobatch_memory_scaling_factor=2.0), stats, 100, _hardware()
     )
 
     result = tune_batch_shape(stats, 100, 1, lambda candidate: ProbeResult(candidate, "ok"))

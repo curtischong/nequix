@@ -3,6 +3,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import cloudpickle
@@ -15,14 +16,12 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
 from nequix.autobatch import probe_summary, tune_training_batch
-from nequix.config import TrainerConfig, config_dict
+from nequix.config import ModelMetadata, TrainerConfig, config_values
 from nequix.data import (
     ConcatDataset,
     DataLoader,
     ParallelLoader,
-    average_atom_energies,
     dataset_from_path,
-    dataset_stats,
     prefetch,
 )
 from nequix.model import (
@@ -35,6 +34,8 @@ from nequix.model import (
     weight_decay_mask,
 )
 from nequix.train_utils import wandb_run_name
+
+TRAINING_STATE_FORMAT = "nequix-training-state-v1"
 
 
 def _loss_statistics(model, batch, loss_type="huber"):
@@ -210,6 +211,7 @@ def save_training_state(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = {
+        "format": TRAINING_STATE_FORMAT,
         "model": model,
         "ema_model": ema_model,
         "optim": optim,
@@ -228,6 +230,23 @@ def save_training_state(
 def load_training_state(path):
     with open(path, "rb") as f:
         state = cloudpickle.load(f)
+    expected_keys = {
+        "format",
+        "model",
+        "ema_model",
+        "optim",
+        "opt_state",
+        "step",
+        "epoch",
+        "best_val_loss",
+        "wandb_run_id",
+        "training_runtime_seconds",
+        "validation_runtime_seconds",
+    }
+    if not isinstance(state, dict) or set(state) != expected_keys:
+        raise ValueError("invalid Nequix training state")
+    if state["format"] != TRAINING_STATE_FORMAT:
+        raise ValueError(f"unsupported Nequix training state format: {state['format']!r}")
     return (
         state["model"],
         state["ema_model"],
@@ -236,39 +255,40 @@ def load_training_state(path):
         state["step"],
         state["epoch"],
         state["best_val_loss"],
-        state.get("wandb_run_id"),
-        state.get("training_runtime_seconds", 0.0),
-        state.get("validation_runtime_seconds", 0.0),
+        state["wandb_run_id"],
+        state["training_runtime_seconds"],
+        state["validation_runtime_seconds"],
     )
 
 
 def build_model(config, stats, atom_energies):
     """Construct the training architecture shared by real runs and probes."""
+    model_config = config.model_config
     key = jax.random.key(0)
     model = Nequix(
         key,
-        n_species=len(config["atomic_numbers"]),
-        hidden_irreps=config["hidden_irreps"],
-        lmax=config["lmax"],
-        cutoff=config["cutoff"],
-        n_layers=config["n_layers"],
-        radial_basis_size=config["radial_basis_size"],
-        radial_mlp_size=config["radial_mlp_size"],
-        radial_mlp_layers=config["radial_mlp_layers"],
-        radial_polynomial_p=config["radial_polynomial_p"],
-        mlp_init_scale=config["mlp_init_scale"],
-        index_weights=config["index_weights"],
-        layer_norm=config["layer_norm"],
+        n_species=len(config.atomic_numbers),
+        hidden_irreps=model_config.hidden_irreps,
+        lmax=model_config.lmax,
+        cutoff=model_config.cutoff,
+        n_layers=model_config.n_layers,
+        radial_basis_size=model_config.radial_basis_size,
+        radial_mlp_size=model_config.radial_mlp_size,
+        radial_mlp_layers=model_config.radial_mlp_layers,
+        radial_polynomial_p=model_config.radial_polynomial_p,
+        mlp_init_scale=model_config.mlp_init_scale,
+        index_weights=model_config.index_weights,
+        layer_norm=model_config.layer_norm,
         shift=stats["shift"],
         scale=stats["scale"],
         avg_n_neighbors=stats["avg_n_neighbors"],
         atom_energies=atom_energies,
-        kernel=config["kernel"],
+        kernel=config.kernel,
     )
-    if config["force_mode"] == "direct":
+    if config.force_mode == "direct":
         model = DirectForceNequix(
             model,
-            config["hidden_irreps"],
+            model_config.hidden_irreps,
             key=jax.random.fold_in(key, 1),
         )
     return model
@@ -277,32 +297,32 @@ def build_model(config, stats, atom_energies):
 def build_optimizer(config, model, steps_per_epoch):
     """Construct the optimizer and schedule shared by real runs and probes."""
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=config["learning_rate"] * config["warmup_factor"],
-        peak_value=config["learning_rate"],
+        init_value=config.learning_rate * config.warmup_factor,
+        peak_value=config.learning_rate,
         end_value=1e-6,
-        warmup_steps=config["warmup_epochs"] * steps_per_epoch,
-        decay_steps=config["n_epochs"] * steps_per_epoch,
+        warmup_steps=config.warmup_epochs * steps_per_epoch,
+        decay_steps=config.n_epochs * steps_per_epoch,
     )
-    if config["optimizer"] == "adamw":
+    if config.optimizer == "adamw":
         optim = optax.chain(
-            optax.clip_by_global_norm(config["grad_clip_norm"]),
+            optax.clip_by_global_norm(config.grad_clip_norm),
             optax.adamw(
                 learning_rate=schedule,
-                weight_decay=config["weight_decay"],
+                weight_decay=config.weight_decay,
                 mask=weight_decay_mask(model),
             ),
         )
-    elif config["optimizer"] == "muon":
+    elif config.optimizer == "muon":
         optim = optax.chain(
-            optax.clip_by_global_norm(config["grad_clip_norm"]),
+            optax.clip_by_global_norm(config.grad_clip_norm),
             optax.contrib.muon(
                 learning_rate=schedule,
-                weight_decay=config["weight_decay"] if config["weight_decay"] != 0.0 else None,
+                weight_decay=config.weight_decay if config.weight_decay != 0.0 else None,
                 weight_decay_mask=weight_decay_mask(model),
             ),
         )
     else:
-        raise ValueError(f"optimizer {config['optimizer']} not supported")
+        raise ValueError(f"optimizer {config.optimizer} not supported")
     return optim, schedule
 
 
@@ -316,10 +336,10 @@ def make_train_step(optim, config):
         )(
             model,
             batch,
-            config["energy_weight"],
-            config["force_weight"],
-            config["stress_weight"],
-            config["loss_type"],
+            config.energy_weight,
+            config.force_weight,
+            config.stress_weight,
+            config.loss_type,
         )
         # Each local loss is normalized by global real-sample counts, so a sum
         # produces the gradient of the equivalent combined batch.
@@ -328,7 +348,7 @@ def make_train_step(optim, config):
         updates, opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_array))
         model = eqx.apply_updates(model, updates)
 
-        decay = jnp.minimum(config["ema_decay"], (1 + step) / (10 + step))
+        decay = jnp.minimum(config.ema_decay, (1 + step) / (10 + step))
         ema_params, ema_static = eqx.partition(ema_model, eqx.is_array)
         model_params = eqx.filter(model, eqx.is_array)
         new_ema_params = jax.tree.map(
@@ -356,62 +376,53 @@ def _peak_device_memory_bytes():
 
 def train(run_config: TrainerConfig):
     """Train a JAX Nequix model from a registered Python config."""
-    if run_config.trainer != "jax":
-        raise ValueError(
-            f"JAX trainer cannot run {run_config.trainer!r} config {run_config.name!r}"
-        )
-    config = config_dict(run_config)
-    if config["force_mode"] not in {"conservative", "direct"}:
-        raise ValueError(f"force mode {config['force_mode']!r} is not supported")
-    val_every_steps = config.get("val_every_steps")
+    config = run_config
+    if config.force_mode not in {"conservative", "direct"}:
+        raise ValueError(f"force mode {config.force_mode!r} is not supported")
+    val_every_steps = config.val_every_steps
     if val_every_steps is not None and val_every_steps <= 0:
         raise ValueError("val_every_steps must be greater than zero")
-
-    # use TMPDIR for slurm jobs if available
-    config["cache_dir"] = config.get("cache_dir") or os.environ.get("TMPDIR")
 
     def make_dataset(path):
         return dataset_from_path(
             file_path=path,
-            atomic_numbers=config["atomic_numbers"],
-            cutoff=config["cutoff"],
+            atomic_numbers=config.atomic_numbers,
+            cutoff=config.model_config.cutoff,
             backend="jax",
         )
 
-    if isinstance(config["train_path"], list):
-        train_dataset = ConcatDataset([make_dataset(path) for path in config["train_path"]])
+    if isinstance(config.train_path, tuple):
+        train_dataset = ConcatDataset([make_dataset(path) for path in config.train_path])
     else:
-        train_dataset = make_dataset(config["train_path"])
-    if "valid_frac" in config:
+        train_dataset = make_dataset(config.train_path)
+    if config.valid_frac is not None:
         train_dataset, val_dataset = train_dataset.split(
-            valid_frac=config["valid_frac"], seed=config.get("seed", 42)
+            valid_frac=config.valid_frac, seed=config.seed
         )
     else:
-        assert "valid_path" in config, "valid_path must be specified if valid_frac is not provided"
-        val_dataset = make_dataset(config["valid_path"])
+        if config.valid_path is None:
+            raise ValueError("valid_path must be specified when valid_frac is not provided")
+        val_dataset = make_dataset(config.valid_path)
 
-    train_dataset = train_dataset.subset(
-        float(config.get("train_frac", 1.0)), seed=config.get("seed", 0)
+    train_dataset = train_dataset.subset(float(config.train_frac), seed=config.seed)
+    atom_energies = [config.atom_energies[number] for number in config.atomic_numbers]
+    stats = {
+        "shift": config.shift,
+        "scale": config.scale,
+        "avg_n_neighbors": config.avg_n_neighbors,
+        "max_n_edges": config.max_n_edges,
+        "max_n_nodes": config.max_n_nodes,
+        "avg_n_nodes": config.avg_n_nodes,
+        "avg_n_edges": config.avg_n_edges,
+    }
+    metadata = ModelMetadata(
+        atomic_numbers=config.atomic_numbers,
+        atom_energies=tuple(atom_energies),
+        shift=config.shift,
+        scale=config.scale,
+        avg_n_neighbors=config.avg_n_neighbors,
+        model_config=config.model_config,
     )
-
-    if "atom_energies" in config:
-        atom_energies = [config["atom_energies"][n] for n in config["atomic_numbers"]]
-    else:
-        atom_energies = average_atom_energies(train_dataset)
-
-    stats_keys = [
-        "shift",
-        "scale",
-        "avg_n_neighbors",
-        "max_n_edges",
-        "max_n_nodes",
-        "avg_n_nodes",
-        "avg_n_edges",
-    ]
-    if all(key in config for key in stats_keys):
-        stats = {key: config[key] for key in stats_keys}
-    else:
-        stats = dataset_stats(train_dataset, atom_energies)
 
     tune_result = tune_training_batch(config, stats, train_dataset, atom_energies)
     selected_shape = tune_result.shape
@@ -427,7 +438,7 @@ def train(run_config: TrainerConfig):
         max_n_edges=stats["max_n_edges"],
         avg_n_nodes=stats["avg_n_nodes"],
         avg_n_edges=stats["avg_n_edges"],
-        seed=config.get("seed", 0),
+        seed=config.seed,
         num_workers=16,
         packing="best_fit",
     )
@@ -456,27 +467,28 @@ def train(run_config: TrainerConfig):
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
     )
 
-    model_config = {**config, "force_mode": "conservative"}
-    model = build_model(model_config, stats, atom_energies)
-    resume_exists = "resume_from" in config and Path(config["resume_from"]).exists()
-    if "finetune_from" in config and Path(config["finetune_from"]).exists():
-        model, checkpoint_config = load_model(config["finetune_from"], config["kernel"])
-        if checkpoint_config["atomic_numbers"] != config["atomic_numbers"]:
+    model = build_model(replace(config, force_mode="conservative"), stats, atom_energies)
+    resume_exists = Path(config.resume_from).exists()
+    if config.finetune_from is not None and Path(config.finetune_from).exists():
+        model, checkpoint_metadata = load_model(config.finetune_from, config.kernel)
+        if checkpoint_metadata.atomic_numbers != config.atomic_numbers:
             raise ValueError("fine-tuning checkpoint and run config use different elements")
+        if checkpoint_metadata.model_config != config.model_config:
+            raise ValueError("fine-tuning checkpoint and run config use different architectures")
         model = replace_normalization(
             model,
             atom_energies=atom_energies,
             shift=stats["shift"],
             scale=stats["scale"],
         )
-    elif "finetune_from" in config and not resume_exists:
-        raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config['finetune_from']}")
+    elif config.finetune_from is not None and not resume_exists:
+        raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config.finetune_from}")
 
-    if config["force_mode"] == "direct":
+    if config.force_mode == "direct":
         key = jax.random.key(0)
         model = DirectForceNequix(
             model,
-            config["hidden_irreps"],
+            config.model_config.hidden_irreps,
             key=jax.random.fold_in(key, 1),
         )
 
@@ -512,11 +524,11 @@ def train(run_config: TrainerConfig):
             wandb_run_id,
             training_runtime_seconds,
             validation_runtime_seconds,
-        ) = load_training_state(config["resume_from"])
+        ) = load_training_state(config.resume_from)
 
-    run_name = wandb_run_name(run_config.name, config)
+    run_name = wandb_run_name(config)
     wandb_config = {
-        **config,
+        **config_values(config),
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
         "autobatch_selected_batch_size": selected_shape.batch_size,
@@ -527,12 +539,12 @@ def train(run_config: TrainerConfig):
     }
     wandb_init_kwargs = {
         "entity": "curtischong",
-        "project": config.get("wandb_project", "nequix"),
+        "project": config.wandb_project or "nequix",
         "name": run_name,
         "config": wandb_config,
     }
-    if config.get("wandb_mode"):
-        wandb_init_kwargs["mode"] = config["wandb_mode"]
+    if config.wandb_mode:
+        wandb_init_kwargs["mode"] = config.wandb_mode
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
     wandb_run = wandb.init(**wandb_init_kwargs)
@@ -579,18 +591,17 @@ def train(run_config: TrainerConfig):
         val_metrics = evaluate(
             ema_model_single,
             val_loader,
-            config["energy_weight"],
-            config["force_weight"],
-            config["stress_weight"],
-            config["loss_type"],
+            config.energy_weight,
+            config.force_weight,
+            config.stress_weight,
+            config.loss_type,
         )
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             checkpoint_model = conservative_backbone(ema_model_single)
-            save_model(Path(wandb.run.dir) / "checkpoint.nqx", checkpoint_model, config)
-            if "checkpoint_path" in config:
-                save_model(config["checkpoint_path"], checkpoint_model, config)
+            save_model(Path(wandb.run.dir) / "checkpoint.nqx", checkpoint_model, metadata)
+            save_model(config.checkpoint_path, checkpoint_model, metadata)
 
         validation_runtime_seconds += time.perf_counter() - validation_start
 
@@ -608,7 +619,7 @@ def train(run_config: TrainerConfig):
 
     train_step = make_train_step(optim, config)
 
-    for epoch in range(start_epoch, config["n_epochs"]):
+    for epoch in range(start_epoch, config.n_epochs):
         train_segment_start = time.perf_counter()
         start_time = time.perf_counter()
         train_loader.loader.set_epoch(epoch)
@@ -623,7 +634,7 @@ def train(run_config: TrainerConfig):
             jax.block_until_ready(total_loss)
             train_time = time.perf_counter() - start_time
             step = step + 1
-            if step % config["log_every"] == 0:
+            if step % config.log_every == 0:
                 graph_masks = jax.vmap(jraph.get_graph_padding_mask)(batch)
                 node_masks = jax.vmap(jraph.get_node_padding_mask)(batch)
                 graph_count = graph_masks.sum().item()
@@ -683,20 +694,19 @@ def train(run_config: TrainerConfig):
             validation_runtime_seconds=validation_runtime_seconds,
         )
 
-        if "state_path" in config:
-            save_training_state(
-                config["state_path"],
-                model,
-                ema_model,
-                optim,
-                opt_state,
-                step,
-                epoch + 1,
-                best_val_loss,
-                wandb_run_id=wandb_run_id,
-                training_runtime_seconds=training_runtime_seconds,
-                validation_runtime_seconds=validation_runtime_seconds,
-            )
+        save_training_state(
+            config.state_path,
+            model,
+            ema_model,
+            optim,
+            opt_state,
+            step,
+            epoch + 1,
+            best_val_loss,
+            wandb_run_id=wandb_run_id,
+            training_runtime_seconds=training_runtime_seconds,
+            validation_runtime_seconds=validation_runtime_seconds,
+        )
 
     final_runtime_metrics = runtime_metrics(training_runtime_seconds)
     if hasattr(wandb, "run") and wandb.run is not None:

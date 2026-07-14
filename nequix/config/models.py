@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
 
-Trainer = Literal["jax", "torch", "pft"]
+MODEL_FORMAT = "nequix-model-v1"
 
 ATOMIC_NUMBERS = tuple(range(1, 84)) + tuple(range(89, 95))
 
@@ -313,13 +313,61 @@ class NequixConfig:
     mlp_init_scale: float = 4.0
     index_weights: bool = False
     layer_norm: bool = True
-    kernel: bool = True
+
+
+@dataclass(frozen=True)
+class ModelMetadata:
+    """The complete, backend-independent schema stored with model weights."""
+
+    atomic_numbers: tuple[int, ...]
+    atom_energies: tuple[float, ...]
+    shift: float
+    scale: float
+    avg_n_neighbors: float
+    model_config: NequixConfig
+
+    def __post_init__(self) -> None:
+        if len(self.atomic_numbers) != len(self.atom_energies):
+            raise ValueError("atomic_numbers and atom_energies must have the same length")
+        if len(set(self.atomic_numbers)) != len(self.atomic_numbers):
+            raise ValueError("atomic_numbers must be unique")
+
+    def to_header(self) -> dict[str, Any]:
+        return {"format": MODEL_FORMAT, "metadata": asdict(self)}
+
+    @classmethod
+    def from_header(cls, header: Any) -> ModelMetadata:
+        if not isinstance(header, dict) or set(header) != {"format", "metadata"}:
+            raise ValueError("invalid Nequix model header")
+        if header["format"] != MODEL_FORMAT:
+            raise ValueError(f"unsupported Nequix model format: {header['format']!r}")
+
+        values = header["metadata"]
+        expected = {item.name for item in fields(cls)}
+        if not isinstance(values, dict) or set(values) != expected:
+            raise ValueError("invalid Nequix model metadata")
+
+        model_values = values["model_config"]
+        model_expected = {item.name for item in fields(NequixConfig)}
+        if not isinstance(model_values, dict) or set(model_values) != model_expected:
+            raise ValueError("invalid Nequix architecture metadata")
+
+        try:
+            return cls(
+                atomic_numbers=tuple(int(value) for value in values["atomic_numbers"]),
+                atom_energies=tuple(float(value) for value in values["atom_energies"]),
+                shift=float(values["shift"]),
+                scale=float(values["scale"]),
+                avg_n_neighbors=float(values["avg_n_neighbors"]),
+                model_config=NequixConfig(**model_values),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid Nequix model metadata") from error
 
 
 @dataclass
 class TrainerConfig:
     name: str
-    trainer: Literal["jax", "torch"]
     train_path: str | tuple[str, ...]
     atomic_numbers: tuple[int, ...]
     atom_energies: dict[int, float]
@@ -330,7 +378,11 @@ class TrainerConfig:
     max_n_nodes: int
     scale: float
     shift: float
+    state_path: str
+    resume_from: str
+    checkpoint_path: str
     model_config: NequixConfig = field(default_factory=NequixConfig)
+    kernel: bool = True
     valid_frac: float | None = None
     valid_path: str | None = None
     dataset_name: str | None = None
@@ -352,11 +404,7 @@ class TrainerConfig:
     log_every: int = 100
     val_every_steps: int | None = None
     ema_decay: float = 0.999
-    state_path: str | None = None
-    resume_from: str | None = None
     finetune_from: str | None = None
-    checkpoint_path: str | None = None
-    cache_dir: str | None = None
     run_name: str | None = None
     wandb_run_name: str | None = None
     wandb_project: str | None = None
@@ -376,7 +424,11 @@ class PFTTrainerConfig:
     avg_n_nodes: float
     max_n_edges: int
     max_n_nodes: int
-    trainer: Literal["pft"] = field(default="pft", init=False)
+    extra_avg_n_edges: float
+    extra_avg_n_nodes: float
+    extra_max_n_edges: int
+    extra_max_n_nodes: int
+    extra_batch_size: int
     extra_val_frac: float | None = None
     extra_val_path: str | None = None
     extra_train_steps: int = 4
@@ -404,20 +456,15 @@ class PFTTrainerConfig:
 RunConfig = TrainerConfig | PFTTrainerConfig
 
 
+def config_values(config: RunConfig) -> dict[str, Any]:
+    """Return the nested, JSON-friendly representation used for run logging."""
+
+    return _plain_value(asdict(config))
+
+
 def _plain_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_plain_value(item) for item in value]
     if isinstance(value, dict):
         return {key: _plain_value(item) for key, item in value.items()}
     return value
-
-
-def config_dict(config: RunConfig) -> dict[str, Any]:
-    """Flatten a named Python config into the legacy trainer dictionary shape."""
-    values = asdict(config)
-    values.pop("name")
-    values.pop("trainer")
-    model_config = values.pop("model_config", None)
-    if model_config is not None:
-        values.update(model_config)
-    return {key: _plain_value(value) for key, value in values.items() if value is not None}

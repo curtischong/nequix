@@ -1,6 +1,6 @@
 <h1 align='center'>Nequix</h1>
 
-Source code and model weights for the [Nequix foundation model](https://arxiv.org/abs/2508.16067), and [Phonon fine-tuning (PFT)](https://arxiv.org/abs/2601.07742).
+Source code for training [Nequix foundation models](https://arxiv.org/abs/2508.16067) and [Phonon fine-tuning (PFT)](https://arxiv.org/abs/2601.07742).
 
 Model | Dataset | Theory | Reference
 ---   | ---     | ---    | ---
@@ -36,20 +36,20 @@ pip install nequix[torch]
 ### ASE calculator
 
 Using `nequix.calculator.NequixCalculator`, you can perform calculations in
-ASE with a pre-trained Nequix model.
+ASE with a checkpoint produced by the current training code.
 
 ```python
 from nequix.calculator import NequixCalculator
 
 atoms = ...
-atoms.calc = NequixCalculator("nequix-mp-1", backend="jax")
+atoms.calc = NequixCalculator("checkpoints/model.nqx", backend="jax")
 ```
 
 or if you want to use the torch backend:
 
 ```python
 ...
-atoms.calc = NequixCalculator("nequix-mp-1", backend="torch")
+atoms.calc = NequixCalculator("checkpoints/model.nqx", backend="torch")
 ...
 ```
 
@@ -58,24 +58,23 @@ These are typically comparable in speed with kernels.
 Analytical Hessians can be calculated with (currently only supported for JAX backend):
 
 ```python
-calc = NequixCalculator("nequix-mp-1", backend="jax")
+calc = NequixCalculator("checkpoints/model.nqx", backend="jax")
 calc.get_hessian(atoms)  # np array of shape (n, n, 3, 3)
 ```
 
 #### NequixCalculator
 
 Arguments
-- `model_name` (str, default "nequix-mp-1"): Pretrained model alias to load or download.
-- `model_path` (str | Path, optional): Path to local checkpoint; overrides `model_name`.
+- `model_path` (str | Path): Path to a current-format local `.nqx` or `.pt` checkpoint.
 - `backend` ({"jax", "torch"}, default "jax"): Compute backend.
 - `capacity_multiplier` (float, default 1.1): JAX-only; padding factor to limit recompiles.
-- `use_compile` (bool, default True): Torch-only; on GPU, uses `torch.compile()`.
+- `use_compile` (bool, default False): Torch-only; on GPU, uses `torch.compile()`.
 - `use_kernel` (bool, default True): on GPU, use [OpenEquivariance](https://github.com/PASSIONLab/OpenEquivariance) kernels.
 
 ### Training
 
 Training configs are Python dataclasses registered by name in `nequix/config/runs`.
-The `train` command selects both the config and its JAX, Torch, or PFT trainer:
+The `train` command selects either standard JAX training or PFT from the config type:
 
 ```bash
 uv run train nequix-mp-1
@@ -155,11 +154,10 @@ uv sync --extra pft
 
 ### Phonon calculations
 
-We provide pretrained model weights for the co-trained (better alignment with
-MPtrj) and non co-trained models in `models/nequix-mp-1-pft.nqx` and
-`nequix-mp-1-pft-nocotrain.nqx` respectively. See [nequix-examples/phonon](https://github.com/teddykoker/nequix-examples/blob/main/phonon) for
-examples on how to use these models for phonon calculations with both finite
-displacement, and analytical Hessians.
+PFT checkpoints produced by the recipes below can be used for both finite-displacement
+phonon calculations and analytical Hessians. See
+[nequix-examples/phonon](https://github.com/teddykoker/nequix-examples/blob/main/phonon)
+for examples.
 
 
 ### Training
@@ -228,8 +226,8 @@ the best first-stage backbone checkpoint but deliberately creates a fresh optimi
 and learning-rate schedule for the new objective. The final best checkpoint is
 `checkpoints/nequix-omat-foundation-conservative.nqx`.
 
-To fine-tune the OAM model, copy the best JAX OMat checkpoint to
-`models/nequix-omat-1.nqx` and run
+The OMat run writes its best checkpoint to `checkpoints/nequix-omat-1.nqx`.
+To fine-tune the OAM model from that newly trained checkpoint, run
 ```bash
 uv run train nequix-oam-1
 ```

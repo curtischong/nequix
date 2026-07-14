@@ -1,11 +1,13 @@
 import numpy as np
 import pytest
+from dataclasses import replace
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.db import connect
 from ase.io import write
 from atompack import Database, Molecule
 
+from nequix.config import RUNS
 from nequix.data import AtomPackDataset, Dataset, dataset_from_path
 from nequix.pft.data import PhononDataset
 from nequix.train_utils import wandb_run_name
@@ -176,11 +178,12 @@ def test_phonon_dataset_reads_hessian_from_atompack(tmp_path):
 
 
 def test_wandb_name_includes_fraction_and_schedule():
-    config = {
-        "dataset_name": "1m",
-        "train_frac": 0.25,
-        "n_epochs": 4,
-        "run_name": "nequix_orig",
-    }
+    config = replace(
+        RUNS["nequix-mp-1"],
+        dataset_name="1m",
+        train_frac=0.25,
+        n_epochs=4,
+        run_name="nequix_orig",
+    )
 
-    assert wandb_run_name("unused", config) == "1m25_4ep_nequix_orig"
+    assert wandb_run_name(config) == "1m25_4ep_nequix_orig"

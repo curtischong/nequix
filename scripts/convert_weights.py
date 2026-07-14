@@ -16,9 +16,13 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input_path)
-    input_backend = "jax" if input_path.suffix == ".nqx" else "torch"
     output_path = Path(args.output_path)
-    output_backend = "torch" if output_path.suffix == ".pt" else "jax"
+    backends = {".nqx": "jax", ".pt": "torch"}
+    try:
+        input_backend = backends[input_path.suffix]
+        output_backend = backends[output_path.suffix]
+    except KeyError as error:
+        raise ValueError("model paths must use a .nqx or .pt extension") from error
 
     if input_backend == "jax" and output_backend == "torch":
         model, config = load_model_jax(input_path)

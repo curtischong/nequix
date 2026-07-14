@@ -9,12 +9,11 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
-from nequix.config import PFTTrainerConfig, config_dict
+from nequix.config import PFTTrainerConfig, config_values
 from nequix.data import (
     AtomPackDataset,
     ConcatDataset,
     DataLoader,
-    dataset_stats,
     prefetch,
 )
 from nequix.model import load_model, node_graph_idx, save_model, weight_decay_mask
@@ -188,169 +187,139 @@ def evaluate(
 
 
 def train(run_config: PFTTrainerConfig):
-    if run_config.trainer != "pft":
-        raise ValueError(f"PFT trainer cannot run config {run_config.name!r}")
-    config = config_dict(run_config)
+    config = run_config
 
-    model, original_config = load_model(config["finetune_from"], config["kernel"])
+    model, metadata = load_model(config.finetune_from, config.kernel)
 
-    if config["optimizer"] == "muon":
+    if config.optimizer == "muon":
         optim = optax.chain(
-            optax.clip_by_global_norm(config["grad_clip_norm"]),
+            optax.clip_by_global_norm(config.grad_clip_norm),
             optax.contrib.muon(
-                learning_rate=config["learning_rate"],
-                weight_decay=config["weight_decay"] if config["weight_decay"] != 0.0 else None,
+                learning_rate=config.learning_rate,
+                weight_decay=config.weight_decay if config.weight_decay != 0.0 else None,
                 weight_decay_mask=weight_decay_mask(model),
             ),
         )
-    elif config["optimizer"] == "adam":
+    elif config.optimizer == "adam":
         optim = optax.chain(
-            optax.clip_by_global_norm(config["grad_clip_norm"]),
+            optax.clip_by_global_norm(config.grad_clip_norm),
             optax.adamw(
-                learning_rate=config["learning_rate"],
-                weight_decay=config["weight_decay"] if config["weight_decay"] != 0.0 else None,
+                learning_rate=config.learning_rate,
+                weight_decay=config.weight_decay if config.weight_decay != 0.0 else None,
                 mask=weight_decay_mask(model),
             ),
         )
+    else:
+        raise ValueError(f"optimizer {config.optimizer!r} is not supported")
 
     ema_model = jax.tree.map(lambda x: x.copy(), model)  # copy model
 
     opt_state = optim.init(model)
 
-    if "displacement" in config and config["displacement"]:
-        train_dataset = AtomPackDataset(
-            file_path=config["train_path"],
-            atomic_numbers=original_config["atomic_numbers"],
-            cutoff=original_config["cutoff"],
-        )
-    else:
-        train_dataset = PhononDataset(
-            file_path=config["train_path"],
-            atomic_numbers=original_config["atomic_numbers"],
-            cutoff=original_config["cutoff"],
-            random_col=True,
-        )
+    train_dataset = PhononDataset(
+        file_path=config.train_path,
+        atomic_numbers=metadata.atomic_numbers,
+        cutoff=metadata.model_config.cutoff,
+        random_col=True,
+    )
 
     val_dataset = PhononDataset(
-        file_path=config["val_path"],
-        atomic_numbers=original_config["atomic_numbers"],
-        cutoff=original_config["cutoff"],
+        file_path=config.val_path,
+        atomic_numbers=metadata.atomic_numbers,
+        cutoff=metadata.model_config.cutoff,
         random_col=False,  # always use first column for validation
     )
 
-    if isinstance(config["extra_train_path"], list):
+    if isinstance(config.extra_train_path, tuple):
         extra_train_dataset = ConcatDataset(
             [
                 AtomPackDataset(
                     file_path=path,
-                    atomic_numbers=original_config["atomic_numbers"],
-                    cutoff=original_config["cutoff"],
+                    atomic_numbers=metadata.atomic_numbers,
+                    cutoff=metadata.model_config.cutoff,
                 )
-                for path in config["extra_train_path"]
+                for path in config.extra_train_path
             ]
         )
     else:
         extra_train_dataset = AtomPackDataset(
-            file_path=config["extra_train_path"],
-            atomic_numbers=original_config["atomic_numbers"],
-            cutoff=original_config["cutoff"],
+            file_path=config.extra_train_path,
+            atomic_numbers=metadata.atomic_numbers,
+            cutoff=metadata.model_config.cutoff,
         )
-    if "extra_val_frac" in config:
+    if config.extra_val_frac is not None:
         extra_train_dataset, extra_val_dataset = extra_train_dataset.split(
-            valid_frac=config["extra_val_frac"]
+            valid_frac=config.extra_val_frac
         )
     else:
+        if config.extra_val_path is None:
+            raise ValueError("extra_val_path is required when extra_val_frac is not provided")
         extra_val_dataset = AtomPackDataset(
-            file_path=config["extra_val_path"],
-            cutoff=original_config["cutoff"],
-            atomic_numbers=original_config["atomic_numbers"],
+            file_path=config.extra_val_path,
+            cutoff=metadata.model_config.cutoff,
+            atomic_numbers=metadata.atomic_numbers,
         )
-
-    stats_keys = [
-        # "shift",  shift, scale, avg_n_neighbors are used from the pretraining model
-        # "scale",
-        # "avg_n_neighbors",
-        "max_n_edges",
-        "max_n_nodes",
-        "avg_n_nodes",
-        "avg_n_edges",
-    ]
-    if all(key in config for key in stats_keys):
-        stats = {key: config[key] for key in stats_keys}
-    else:
-        atom_energies = [
-            original_config["atom_energies"][str(n)] for n in original_config["atomic_numbers"]
-        ]
-        stats = dataset_stats(train_dataset, atom_energies)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config["batch_size"],
-        n_graph=config.get("n_graph", None),
+        batch_size=config.batch_size,
+        n_graph=config.n_graph,
         shuffle=True,
-        max_n_nodes=stats["max_n_nodes"],
-        max_n_edges=stats["max_n_edges"],
-        avg_n_nodes=stats["avg_n_nodes"],
-        avg_n_edges=stats["avg_n_edges"],
+        max_n_nodes=config.max_n_nodes,
+        max_n_edges=config.max_n_edges,
+        avg_n_nodes=config.avg_n_nodes,
+        avg_n_edges=config.avg_n_edges,
         num_workers=8,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config["batch_size"],
-        n_graph=config.get("n_graph", None),
+        batch_size=config.batch_size,
+        n_graph=config.n_graph,
         shuffle=False,
-        max_n_nodes=stats["max_n_nodes"],
-        max_n_edges=stats["max_n_edges"],
-        avg_n_nodes=stats["avg_n_nodes"],
-        avg_n_edges=stats["avg_n_edges"],
+        max_n_nodes=config.max_n_nodes,
+        max_n_edges=config.max_n_edges,
+        avg_n_nodes=config.avg_n_nodes,
+        avg_n_edges=config.avg_n_edges,
         num_workers=8,
     )
 
     extra_val_loader = DataLoader(
         extra_val_dataset,
-        batch_size=original_config["batch_size"],
+        batch_size=config.extra_batch_size,
         shuffle=False,
-        max_n_nodes=original_config["max_n_nodes"],
-        max_n_edges=original_config["max_n_edges"],
-        avg_n_nodes=original_config["avg_n_nodes"],
-        avg_n_edges=original_config["avg_n_edges"],
+        max_n_nodes=config.extra_max_n_nodes,
+        max_n_edges=config.extra_max_n_edges,
+        avg_n_nodes=config.extra_avg_n_nodes,
+        avg_n_edges=config.extra_avg_n_edges,
         num_workers=8,
     )
 
     extra_train_loader = DataLoader(
         extra_train_dataset,
-        batch_size=original_config["batch_size"],
+        batch_size=config.extra_batch_size,
         shuffle=True,
-        max_n_nodes=original_config["max_n_nodes"],
-        max_n_edges=original_config["max_n_edges"],
-        avg_n_nodes=original_config["avg_n_nodes"],
-        avg_n_edges=original_config["avg_n_edges"],
+        max_n_nodes=config.extra_max_n_nodes,
+        max_n_edges=config.extra_max_n_edges,
+        avg_n_nodes=config.extra_avg_n_nodes,
+        avg_n_edges=config.extra_avg_n_edges,
         num_workers=8,
     )
 
-    if "displacement" in config and config["displacement"]:
-        loss_fn = partial(
-            efs_loss,
-            energy_weight=config["energy_weight"],
-            force_weight=config["force_weight"],
-            stress_weight=config["stress_weight"],
-        )
-    else:
-        loss_fn = partial(
-            loss,
-            energy_weight=config["energy_weight"],
-            force_weight=config["force_weight"],
-            stress_weight=config["stress_weight"],
-            hessian_weight=config["hessian_weight"],
-            checkpoint_grad_energy=config["checkpoint_grad_energy"],
-        )
+    loss_fn = partial(
+        loss,
+        energy_weight=config.energy_weight,
+        force_weight=config.force_weight,
+        stress_weight=config.stress_weight,
+        hessian_weight=config.hessian_weight,
+        checkpoint_grad_energy=config.checkpoint_grad_energy,
+    )
 
     extra_train_loss_fn = partial(
         efs_loss,
-        energy_weight=config.get("extra_energy_weight", original_config["energy_weight"]),
-        force_weight=config.get("extra_force_weight", original_config["force_weight"]),
-        stress_weight=config.get("extra_stress_weight", original_config["stress_weight"]),
+        energy_weight=config.extra_energy_weight,
+        force_weight=config.extra_force_weight,
+        stress_weight=config.extra_stress_weight,
     )
 
     @eqx.filter_jit(donate="all")
@@ -363,7 +332,7 @@ def train(run_config: PFTTrainerConfig):
 
         # update EMA model
         # don't weight early steps as much (from https://github.com/fadel/pytorch_ema)
-        decay = jnp.minimum(config["ema_decay"], (1 + step) / (10 + step))
+        decay = jnp.minimum(config.ema_decay, (1 + step) / (10 + step))
         ema_params, ema_static = eqx.partition(ema_model, eqx.is_array)
         model_params = eqx.filter(model, eqx.is_array)
         new_ema_params = jax.tree.map(
@@ -376,8 +345,10 @@ def train(run_config: PFTTrainerConfig):
     start_epoch = 0
     best_val_loss = float("inf")
     wandb_run_id = None
+    training_runtime_seconds = 0.0
+    validation_runtime_seconds = 0.0
 
-    if "resume_from" in config and Path(config["resume_from"]).exists():
+    if Path(config.resume_from).exists():
         (
             model,
             ema_model,
@@ -387,12 +358,14 @@ def train(run_config: PFTTrainerConfig):
             start_epoch,
             best_val_loss,
             wandb_run_id,
-        ) = load_training_state(config["resume_from"])
+            training_runtime_seconds,
+            validation_runtime_seconds,
+        ) = load_training_state(config.resume_from)
 
     wandb_init_kwargs = {
         "entity": "curtischong",
         "project": "nequix-phonon",
-        "config": config,
+        "config": config_values(config),
     }
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
@@ -400,7 +373,7 @@ def train(run_config: PFTTrainerConfig):
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb_run_id = getattr(wandb.run, "id", None)
 
-    for epoch in range(start_epoch, config["n_epochs"]):
+    for epoch in range(start_epoch, config.n_epochs):
         train_loader.set_epoch(epoch)
         extra_train_loader.set_epoch(epoch)
 
@@ -416,43 +389,41 @@ def train(run_config: PFTTrainerConfig):
             step_time = time.time() - start
 
             # extra train step with original training data/loss fn
-            for _ in range(config["extra_train_steps"]):
+            for _ in range(config.extra_train_steps):
                 extra_batch = next(extra_iter)
                 model, ema_model, opt_state, extra_total_loss, extra_metrics = train_step(
                     model, ema_model, extra_train_loss_fn, step.copy(), opt_state, extra_batch
                 )
 
             step = step + 1
-            if step % config["log_every"] == 0:
+            if step % config.log_every == 0:
                 logs = {}
                 for k, v in metrics.items():
                     logs[f"train/{k}"] = v.mean().item()
                 logs["train/loss"] = total_loss.mean().item()
                 logs["train/batch_size"] = jraph.get_graph_padding_mask(batch).sum().item()
                 logs["train/time"] = step_time
-                if config["extra_train_steps"]:
+                if config.extra_train_steps:
                     for k, v in extra_metrics.items():
                         logs[f"extra_train/{k}"] = v.mean().item()
                     logs["extra_train/loss"] = extra_total_loss.mean().item()
                 wandb.log(logs, step=step)
                 print(f"step {step:03d} logs: {logs}")
 
-        if epoch % config["val_every"] == 0 or epoch == config["n_epochs"] - 1:
+        if epoch % config.val_every == 0 or epoch == config.n_epochs - 1:
             val_metrics = evaluate(
                 ema_model,
                 val_loader,
-                config["energy_weight"],
-                config["force_weight"],
-                config["stress_weight"],
-                config["hessian_weight"],
-                config["checkpoint_grad_energy"],
+                config.energy_weight,
+                config.force_weight,
+                config.stress_weight,
+                config.hessian_weight,
+                config.checkpoint_grad_energy,
             )
 
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
-                save_model(
-                    Path(wandb.run.dir) / "checkpoint.nqx", ema_model, original_config | config
-                )
+                save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model, metadata)
 
             # always save training state to wandb dir
             save_training_state(
@@ -465,20 +436,22 @@ def train(run_config: PFTTrainerConfig):
                 epoch + 1,
                 best_val_loss,
                 wandb_run_id=wandb_run_id,
+                training_runtime_seconds=training_runtime_seconds,
+                validation_runtime_seconds=validation_runtime_seconds,
             )
-            # also save training state to config state_path
-            if "state_path" in config:
-                save_training_state(
-                    config["state_path"],
-                    model,
-                    ema_model,
-                    optim,
-                    opt_state,
-                    step,
-                    epoch + 1,
-                    best_val_loss,
-                    wandb_run_id=wandb_run_id,
-                )
+            save_training_state(
+                config.state_path,
+                model,
+                ema_model,
+                optim,
+                opt_state,
+                step,
+                epoch + 1,
+                best_val_loss,
+                wandb_run_id=wandb_run_id,
+                training_runtime_seconds=training_runtime_seconds,
+                validation_runtime_seconds=validation_runtime_seconds,
+            )
 
             logs = {}
             for k, v in val_metrics.items():
@@ -491,9 +464,9 @@ def train(run_config: PFTTrainerConfig):
             extra_val_metrics = efs_evaluate(
                 ema_model,
                 extra_val_loader,
-                energy_weight=original_config["energy_weight"],
-                force_weight=original_config["force_weight"],
-                stress_weight=original_config["stress_weight"],
+                energy_weight=config.extra_energy_weight,
+                force_weight=config.extra_force_weight,
+                stress_weight=config.extra_stress_weight,
             )
             for k, v in extra_val_metrics.items():
                 logs[f"extra_val/{k}"] = v.mean().item()

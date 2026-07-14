@@ -18,21 +18,9 @@ import cloudpickle
 import jax
 import jaxlib
 
+from nequix.config import TrainerConfig
 
 _CACHE_SCHEMA = 2
-_MODEL_SHAPE_KEYS = (
-    "atomic_numbers",
-    "hidden_irreps",
-    "lmax",
-    "n_layers",
-    "radial_basis_size",
-    "radial_mlp_size",
-    "radial_mlp_layers",
-    "radial_polynomial_p",
-    "index_weights",
-    "layer_norm",
-    "cutoff",
-)
 _DATASET_STAT_KEYS = (
     "avg_n_nodes",
     "avg_n_edges",
@@ -140,7 +128,9 @@ def query_gpu_hardware() -> dict:
     return {"gpus": gpus, "cuda_visible_devices": visible}
 
 
-def autobatch_cache_key(config: dict, stats: dict, dataset_size: int, hardware: dict) -> str:
+def autobatch_cache_key(
+    config: TrainerConfig, stats: dict, dataset_size: int, hardware: dict
+) -> str:
     """Build a stable key for every input that changes capacity or train graphs."""
     payload = {
         "schema": _CACHE_SCHEMA,
@@ -148,25 +138,33 @@ def autobatch_cache_key(config: dict, stats: dict, dataset_size: int, hardware: 
         "jax": jax.__version__,
         "jaxlib": jaxlib.__version__,
         "os_kernel": platform.release(),
-        "model": {key: config.get(key) for key in _MODEL_SHAPE_KEYS},
+        "model": {"atomic_numbers": config.atomic_numbers, **asdict(config.model_config)},
         "training_kernel": {
-            "enabled": config.get("kernel"),
+            "enabled": config.kernel,
             "openequivariance": _package_version("openequivariance"),
             "openequivariance_extjax": _package_version("openequivariance-extjax"),
         },
-        "force_mode": config.get("force_mode"),
-        "optimizer": config.get("optimizer"),
+        "force_mode": config.force_mode,
+        "optimizer": config.optimizer,
         "optimizer_config": {
-            key: config.get(key) for key in ("grad_clip_norm", "weight_decay", "ema_decay")
+            "grad_clip_norm": config.grad_clip_norm,
+            "weight_decay": config.weight_decay,
+            "ema_decay": config.ema_decay,
         },
         "loss": {
-            key: config.get(key)
-            for key in ("energy_weight", "force_weight", "stress_weight", "loss_type")
+            "energy_weight": config.energy_weight,
+            "force_weight": config.force_weight,
+            "stress_weight": config.stress_weight,
+            "loss_type": config.loss_type,
         },
         "dataset_size": int(dataset_size),
-        "dataset_stats": {key: stats.get(key) for key in _DATASET_STAT_KEYS},
-        "dataset_config": {key: config.get(key) for key in ("train_path", "train_frac", "seed")},
-        "autobatch_memory_scaling_factor": config.get("autobatch_memory_scaling_factor", 1.6),
+        "dataset_stats": {key: stats[key] for key in _DATASET_STAT_KEYS},
+        "dataset_config": {
+            "train_path": config.train_path,
+            "train_frac": config.train_frac,
+            "seed": config.seed,
+        },
+        "autobatch_memory_scaling_factor": config.autobatch_memory_scaling_factor,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -212,7 +210,7 @@ def _shape_from_dict(values: dict) -> BatchShape:
 def _probe_from_dict(values: dict) -> ProbeResult:
     values = dict(values)
     values["shape"] = _shape_from_dict(values["shape"])
-    values["timed_graphs_per_second"] = tuple(values.get("timed_graphs_per_second", ()))
+    values["timed_graphs_per_second"] = tuple(values["timed_graphs_per_second"])
     return ProbeResult(**values)
 
 
@@ -222,14 +220,14 @@ def cached_tune_result(path: Path, key: str) -> TuneResult | None:
         return None
     try:
         shape = _shape_from_dict(entry["shape"])
-        probes = tuple(_probe_from_dict(probe) for probe in entry.get("probes", []))
+        probes = tuple(_probe_from_dict(probe) for probe in entry["probes"])
     except (KeyError, TypeError, ValueError):
         return None
     return TuneResult(
         shape=shape,
         probes=probes,
         cached=True,
-        warning=entry.get("warning"),
+        warning=entry["warning"],
         cache_key=key,
     )
 
@@ -382,7 +380,7 @@ def subprocess_probe(payload: dict, shape: BatchShape, timeout: float = 1800) ->
 def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResult:
     """Load or measure the fixed batch shape for a standard JAX training run."""
     initial = batch_shape(1, stats)
-    memory_scaling_factor = float(config.get("autobatch_memory_scaling_factor", 1.6))
+    memory_scaling_factor = float(config.autobatch_memory_scaling_factor)
     if not math.isfinite(memory_scaling_factor) or memory_scaling_factor <= 1:
         raise ValueError("autobatch_memory_scaling_factor must be greater than one")
 
@@ -405,6 +403,7 @@ def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResu
         "stats": stats,
         "train_dataset": train_dataset,
         "atom_energies": atom_energies,
+        "packing": "best_fit",
     }
     result = tune_batch_shape(
         stats,

@@ -13,8 +13,9 @@ from nequix.config.models import (
 
 _MP = TrainerConfig(
     name="nequix-mp-1",
-    trainer="jax",
-    state_path="state.pkl",
+    state_path="checkpoints/nequix-mp-1.pkl",
+    resume_from="checkpoints/nequix-mp-1.pkl",
+    checkpoint_path="checkpoints/nequix-mp-1.nqx",
     train_path="data/mptrj.atp",
     valid_frac=0.05,
     dataset_name="mptrj",
@@ -33,9 +34,9 @@ _MP = TrainerConfig(
 _OMAT = replace(
     _MP,
     name="nequix-omat-1",
-    trainer="jax",
     state_path="checkpoints/nequix-omat-1-jax.pkl",
     resume_from="checkpoints/nequix-omat-1-jax.pkl",
+    checkpoint_path="checkpoints/nequix-omat-1.nqx",
     train_path="data/omat/train.atp",
     valid_frac=None,
     valid_path="data/omat/val.atp",
@@ -81,7 +82,8 @@ _OAM = replace(
     name="nequix-oam-1",
     state_path="checkpoints/nequix-oam-1-jax.pkl",
     resume_from="checkpoints/nequix-oam-1-jax.pkl",
-    finetune_from="models/nequix-omat-1.nqx",
+    finetune_from="checkpoints/nequix-omat-1.nqx",
+    checkpoint_path="checkpoints/nequix-oam-1.nqx",
     train_path=_OAM_TRAIN_PATHS,
     valid_path="data/salex/val.atp",
     dataset_name="oam",

@@ -5,10 +5,10 @@ import torch
 import torch_geometric
 from e3nn import o3
 
+from nequix.config import ModelMetadata, NequixConfig
 from nequix.torch_impl.layer_norm import RMSLayerNorm
 from nequix.torch_impl.model import (
     NequixTorch,
-    get_optimizer_param_groups,
     load_model,
     save_model,
     scatter,
@@ -132,6 +132,26 @@ def test_model_save_load():
 
     # Create model using config parameters
     atom_energies = [config["atom_energies"][n] for n in config["atomic_numbers"]]
+    metadata = ModelMetadata(
+        atomic_numbers=tuple(config["atomic_numbers"]),
+        atom_energies=tuple(atom_energies),
+        shift=config["shift"],
+        scale=config["scale"],
+        avg_n_neighbors=config["avg_n_neighbors"],
+        model_config=NequixConfig(
+            cutoff=config["cutoff"],
+            hidden_irreps=config["hidden_irreps"],
+            lmax=config["lmax"],
+            n_layers=config["n_layers"],
+            radial_basis_size=config["radial_basis_size"],
+            radial_mlp_size=config["radial_mlp_size"],
+            radial_mlp_layers=config["radial_mlp_layers"],
+            radial_polynomial_p=config["radial_polynomial_p"],
+            mlp_init_scale=config["mlp_init_scale"],
+            index_weights=config["index_weights"],
+            layer_norm=config["layer_norm"],
+        ),
+    )
     model = NequixTorch(
         n_species=len(config["atomic_numbers"]),
         cutoff=config["cutoff"],
@@ -165,8 +185,9 @@ def test_model_save_load():
     )
 
     with tempfile.NamedTemporaryFile(suffix=".pt") as tmp_file:
-        save_model(tmp_file.name, model, config)
-        loaded_model, _ = load_model(tmp_file.name)
+        save_model(tmp_file.name, model, metadata)
+        loaded_model, loaded_metadata = load_model(tmp_file.name)
+        assert loaded_metadata == metadata
         assert model.lmax == loaded_model.lmax
         assert model.cutoff == loaded_model.cutoff
         assert model.n_species == loaded_model.n_species
@@ -189,27 +210,3 @@ def test_model_save_load():
         torch.testing.assert_close(original_energy, loaded_energy)
         torch.testing.assert_close(original_forces, loaded_forces)
         torch.testing.assert_close(original_stress, loaded_stress)
-
-
-def test_weight_decay_mask():
-    model = NequixTorch(
-        n_species=2,
-        lmax=1,
-        hidden_irreps="8x0e+8x1o",
-        n_layers=2,
-        radial_basis_size=4,
-        radial_mlp_size=8,
-        radial_mlp_layers=2,
-        layer_norm=True,
-    )
-    params_groups = get_optimizer_param_groups(model, 0.001)
-
-    # First param group should have the weight decay
-    assert params_groups[0]["weight_decay"] == 0.001
-    # should be weight decay on e3nn linear layers and normal linear weights
-    torch.testing.assert_close(params_groups[0]["params"][0], model.layers[0].linear_1.weight)
-    torch.testing.assert_close(
-        params_groups[0]["params"][1], model.layers[0].radial_mlp.layers[0].weights
-    )
-
-    # TODO: Have tests for the params that have a weight_decay

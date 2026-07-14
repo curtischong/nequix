@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from nequix.calculator import from_pretrained
+from nequix.calculator import load_model_for_backend
 from nequix.torch_impl.model import scatter
 from nequix.data import atomic_numbers_to_indices
 
@@ -44,7 +44,7 @@ class NequixTorchSimModel(ModelInterface):
         """Initialize the Nequix model for energy and force calculations.
 
         Args:
-            model: Path to a .pt model file, or name of a pretrained model.
+            model: Path to a current-format .nqx or .pt model file.
             use_kernel: Whether to use the OpenEquivariance kernels.
             device: Device to run computations on. Defaults to CUDA if available.
             dtype: Data type for tensor operations. Defaults to float64.
@@ -59,21 +59,18 @@ class NequixTorchSimModel(ModelInterface):
         self._compute_forces = True
         self._memory_scales_with = "n_atoms_x_density"
         self.neighbor_list_fn = neighbor_list_fn
-        if Path(model).exists():
-            self.model, self.config = from_pretrained(
-                model_path=model, backend="torch", use_kernel=use_kernel
-            )
-        else:
-            self.model, self.config = from_pretrained(
-                model_name=model, backend="torch", use_kernel=use_kernel
-            )
+        self.model, self.metadata = load_model_for_backend(
+            model, backend="torch", use_kernel=use_kernel
+        )
 
         self.model = self.model.to(device=self._device, dtype=self._dtype)
         self.model = self.model.eval()
 
-        self.r_max = torch.tensor(self.config["cutoff"], dtype=self._dtype, device=self._device)
+        self.r_max = torch.tensor(
+            self.metadata.model_config.cutoff, dtype=self._dtype, device=self._device
+        )
 
-        atom_indices = atomic_numbers_to_indices(self.config["atomic_numbers"])
+        atom_indices = atomic_numbers_to_indices(self.metadata.atomic_numbers)
         max_z = max(atom_indices.keys())
         z_table = torch.full((max_z + 1,), -1, dtype=torch.long, device=self._device)
         for z, idx in atom_indices.items():
