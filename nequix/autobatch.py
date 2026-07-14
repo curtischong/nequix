@@ -19,15 +19,9 @@ import jax
 import jaxlib
 
 from nequix.config import TrainerConfig
+from nequix.data import padded_shape
 
 _CACHE_SCHEMA = 2
-_DATASET_STAT_KEYS = (
-    "avg_n_nodes",
-    "avg_n_edges",
-    "max_n_nodes",
-    "max_n_edges",
-    "avg_n_neighbors",
-)
 _OOM_MARKERS = (
     "out of memory",
     "resource_exhausted",
@@ -75,17 +69,34 @@ class TuneResult:
 
 
 def batch_shape(batch_size: int, stats: dict, buffer_factor: float = 1.1) -> BatchShape:
-    """Return the padded shape for an internal autobatch candidate."""
+    """Return the padded shape a DataLoader derives for an autobatch candidate."""
     batch_size = int(batch_size)
     if batch_size < 1:
         raise ValueError("batch_size must be at least one")
-    return BatchShape(
-        batch_size=batch_size,
-        n_graph=batch_size + 1,
-        n_node=int(max(batch_size * stats["avg_n_nodes"] * buffer_factor, stats["max_n_nodes"]))
-        + 1,
-        n_edge=int(max(batch_size * stats["avg_n_edges"] * buffer_factor, stats["max_n_edges"])),
+    n_graph, n_node, n_edge = padded_shape(
+        batch_size,
+        stats["avg_n_nodes"],
+        stats["avg_n_edges"],
+        stats["max_n_nodes"],
+        stats["max_n_edges"],
+        buffer_factor,
     )
+    return BatchShape(batch_size=batch_size, n_graph=n_graph, n_node=n_node, n_edge=n_edge)
+
+
+def peak_device_memory_bytes() -> int:
+    """Return the highest peak-memory statistic reported by any JAX device."""
+    peaks = []
+    for device in jax.devices():
+        try:
+            memory = device.memory_stats() or {}
+        except (AttributeError, RuntimeError):
+            continue
+        for key in ("peak_bytes_in_use", "peak_bytes_in_use_limit", "bytes_in_use"):
+            if key in memory:
+                peaks.append(int(memory[key]))
+                break
+    return max(peaks, default=0)
 
 
 def query_gpu_hardware() -> dict:
@@ -128,9 +139,7 @@ def query_gpu_hardware() -> dict:
     return {"gpus": gpus, "cuda_visible_devices": visible}
 
 
-def autobatch_cache_key(
-    config: TrainerConfig, stats: dict, dataset_size: int, hardware: dict
-) -> str:
+def autobatch_cache_key(config: TrainerConfig, dataset_size: int, hardware: dict) -> str:
     """Build a stable key for every input that changes capacity or train graphs."""
     payload = {
         "schema": _CACHE_SCHEMA,
@@ -158,13 +167,14 @@ def autobatch_cache_key(
             "loss_type": config.loss_type,
         },
         "dataset_size": int(dataset_size),
-        "dataset_stats": {key: stats[key] for key in _DATASET_STAT_KEYS},
+        "dataset_stats": config.dataset_stats(),
         "dataset_config": {
             "train_path": config.train_path,
             "train_frac": config.train_frac,
             "seed": config.seed,
         },
         "autobatch_memory_scaling_factor": config.autobatch_memory_scaling_factor,
+        "autobatch_minimum_speedup": config.autobatch_minimum_speedup,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -267,15 +277,13 @@ def tune_batch_shape(
         probes.append(result)
         return result
 
+    def fallback(warning):
+        return TuneResult(shape=initial_shape, probes=tuple(probes), warning=warning)
+
     baseline = run(initial_shape.batch_size)
     if not baseline.safe:
-        return TuneResult(
-            shape=initial_shape,
-            probes=tuple(probes),
-            warning=(
-                "autobatch probing failed at the minimum capacity; "
-                "using a single-example capacity"
-            ),
+        return fallback(
+            "autobatch probing failed at the minimum capacity; using a single-example capacity"
         )
 
     per_device_examples = max(1, math.ceil(dataset_size / max(device_count, 1)))
@@ -290,11 +298,7 @@ def tune_batch_shape(
         )
         result = run(candidate)
         if result.status == "failed":
-            return TuneResult(
-                shape=initial_shape,
-                probes=tuple(probes),
-                warning="autobatch probing failed; using a single-example capacity",
-            )
+            return fallback("autobatch probing failed; using a single-example capacity")
         if result.safe:
             last_safe = result
         else:
@@ -311,11 +315,7 @@ def tune_batch_shape(
             middle = (low + high) // 2
             result = run(middle)
             if result.status == "failed":
-                return TuneResult(
-                    shape=initial_shape,
-                    probes=tuple(probes),
-                    warning="autobatch probing failed; using a single-example capacity",
-                )
+                return fallback("autobatch probing failed; using a single-example capacity")
             if result.safe:
                 low = middle
             else:
@@ -324,13 +324,9 @@ def tune_batch_shape(
     safe = [result for result in probes if result.safe]
     best = max(safe, key=lambda result: result.graphs_per_second)
     if best.graphs_per_second <= baseline.graphs_per_second * (1 + minimum_speedup):
-        return TuneResult(
-            shape=initial_shape,
-            probes=tuple(probes),
-            warning=(
-                "no autobatch candidate was measurably faster than one example; "
-                "using a single-example capacity"
-            ),
+        return fallback(
+            "no autobatch candidate was measurably faster than one example; "
+            "using a single-example capacity"
         )
     return TuneResult(shape=best.shape, probes=tuple(probes))
 
@@ -340,19 +336,19 @@ def _looks_like_oom(message: str) -> bool:
     return any(marker in lowered for marker in _OOM_MARKERS)
 
 
-def subprocess_probe(payload: dict, shape: BatchShape, timeout: float = 1800) -> ProbeResult:
+def subprocess_probe(payload_path: Path, shape: BatchShape, timeout: float = 1800) -> ProbeResult:
     """Run one real compiled candidate in a disposable Python process."""
     with tempfile.TemporaryDirectory(prefix="nequix-autobatch-") as directory:
         directory = Path(directory)
-        payload_path = directory / "payload.pkl"
+        shape_path = directory / "shape.json"
         result_path = directory / "result.json"
-        with payload_path.open("wb") as payload_file:
-            cloudpickle.dump({**payload, "shape": shape}, payload_file)
+        shape_path.write_text(json.dumps(asdict(shape)))
         command = [
             sys.executable,
             "-m",
             "nequix.autobatch_probe",
             str(payload_path),
+            str(shape_path),
             str(result_path),
         ]
         try:
@@ -377,20 +373,16 @@ def subprocess_probe(payload: dict, shape: BatchShape, timeout: float = 1800) ->
         )
 
 
-def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResult:
+def tune_training_batch(config: TrainerConfig, train_dataset) -> TuneResult:
     """Load or measure the fixed batch shape for a standard JAX training run."""
-    initial = batch_shape(1, stats)
-    memory_scaling_factor = float(config.autobatch_memory_scaling_factor)
-    if not math.isfinite(memory_scaling_factor) or memory_scaling_factor <= 1:
-        raise ValueError("autobatch_memory_scaling_factor must be greater than one")
-
+    stats = config.dataset_stats()
     hardware = query_gpu_hardware()
     if not hardware["gpus"]:
         message = "autobatch could not identify an NVIDIA GPU; using a single-example capacity"
         warnings.warn(message, RuntimeWarning)
-        return TuneResult(shape=initial, warning=message)
+        return TuneResult(shape=batch_shape(1, stats), warning=message)
 
-    key = autobatch_cache_key(config, stats, len(train_dataset), hardware)
+    key = autobatch_cache_key(config, len(train_dataset), hardware)
     cache_path = default_cache_path()
     cached = cached_tune_result(cache_path, key)
     if cached is not None:
@@ -398,21 +390,19 @@ def tune_training_batch(config, stats, train_dataset, atom_energies) -> TuneResu
             warnings.warn(cached.warning, RuntimeWarning)
         return cached
 
-    payload = {
-        "config": config,
-        "stats": stats,
-        "train_dataset": train_dataset,
-        "atom_energies": atom_energies,
-        "packing": "best_fit",
-    }
-    result = tune_batch_shape(
-        stats,
-        len(train_dataset),
-        len(hardware["gpus"]),
-        lambda shape: subprocess_probe(payload, shape),
-        memory_scaling_factor=memory_scaling_factor,
-        minimum_speedup=float(os.environ.get("NEQUIX_AUTOBATCH_MIN_SPEEDUP", 0.02)),
-    )
+    # The payload is identical for every candidate, so it is serialized once.
+    with tempfile.TemporaryDirectory(prefix="nequix-autobatch-") as directory:
+        payload_path = Path(directory) / "payload.pkl"
+        with payload_path.open("wb") as payload_file:
+            cloudpickle.dump({"config": config, "train_dataset": train_dataset}, payload_file)
+        result = tune_batch_shape(
+            stats,
+            len(train_dataset),
+            len(hardware["gpus"]),
+            lambda shape: subprocess_probe(payload_path, shape),
+            memory_scaling_factor=float(config.autobatch_memory_scaling_factor),
+            minimum_speedup=float(config.autobatch_minimum_speedup),
+        )
     result = replace(result, cache_key=key)
     if result.warning:
         warnings.warn(result.warning, RuntimeWarning)

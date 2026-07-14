@@ -6,7 +6,7 @@ import threading
 from collections import deque
 from abc import ABC, abstractmethod
 from pathlib import Path
-from pprint import pformat
+from typing import Callable
 
 import ase
 from atompack import Database
@@ -167,8 +167,6 @@ class IndexDataset(Dataset):
     def __init__(self, base: Dataset, indices: np.ndarray):
         super().__init__(backend=base.backend)
         self.base, self.indices = base, np.asarray(indices, dtype=int)
-        if hasattr(base, "atomic_indices"):
-            self.atomic_indices = base.atomic_indices
 
     def __len__(self):
         return self.indices.size
@@ -182,8 +180,6 @@ class ConcatDataset(Dataset):
         super().__init__(backend=datasets[0].backend)
         self.datasets = datasets
         self.len_cumulative = np.cumsum([len(ds) for ds in datasets])
-        if hasattr(datasets[0], "atomic_indices"):
-            self.atomic_indices = datasets[0].atomic_indices
 
     def __len__(self):
         return self.len_cumulative[-1]
@@ -273,18 +269,6 @@ class AtomPackDataset(Dataset):
         return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
 
 
-def dataset_from_path(
-    file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
-) -> Dataset:
-    """Open an AtomPack training dataset."""
-    return AtomPackDataset(
-        file_path=file_path,
-        atomic_numbers=atomic_numbers,
-        cutoff=cutoff,
-        backend=backend,
-    )
-
-
 def _dataloader_worker(dataset, index_queue, output_queue):
     while True:
         try:
@@ -294,6 +278,20 @@ def _dataloader_worker(dataset, index_queue, output_queue):
         if index is None:
             break
         output_queue.put((index, dataset[index]))
+
+
+def padded_shape(
+    batch_size: int,
+    avg_n_nodes: float,
+    avg_n_edges: float,
+    max_n_nodes: int,
+    max_n_edges: int,
+    buffer_factor: float = 1.1,
+) -> tuple[int, int, int]:
+    """Return the static (n_graph, n_node, n_edge) padding for a dynamic batch."""
+    n_node = int(max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes)) + 1
+    n_edge = int(max(batch_size * avg_n_edges * buffer_factor, max_n_edges))
+    return batch_size + 1, n_node, n_edge
 
 
 # multiprocess data loader with dynamic batching, based on
@@ -325,9 +323,10 @@ class DataLoader:
         self.idxs = np.arange(len(self.dataset))
         self.idx = 0
         self._generator = None  # created in __iter__
-        self.n_node = int(max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes)) + 1
-        self.n_edge = int(max(batch_size * avg_n_edges * buffer_factor, max_n_edges))
-        self.n_graph = int(n_graph if n_graph is not None else batch_size + 1)
+        default_n_graph, self.n_node, self.n_edge = padded_shape(
+            batch_size, avg_n_nodes, avg_n_edges, max_n_nodes, max_n_edges, buffer_factor
+        )
+        self.n_graph = int(n_graph if n_graph is not None else default_n_graph)
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
         if packing not in {"next_fit", "best_fit"}:
@@ -457,12 +456,12 @@ def _graph_size(graph):
     )
 
 
-def bounded_best_fit_indices(sizes, capacity, lookahead=64):
-    """Pack ordered items with deterministic, bounded-lookahead best fit.
+def _bounded_best_fit(items, capacity, lookahead):
+    """Pack (payload, size) items with deterministic, bounded-lookahead best fit.
 
-    ``capacity`` and every entry in ``sizes`` are ``(graphs, nodes, edges)``.
-    Items may move only within the rolling lookahead window, and each input
-    index is returned exactly once.
+    ``capacity`` and every size are ``(graphs, nodes, edges)``. Items may move
+    only within the rolling lookahead window, and each input item is returned
+    exactly once.
     """
     capacity = tuple(int(value) for value in capacity)
     if capacity[0] < 1 or capacity[1] < 1 or capacity[2] < 0:
@@ -472,21 +471,24 @@ def bounded_best_fit_indices(sizes, capacity, lookahead=64):
     if lookahead < 1:
         raise ValueError("lookahead must be at least one")
 
-    sizes = [tuple(int(value) for value in size) for size in sizes]
-    for index, size in enumerate(sizes):
-        if any(value < 0 for value in size):
-            raise ValueError(f"item {index} has a negative size: {size}")
-        if any(value > limit for value, limit in zip(size, capacity)):
-            raise ValueError(f"item {index} with size {size} exceeds capacity {capacity}")
-
+    items = iter(items)
     waiting = deque()
-    next_index = 0
+    exhausted = False
 
     def refill():
-        nonlocal next_index
-        while len(waiting) < lookahead and next_index < len(sizes):
-            waiting.append(next_index)
-            next_index += 1
+        nonlocal exhausted
+        while len(waiting) < lookahead and not exhausted:
+            try:
+                payload, size = next(items)
+            except StopIteration:
+                exhausted = True
+                break
+            size = tuple(int(value) for value in size)
+            if any(value < 0 for value in size):
+                raise ValueError(f"item has a negative size: {size}")
+            if any(value > limit for value, limit in zip(size, capacity)):
+                raise ValueError(f"item with size {size} exceeds capacity {capacity}")
+            waiting.append((payload, size))
 
     refill()
     while waiting:
@@ -494,8 +496,8 @@ def bounded_best_fit_indices(sizes, capacity, lookahead=64):
         packed = []
         while True:
             fitting = []
-            for position, index in enumerate(waiting):
-                added = tuple(a + b for a, b in zip(used, sizes[index]))
+            for position, (payload, size) in enumerate(waiting):
+                added = tuple(a + b for a, b in zip(used, size))
                 if all(value <= limit for value, limit in zip(added, capacity)):
                     # Best fit minimizes normalized space left. The original
                     # stream position is a stable tie-breaker.
@@ -504,62 +506,29 @@ def bounded_best_fit_indices(sizes, capacity, lookahead=64):
                         for value, limit in zip(added, capacity)
                         if limit > 0
                     )
-                    fitting.append((residual, position, index, added))
+                    fitting.append((residual, position, added))
             if not fitting:
                 break
-            _, position, index, used = min(fitting)
+            _, position, used = min(fitting)
+            packed.append(waiting[position][0])
             del waiting[position]
-            packed.append(index)
             refill()
         if not packed:  # guarded by the individual-size check above
             raise RuntimeError("best-fit packer made no progress")
         yield packed
 
 
+def bounded_best_fit_indices(sizes, capacity, lookahead=64):
+    """Pack ordered item sizes, yielding each input index exactly once."""
+    yield from _bounded_best_fit(enumerate(sizes), capacity, lookahead)
+
+
 def best_fit_dynamic_batch(graphs, n_node, n_edge, n_graph, lookahead=64):
     """Batch graphs into a single static shape using bounded best-fit packing."""
     # Jraph needs one spare graph and one spare node for its padding graph.
     capacity = (int(n_graph) - 1, int(n_node) - 1, int(n_edge))
-    waiting = deque()
-    exhausted = False
-
-    def refill():
-        nonlocal exhausted
-        while len(waiting) < lookahead and not exhausted:
-            try:
-                graph = next(graphs)
-            except StopIteration:
-                exhausted = True
-                break
-            size = _graph_size(graph)
-            if any(value > limit for value, limit in zip(size, capacity)):
-                raise ValueError(f"graph with size {size} exceeds batch capacity {capacity}")
-            waiting.append((graph, size))
-
-    graphs = iter(graphs)
-    refill()
-    while waiting:
-        used = (0, 0, 0)
-        packed = []
-        while True:
-            fitting = []
-            for position, (graph, size) in enumerate(waiting):
-                added = tuple(a + b for a, b in zip(used, size))
-                if all(value <= limit for value, limit in zip(added, capacity)):
-                    residual = sum(
-                        (limit - value) / limit
-                        for value, limit in zip(added, capacity)
-                        if limit > 0
-                    )
-                    fitting.append((residual, position, graph, added))
-            if not fitting:
-                break
-            _, position, graph, used = min(fitting, key=lambda item: (item[0], item[1]))
-            del waiting[position]
-            packed.append(graph)
-            refill()
-        if not packed:
-            raise RuntimeError("best-fit graph packer made no progress")
+    sized = ((graph, _graph_size(graph)) for graph in graphs)
+    for packed in _bounded_best_fit(sized, capacity, lookahead):
         yield jraph.pad_with_graphs(
             jraph.batch_np(packed),
             n_node=int(n_node),
@@ -618,90 +587,36 @@ def prefetch(loader, queue_size=4):
         thread.join(timeout=1.0)
 
 
-# based on https://github.com/ACEsuit/mace/blob/d39cc6b/mace/data/utils.py#L300
-def average_atom_energies(dataset: Dataset) -> list[float]:
-    """Compute the average energy of each species in the dataset."""
-    atomic_indices = dataset.atomic_indices
-    A = np.zeros((len(dataset), len(atomic_indices)), dtype=np.float32)
-    B = np.zeros((len(dataset),), dtype=np.float32)
-    for i, graph in tqdm(enumerate(dataset), total=len(dataset)):
-        A[i] = np.bincount(graph.nodes["species"], minlength=len(atomic_indices))
-        B[i] = graph.globals["energy"][0]
-    E0s = np.linalg.lstsq(A, B, rcond=None)[0].tolist()
-    idx_to_atomic_number = {v: k for k, v in atomic_indices.items()}
-    atom_energies = {idx_to_atomic_number[i]: e0 for i, e0 in enumerate(E0s)}
-    print("computed energies; add these atom_energies to the Python run config:")
-    print(pformat(atom_energies, sort_dicts=True))
-    return E0s
+def write_atompack_database(
+    input_path: str | Path,
+    output_path: str | Path,
+    glob_pattern: str,
+    read_molecules: Callable,
+    n_workers: int = 16,
+):
+    """Convert input files into one AtomPack database, in parallel across files.
 
+    ``read_molecules`` must be a picklable top-level function that maps one input
+    file path to a list of AtomPack molecules.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if output_path.suffix != ".atp":
+        raise ValueError(f"AtomPack output path must end in .atp: {output_path}")
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1")
 
-def dataset_stats(dataset: Dataset, atom_energies: list[float], num_workers: int = 16) -> dict:
-    """Compute the statistics of the dataset."""
-    atom_energies = np.array(atom_energies)
-    num_graphs = len(dataset)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_paths = sorted(input_path.rglob(glob_pattern)) if input_path.is_dir() else [input_path]
+    if not file_paths:
+        raise ValueError(f"no {glob_pattern} files found in {input_path}")
 
-    sum_energy_per_atom = 0.0
-    sum_force_sq = 0.0
-    num_force_components = 0
-    sum_neighbors = 0.0
-    sum_nodes = 0
-    sum_edges = 0
-    max_nodes = 0
-    max_edges = 0
-
-    # use DataLoader so we can parallelize workers to compute stats
-    loader = DataLoader(
-        dataset,
-        max_n_nodes=1,
-        max_n_edges=1,
-        avg_n_nodes=1,
-        avg_n_edges=1,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=1,
-    )
-    loader._start_workers()
-    loader.idx = 0
-    iterator = loader.make_generator()
-
-    try:
-        for graph in tqdm(prefetch(iterator), total=num_graphs):
-            n_node = int(np.asarray(graph.n_node).item())
-            n_edge = int(np.asarray(graph.n_edge).item())
-
-            sum_nodes += n_node
-            sum_edges += n_edge
-            if n_node > max_nodes:
-                max_nodes = n_node
-            if n_edge > max_edges:
-                max_edges = n_edge
-
-            graph_e0 = np.sum(atom_energies[graph.nodes["species"]])
-            energy_per_atom = float((graph.globals["energy"][0] - graph_e0) / n_node)
-            sum_energy_per_atom += energy_per_atom
-            sum_force_sq += float(np.sum(graph.nodes["forces"] ** 2))
-            num_force_components += graph.nodes["forces"].size
-            sum_neighbors += n_edge / n_node
-    finally:
-        for _ in loader.workers:
-            loader.index_queue.put(None)
-        for w in loader.workers:
-            w.join(timeout=1.0)
-
-    mean = sum_energy_per_atom / num_graphs
-    rms = float(np.sqrt(sum_force_sq / num_force_components))
-    avg_n_neighbors = sum_neighbors / num_graphs
-
-    stats = {
-        "shift": float(mean),
-        "scale": float(rms),
-        "avg_n_neighbors": float(avg_n_neighbors),
-        "avg_n_nodes": float(sum_nodes / num_graphs),
-        "avg_n_edges": float(sum_edges / num_graphs),
-        "max_n_nodes": int(max_nodes),
-        "max_n_edges": int(max_edges),
-    }
-    print("computed dataset statistics; add these values to the Python run config:")
-    print(pformat(stats, sort_dicts=True))
-    return stats
+    database = Database(str(output_path), overwrite=True)
+    if n_workers == 1 or len(file_paths) == 1:
+        for molecules in tqdm(map(read_molecules, file_paths), total=len(file_paths)):
+            database.add_molecules(molecules)
+    else:
+        with multiprocessing.Pool(min(n_workers, len(file_paths))) as pool:
+            for molecules in tqdm(pool.imap(read_molecules, file_paths), total=len(file_paths)):
+                database.add_molecules(molecules)
+    database.flush()

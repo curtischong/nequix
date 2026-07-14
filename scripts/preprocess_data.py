@@ -1,10 +1,9 @@
 import argparse
-import multiprocessing
-from pathlib import Path
 
 import ase.io
-from atompack import Database, from_ase
-from tqdm import tqdm
+from atompack import from_ase
+
+from nequix.data import write_atompack_database
 
 
 def read_molecules(file_path):
@@ -20,32 +19,7 @@ def read_molecules(file_path):
 
 
 def preprocess(file_path, output_path, n_workers=16):
-    file_path = Path(file_path)
-    output_path = Path(output_path)
-    if output_path.suffix != ".atp":
-        raise ValueError(f"AtomPack output path must end in .atp: {output_path}")
-    if n_workers < 1:
-        raise ValueError("n_workers must be at least 1")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if file_path.is_dir():
-        file_paths = sorted(file_path.rglob("*.extxyz"))
-    else:
-        file_paths = [file_path]
-    if not file_paths:
-        raise ValueError(f"No extxyz files found in {file_path}")
-
-    database = Database(str(output_path), overwrite=True)
-    if n_workers == 1 or len(file_paths) == 1:
-        molecule_groups = map(read_molecules, file_paths)
-        for molecules in tqdm(molecule_groups, total=len(file_paths)):
-            database.add_molecules(molecules)
-    else:
-        with multiprocessing.Pool(min(n_workers, len(file_paths))) as pool:
-            molecule_groups = pool.imap(read_molecules, file_paths)
-            for molecules in tqdm(molecule_groups, total=len(file_paths)):
-                database.add_molecules(molecules)
-    database.flush()
+    write_atompack_database(file_path, output_path, "*.extxyz", read_molecules, n_workers)
 
 
 def main():

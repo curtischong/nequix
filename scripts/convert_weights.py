@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from pathlib import Path
 
+from nequix.calculator import model_path_backend
 from nequix.model import load_model as load_model_jax
 from nequix.model import save_model as save_model_jax
 from nequix.torch_impl.model import load_model as load_model_torch
@@ -17,12 +18,8 @@ def main():
 
     input_path = Path(args.input_path)
     output_path = Path(args.output_path)
-    backends = {".nqx": "jax", ".pt": "torch"}
-    try:
-        input_backend = backends[input_path.suffix]
-        output_backend = backends[output_path.suffix]
-    except KeyError as error:
-        raise ValueError("model paths must use a .nqx or .pt extension") from error
+    input_backend = model_path_backend(input_path)
+    output_backend = model_path_backend(output_path)
 
     if input_backend == "jax" and output_backend == "torch":
         model, config = load_model_jax(input_path)

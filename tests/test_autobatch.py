@@ -125,19 +125,19 @@ def _stats():
 
 def test_cache_key_invalidates_for_hardware_model_and_dataset_changes(tmp_path):
     config = _config()
-    stats = _stats()
-    key = autobatch_cache_key(config, stats, 100, _hardware())
+    key = autobatch_cache_key(config, 100, _hardware())
 
-    assert key != autobatch_cache_key(config, stats, 101, _hardware())
-    assert key != autobatch_cache_key(config, stats, 100, _hardware(40 * 1024**3))
+    assert key != autobatch_cache_key(config, 101, _hardware())
+    assert key != autobatch_cache_key(config, 100, _hardware(40 * 1024**3))
+    assert key != autobatch_cache_key(replace(config, force_mode="direct"), 100, _hardware())
     assert key != autobatch_cache_key(
-        replace(config, force_mode="direct"), stats, 100, _hardware()
+        replace(config, autobatch_memory_scaling_factor=2.0), 100, _hardware()
     )
     assert key != autobatch_cache_key(
-        replace(config, autobatch_memory_scaling_factor=2.0), stats, 100, _hardware()
+        replace(config, autobatch_minimum_speedup=0.1), 100, _hardware()
     )
 
-    result = tune_batch_shape(stats, 100, 1, lambda candidate: ProbeResult(candidate, "ok"))
+    result = tune_batch_shape(_stats(), 100, 1, lambda candidate: ProbeResult(candidate, "ok"))
     cache_path = tmp_path / "autobatch.json"
     cache_tune_result(cache_path, key, result)
     loaded = cached_tune_result(cache_path, key)
@@ -191,9 +191,9 @@ def test_training_falls_back_to_one_example_without_detected_gpu(monkeypatch):
     monkeypatch.setattr("nequix.autobatch.query_gpu_hardware", lambda: {"gpus": []})
 
     with pytest.warns(RuntimeWarning, match="single-example capacity"):
-        result = tune_training_batch(config, _stats(), list(range(10)), [0.0])
+        result = tune_training_batch(config, list(range(10)))
 
-    assert result.shape == batch_shape(1, _stats())
+    assert result.shape == batch_shape(1, config.dataset_stats())
     assert not result.probes
 
 

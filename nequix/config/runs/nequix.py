@@ -75,7 +75,8 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     n_epochs=2,
 )
 
-_OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
+# Repeat MPtrj so every epoch mixes it 8:1 with sAlex (the eSEN OAM recipe).
+OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
 _OAM = replace(
     _OMAT,
@@ -84,7 +85,7 @@ _OAM = replace(
     resume_from="checkpoints/nequix-oam-1-jax.pkl",
     finetune_from="checkpoints/nequix-omat-1.nqx",
     checkpoint_path="checkpoints/nequix-oam-1.nqx",
-    train_path=_OAM_TRAIN_PATHS,
+    train_path=OAM_TRAIN_PATHS,
     valid_path="data/salex/val.atp",
     dataset_name="oam",
     atom_energies=OAM_ATOM_ENERGIES,

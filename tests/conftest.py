@@ -1,8 +1,7 @@
-import jax
 import pytest
 
 from nequix.config import ModelMetadata, NequixConfig
-from nequix.model import Nequix, save_model
+from nequix.model import model_from_metadata, save_model
 
 
 @pytest.fixture(scope="session")
@@ -31,26 +30,7 @@ def model_metadata():
 
 @pytest.fixture(scope="session")
 def jax_model_path(tmp_path_factory, model_metadata):
-    config = model_metadata.model_config
-    model = Nequix(
-        jax.random.key(0),
-        n_species=len(model_metadata.atomic_numbers),
-        cutoff=config.cutoff,
-        hidden_irreps=config.hidden_irreps,
-        lmax=config.lmax,
-        n_layers=config.n_layers,
-        radial_basis_size=config.radial_basis_size,
-        radial_mlp_size=config.radial_mlp_size,
-        radial_mlp_layers=config.radial_mlp_layers,
-        radial_polynomial_p=config.radial_polynomial_p,
-        mlp_init_scale=config.mlp_init_scale,
-        index_weights=config.index_weights,
-        layer_norm=config.layer_norm,
-        shift=model_metadata.shift,
-        scale=model_metadata.scale,
-        avg_n_neighbors=model_metadata.avg_n_neighbors,
-        atom_energies=model_metadata.atom_energies,
-    )
+    model = model_from_metadata(model_metadata)
     path = tmp_path_factory.mktemp("models") / "fresh.nqx"
     save_model(path, model, model_metadata)
     return path

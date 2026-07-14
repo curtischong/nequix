@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from nequix.config.models import PFTTrainerConfig
+from nequix.config.runs.nequix import OAM_TRAIN_PATHS
 
 
 _MP_PFT = PFTTrainerConfig(
@@ -35,15 +36,13 @@ _MP_PFT_NO_COTRAIN = replace(
     energy_weight=20.0,
 )
 
-_OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
-
 _OAM_PFT = replace(
     _MP_PFT,
     name="nequix-oam-1-pft",
     state_path="checkpoints/nequix-oam-1-pft.pkl",
     resume_from="checkpoints/nequix-oam-1-pft.pkl",
     finetune_from="checkpoints/nequix-oam-1.nqx",
-    extra_train_path=_OAM_TRAIN_PATHS,
+    extra_train_path=OAM_TRAIN_PATHS,
     extra_val_frac=None,
     extra_val_path="data/salex/val.atp",
     extra_avg_n_edges=736.2363228968411,

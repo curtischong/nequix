@@ -16,6 +16,14 @@ from nequix.model import load_model as load_model_jax
 from nequix.pft.hessian import hessian_linearized
 
 
+def model_path_backend(model_path: Path) -> str:
+    """Map a checkpoint path to the backend its suffix denotes."""
+    try:
+        return {".nqx": "jax", ".pt": "torch"}[model_path.suffix]
+    except KeyError as error:
+        raise ValueError("model checkpoints must use a .nqx or .pt extension") from error
+
+
 def load_model_for_backend(
     model_path: str | Path, backend: str = "jax", use_kernel: bool = True
 ):
@@ -26,10 +34,7 @@ def load_model_for_backend(
     model_path = Path(model_path)
     if not model_path.is_file():
         raise FileNotFoundError(f"model checkpoint does not exist: {model_path}")
-    try:
-        path_backend = {".nqx": "jax", ".pt": "torch"}[model_path.suffix]
-    except KeyError as error:
-        raise ValueError("model checkpoints must use a .nqx or .pt extension") from error
+    path_backend = model_path_backend(model_path)
 
     if path_backend == backend:
         if backend == "jax":

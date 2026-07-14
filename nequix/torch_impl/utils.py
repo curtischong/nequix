@@ -1,10 +1,9 @@
 import numpy as np
 import torch
-import jax
 import jax.numpy as jnp
 import equinox as eqx
-from nequix.torch_impl.model import NequixTorch
-from nequix.model import Nequix
+from nequix.torch_impl.model import model_from_metadata as torch_model_from_metadata
+from nequix.model import model_from_metadata as jax_model_from_metadata
 
 
 def convert_layer_torch_to_jax(layer_idx, torch_model, jax_model):
@@ -76,27 +75,7 @@ def convert_layer_torch_to_jax(layer_idx, torch_model, jax_model):
 
 
 def convert_model_torch_to_jax(torch_model, metadata, use_kernel):
-    config = metadata.model_config
-    jax_model = Nequix(
-        key=jax.random.key(0),
-        n_species=len(metadata.atomic_numbers),
-        hidden_irreps=config.hidden_irreps,
-        lmax=config.lmax,
-        cutoff=config.cutoff,
-        n_layers=config.n_layers,
-        radial_basis_size=config.radial_basis_size,
-        radial_mlp_size=config.radial_mlp_size,
-        radial_mlp_layers=config.radial_mlp_layers,
-        radial_polynomial_p=config.radial_polynomial_p,
-        mlp_init_scale=config.mlp_init_scale,
-        index_weights=config.index_weights,
-        layer_norm=config.layer_norm,
-        shift=metadata.shift,
-        scale=metadata.scale,
-        avg_n_neighbors=metadata.avg_n_neighbors,
-        atom_energies=metadata.atom_energies,
-        kernel=use_kernel,
-    )
+    jax_model = jax_model_from_metadata(metadata, use_kernel)
     for layer_idx in range(len(torch_model.layers)):
         jax_model = convert_layer_torch_to_jax(layer_idx, torch_model, jax_model)
 
@@ -152,26 +131,7 @@ def convert_layer_jax_to_torch(layer_idx, jax_model, torch_model):
 
 
 def convert_model_jax_to_torch(jax_model, metadata, use_kernel):
-    config = metadata.model_config
-    torch_model = NequixTorch(
-        n_species=len(metadata.atomic_numbers),
-        hidden_irreps=config.hidden_irreps,
-        lmax=config.lmax,
-        cutoff=config.cutoff,
-        n_layers=config.n_layers,
-        radial_basis_size=config.radial_basis_size,
-        radial_mlp_size=config.radial_mlp_size,
-        radial_mlp_layers=config.radial_mlp_layers,
-        radial_polynomial_p=config.radial_polynomial_p,
-        mlp_init_scale=config.mlp_init_scale,
-        index_weights=config.index_weights,
-        layer_norm=config.layer_norm,
-        shift=metadata.shift,
-        scale=metadata.scale,
-        avg_n_neighbors=metadata.avg_n_neighbors,
-        atom_energies=metadata.atom_energies,
-        kernel=use_kernel,
-    )
+    torch_model = torch_model_from_metadata(metadata, use_kernel)
     for layer_idx in range(len(jax_model.layers)):
         torch_model = convert_layer_jax_to_torch(layer_idx, jax_model, torch_model)
 

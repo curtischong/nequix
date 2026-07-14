@@ -1,9 +1,9 @@
 import functools
 import math
 import os
+import shutil
 import time
 from collections import defaultdict
-from dataclasses import replace
 from pathlib import Path
 
 import cloudpickle
@@ -15,27 +15,48 @@ import optax
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
-from nequix.autobatch import probe_summary, tune_training_batch
+from nequix.autobatch import peak_device_memory_bytes, probe_summary, tune_training_batch
 from nequix.config import ModelMetadata, TrainerConfig, config_values
 from nequix.data import (
+    AtomPackDataset,
     ConcatDataset,
     DataLoader,
     ParallelLoader,
-    dataset_from_path,
     prefetch,
 )
 from nequix.model import (
     DirectForceNequix,
-    Nequix,
     conservative_backbone,
     load_model,
+    model_from_metadata,
     replace_normalization,
     save_model,
     weight_decay_mask,
 )
-from nequix.train_utils import wandb_run_name
 
 TRAINING_STATE_FORMAT = "nequix-training-state-v1"
+
+
+def _format_percentage(fraction: float) -> str:
+    percentage = 100.0 * fraction
+    if percentage.is_integer():
+        return str(int(percentage))
+    return f"{percentage:g}".replace(".", "p")
+
+
+def wandb_run_name(config: TrainerConfig) -> str:
+    """Build the data-schedule-prefixed run name used by the training configs."""
+    if config.wandb_run_name:
+        return config.wandb_run_name
+
+    run_name = config.run_name or config.name
+    dataset_name = config.dataset_name
+    if not dataset_name:
+        return run_name
+
+    train_fraction = float(config.train_frac)
+    fraction_suffix = "" if train_fraction == 1.0 else _format_percentage(train_fraction)
+    return f"{dataset_name}{fraction_suffix}_{config.n_epochs}ep_{run_name}"
 
 
 def _loss_statistics(model, batch, loss_type="huber"):
@@ -196,7 +217,7 @@ def evaluate(
 
 
 def save_training_state(
-    path,
+    paths,
     model,
     ema_model,
     optim,
@@ -208,8 +229,7 @@ def save_training_state(
     training_runtime_seconds=0.0,
     validation_runtime_seconds=0.0,
 ):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Serialize the training state once and write it to every path."""
     state = {
         "format": TRAINING_STATE_FORMAT,
         "model": model,
@@ -223,8 +243,11 @@ def save_training_state(
         "training_runtime_seconds": training_runtime_seconds,
         "validation_runtime_seconds": validation_runtime_seconds,
     }
-    with path.open("wb") as f:
-        cloudpickle.dump(state, f)
+    data = cloudpickle.dumps(state)
+    for path in paths:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
 
 
 def load_training_state(path):
@@ -261,36 +284,31 @@ def load_training_state(path):
     )
 
 
-def build_model(config, stats, atom_energies):
-    """Construct the training architecture shared by real runs and probes."""
-    model_config = config.model_config
-    key = jax.random.key(0)
-    model = Nequix(
-        key,
-        n_species=len(config.atomic_numbers),
-        hidden_irreps=model_config.hidden_irreps,
-        lmax=model_config.lmax,
-        cutoff=model_config.cutoff,
-        n_layers=model_config.n_layers,
-        radial_basis_size=model_config.radial_basis_size,
-        radial_mlp_size=model_config.radial_mlp_size,
-        radial_mlp_layers=model_config.radial_mlp_layers,
-        radial_polynomial_p=model_config.radial_polynomial_p,
-        mlp_init_scale=model_config.mlp_init_scale,
-        index_weights=model_config.index_weights,
-        layer_norm=model_config.layer_norm,
-        shift=stats["shift"],
-        scale=stats["scale"],
-        avg_n_neighbors=stats["avg_n_neighbors"],
-        atom_energies=atom_energies,
-        kernel=config.kernel,
+def model_metadata(config: TrainerConfig) -> ModelMetadata:
+    """Build the checkpoint metadata a training config describes."""
+    return ModelMetadata(
+        atomic_numbers=config.atomic_numbers,
+        atom_energies=config.atom_energy_list(),
+        shift=config.shift,
+        scale=config.scale,
+        avg_n_neighbors=config.avg_n_neighbors,
+        model_config=config.model_config,
     )
+
+
+def attach_direct_force_head(model, config: TrainerConfig) -> DirectForceNequix:
+    return DirectForceNequix(
+        model,
+        config.model_config.hidden_irreps,
+        key=jax.random.fold_in(jax.random.key(0), 1),
+    )
+
+
+def build_model(config: TrainerConfig):
+    """Construct the training architecture shared by real runs and probes."""
+    model = model_from_metadata(model_metadata(config), kernel=config.kernel)
     if config.force_mode == "direct":
-        model = DirectForceNequix(
-            model,
-            model_config.hidden_irreps,
-            key=jax.random.fold_in(key, 1),
-        )
+        model = attach_direct_force_head(model, config)
     return model
 
 
@@ -360,18 +378,15 @@ def make_train_step(optim, config):
     return train_step
 
 
-def _peak_device_memory_bytes():
-    peaks = []
-    for device in jax.devices():
-        try:
-            statistics = device.memory_stats() or {}
-        except (AttributeError, RuntimeError):
-            continue
-        for key in ("peak_bytes_in_use", "peak_bytes_in_use_limit", "bytes_in_use"):
-            if key in statistics:
-                peaks.append(int(statistics[key]))
-                break
-    return max(peaks, default=0)
+def _batch_counts(batch):
+    """Return the real (graph, node, edge) counts in one stacked multi-device batch."""
+    graph_masks = jax.vmap(jraph.get_graph_padding_mask)(batch)
+    node_masks = jax.vmap(jraph.get_node_padding_mask)(batch)
+    return (
+        int(graph_masks.sum().item()),
+        int(node_masks.sum().item()),
+        int((batch.n_edge * graph_masks).sum().item()),
+    )
 
 
 def train(run_config: TrainerConfig):
@@ -384,7 +399,7 @@ def train(run_config: TrainerConfig):
         raise ValueError("val_every_steps must be greater than zero")
 
     def make_dataset(path):
-        return dataset_from_path(
+        return AtomPackDataset(
             file_path=path,
             atomic_numbers=config.atomic_numbers,
             cutoff=config.model_config.cutoff,
@@ -405,26 +420,9 @@ def train(run_config: TrainerConfig):
         val_dataset = make_dataset(config.valid_path)
 
     train_dataset = train_dataset.subset(float(config.train_frac), seed=config.seed)
-    atom_energies = [config.atom_energies[number] for number in config.atomic_numbers]
-    stats = {
-        "shift": config.shift,
-        "scale": config.scale,
-        "avg_n_neighbors": config.avg_n_neighbors,
-        "max_n_edges": config.max_n_edges,
-        "max_n_nodes": config.max_n_nodes,
-        "avg_n_nodes": config.avg_n_nodes,
-        "avg_n_edges": config.avg_n_edges,
-    }
-    metadata = ModelMetadata(
-        atomic_numbers=config.atomic_numbers,
-        atom_energies=tuple(atom_energies),
-        shift=config.shift,
-        scale=config.scale,
-        avg_n_neighbors=config.avg_n_neighbors,
-        model_config=config.model_config,
-    )
+    metadata = model_metadata(config)
 
-    tune_result = tune_training_batch(config, stats, train_dataset, atom_energies)
+    tune_result = tune_training_batch(config, train_dataset)
     selected_shape = tune_result.shape
     print(probe_summary(tune_result))
 
@@ -434,40 +432,33 @@ def train(run_config: TrainerConfig):
         batch_size=selected_shape.batch_size,
         n_graph=selected_shape.n_graph,
         shuffle=True,
-        max_n_nodes=stats["max_n_nodes"],
-        max_n_edges=stats["max_n_edges"],
-        avg_n_nodes=stats["avg_n_nodes"],
-        avg_n_edges=stats["avg_n_edges"],
+        max_n_nodes=config.max_n_nodes,
+        max_n_edges=config.max_n_edges,
+        avg_n_nodes=config.avg_n_nodes,
+        avg_n_edges=config.avg_n_edges,
         seed=config.seed,
         num_workers=16,
         packing="best_fit",
     )
-    if (
-        per_device_train_loader.n_node != selected_shape.n_node
-        or per_device_train_loader.n_edge != selected_shape.n_edge
-    ):
-        raise RuntimeError("selected autobatch shape does not match the training loader shape")
     train_loader = ParallelLoader(per_device_train_loader, num_devices)
     val_loader = DataLoader(
         val_dataset,
         batch_size=selected_shape.batch_size,
         n_graph=selected_shape.n_graph,
         shuffle=False,
-        max_n_nodes=stats["max_n_nodes"],
-        max_n_edges=stats["max_n_edges"],
-        avg_n_nodes=stats["avg_n_nodes"],
-        avg_n_edges=stats["avg_n_edges"],
+        max_n_nodes=config.max_n_nodes,
+        max_n_edges=config.max_n_edges,
+        avg_n_nodes=config.avg_n_nodes,
+        avg_n_edges=config.avg_n_edges,
         num_workers=16,
         packing="best_fit",
     )
-    if val_loader.n_node != selected_shape.n_node or val_loader.n_edge != selected_shape.n_edge:
-        raise RuntimeError("selected autobatch shape does not match the validation loader shape")
 
     wandb_sync = (
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
     )
 
-    model = build_model(replace(config, force_mode="conservative"), stats, atom_energies)
+    model = model_from_metadata(metadata, kernel=config.kernel)
     resume_exists = Path(config.resume_from).exists()
     if config.finetune_from is not None and Path(config.finetune_from).exists():
         model, checkpoint_metadata = load_model(config.finetune_from, config.kernel)
@@ -477,20 +468,15 @@ def train(run_config: TrainerConfig):
             raise ValueError("fine-tuning checkpoint and run config use different architectures")
         model = replace_normalization(
             model,
-            atom_energies=atom_energies,
-            shift=stats["shift"],
-            scale=stats["scale"],
+            atom_energies=metadata.atom_energies,
+            shift=config.shift,
+            scale=config.scale,
         )
     elif config.finetune_from is not None and not resume_exists:
         raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config.finetune_from}")
 
     if config.force_mode == "direct":
-        key = jax.random.key(0)
-        model = DirectForceNequix(
-            model,
-            config.model_config.hidden_irreps,
-            key=jax.random.fold_in(key, 1),
-        )
+        model = attach_direct_force_head(model, config)
 
     param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
 
@@ -538,7 +524,7 @@ def train(run_config: TrainerConfig):
         "autobatch_cached": tune_result.cached,
     }
     wandb_init_kwargs = {
-        "entity": "curtischong",
+        "entity": config.wandb_entity,
         "project": config.wandb_project or "nequix",
         "name": run_name,
         "config": wandb_config,
@@ -600,8 +586,8 @@ def train(run_config: TrainerConfig):
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             checkpoint_model = conservative_backbone(ema_model_single)
-            save_model(Path(wandb.run.dir) / "checkpoint.nqx", checkpoint_model, metadata)
             save_model(config.checkpoint_path, checkpoint_model, metadata)
+            shutil.copyfile(config.checkpoint_path, Path(wandb.run.dir) / "checkpoint.nqx")
 
         validation_runtime_seconds += time.perf_counter() - validation_start
 
@@ -627,19 +613,20 @@ def train(run_config: TrainerConfig):
         step_in_epoch = 0
         for step_in_epoch, batch in enumerate(prefetch(train_loader), start=1):
             batch_time = time.perf_counter() - start_time
+            # Only log steps synchronize with the device; other steps dispatch
+            # asynchronously so the host can keep feeding the accelerators.
+            log_this_step = int(step + 1) % config.log_every == 0
+            if log_this_step:
+                jax.block_until_ready(model)
             start_time = time.perf_counter()
             (model, ema_model, opt_state, total_loss, metrics) = train_step(
                 model, ema_model, step, opt_state, batch
             )
-            jax.block_until_ready(total_loss)
-            train_time = time.perf_counter() - start_time
             step = step + 1
-            if step % config.log_every == 0:
-                graph_masks = jax.vmap(jraph.get_graph_padding_mask)(batch)
-                node_masks = jax.vmap(jraph.get_node_padding_mask)(batch)
-                graph_count = graph_masks.sum().item()
-                node_count = node_masks.sum().item()
-                edge_count = (batch.n_edge * graph_masks).sum().item()
+            if log_this_step:
+                jax.block_until_ready(total_loss)
+                train_time = time.perf_counter() - start_time
+                graph_count, node_count, edge_count = _batch_counts(batch)
                 logs = {}
                 logs["train/loss"] = total_loss.mean().item()
                 logs["learning_rate"] = schedule(step).item()
@@ -660,7 +647,7 @@ def train(run_config: TrainerConfig):
                 logs["train/edge_padding_utilization"] = edge_count / max(
                     num_devices * selected_shape.n_edge, 1
                 )
-                logs["train/peak_gpu_memory_bytes"] = _peak_device_memory_bytes()
+                logs["train/peak_gpu_memory_bytes"] = peak_device_memory_bytes()
                 current_training_seconds = (
                     training_runtime_seconds + time.perf_counter() - train_segment_start
                 )
@@ -681,21 +668,7 @@ def train(run_config: TrainerConfig):
             run_validation(epoch, step_in_epoch, training_runtime_seconds)
 
         save_training_state(
-            Path(wandb.run.dir) / "state.pkl",
-            model,
-            ema_model,
-            optim,
-            opt_state,
-            step,
-            epoch + 1,
-            best_val_loss,
-            wandb_run_id=wandb_run_id,
-            training_runtime_seconds=training_runtime_seconds,
-            validation_runtime_seconds=validation_runtime_seconds,
-        )
-
-        save_training_state(
-            config.state_path,
+            (Path(wandb.run.dir) / "state.pkl", config.state_path),
             model,
             ema_model,
             optim,
@@ -714,11 +687,7 @@ def train(run_config: TrainerConfig):
     wandb.finish()
 
 
-def main():
-    from nequix.cli import main as cli_main
-
-    cli_main()
-
-
 if __name__ == "__main__":
+    from nequix.cli import main
+
     main()

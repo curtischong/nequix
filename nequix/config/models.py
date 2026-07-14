@@ -395,6 +395,7 @@ class TrainerConfig:
     grad_clip_norm: float = 100.0
     weight_decay: float = 1.0e-3
     autobatch_memory_scaling_factor: float = 1.6
+    autobatch_minimum_speedup: float = 0.02
     n_epochs: int = 100
     energy_weight: float = 20.0
     force_weight: float = 20.0
@@ -406,9 +407,26 @@ class TrainerConfig:
     ema_decay: float = 0.999
     finetune_from: str | None = None
     run_name: str | None = None
+    wandb_entity: str = "curtischong"
     wandb_run_name: str | None = None
     wandb_project: str | None = None
     wandb_mode: str | None = None
+
+    def dataset_stats(self) -> dict[str, float]:
+        """Precomputed dataset statistics consumed by model construction and batching."""
+        return {
+            "shift": self.shift,
+            "scale": self.scale,
+            "avg_n_neighbors": self.avg_n_neighbors,
+            "avg_n_nodes": self.avg_n_nodes,
+            "avg_n_edges": self.avg_n_edges,
+            "max_n_nodes": self.max_n_nodes,
+            "max_n_edges": self.max_n_edges,
+        }
+
+    def atom_energy_list(self) -> tuple[float, ...]:
+        """Isolated-atom energies ordered to match ``atomic_numbers``."""
+        return tuple(self.atom_energies[number] for number in self.atomic_numbers)
 
 
 @dataclass
@@ -451,6 +469,8 @@ class PFTTrainerConfig:
     log_every: int = 100
     ema_decay: float = 0.999
     kernel: bool = True
+    wandb_entity: str = "curtischong"
+    wandb_project: str = "nequix-phonon"
 
 
 RunConfig = TrainerConfig | PFTTrainerConfig

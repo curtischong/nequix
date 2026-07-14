@@ -419,18 +419,10 @@ class Nequix(eqx.Module):
             normalization="component",
         )
 
-        penultimate_features = None
-        for i, layer in enumerate(self.layers):
-            if i == len(self.layers) - 1:
-                penultimate_features = features
-            features = layer(
-                features,
-                species,
-                sh,
-                radial_basis,
-                senders,
-                receivers,
-            )
+        for layer in self.layers[:-1]:
+            features = layer(features, species, sh, radial_basis, senders, receivers)
+        penultimate_features = features
+        features = self.layers[-1](features, species, sh, radial_basis, senders, receivers)
 
         node_energies = self.readout(features)
 
@@ -442,7 +434,6 @@ class Nequix(eqx.Module):
         # add isolated atom energies to each node as prior
         node_energies = node_energies + jax.lax.stop_gradient(self.atom_energies[species, None])
 
-        assert penultimate_features is not None
         return node_energies.array, penultimate_features
 
     def __call__(self, data: jraph.GraphsTuple):
@@ -649,6 +640,33 @@ def save_model(path: str | Path, model: Nequix, metadata: ModelMetadata) -> None
         eqx.tree_serialise_leaves(f, model)
 
 
+def model_from_metadata(
+    metadata: ModelMetadata, kernel: bool = False, *, key: jax.Array | None = None
+) -> Nequix:
+    """Construct an unfitted Nequix with the architecture a metadata header describes."""
+    config = metadata.model_config
+    return Nequix(
+        key=key if key is not None else jax.random.key(0),
+        n_species=len(metadata.atomic_numbers),
+        hidden_irreps=config.hidden_irreps,
+        lmax=config.lmax,
+        cutoff=config.cutoff,
+        n_layers=config.n_layers,
+        radial_basis_size=config.radial_basis_size,
+        radial_mlp_size=config.radial_mlp_size,
+        radial_mlp_layers=config.radial_mlp_layers,
+        radial_polynomial_p=config.radial_polynomial_p,
+        mlp_init_scale=config.mlp_init_scale,
+        index_weights=config.index_weights,
+        layer_norm=config.layer_norm,
+        shift=metadata.shift,
+        scale=metadata.scale,
+        avg_n_neighbors=metadata.avg_n_neighbors,
+        atom_energies=metadata.atom_energies,
+        kernel=kernel,
+    )
+
+
 def load_model(path: str | Path, kernel: bool = False) -> tuple[Nequix, ModelMetadata]:
     """Load weights written with the current Nequix model format."""
     with open(path, "rb") as f:
@@ -656,26 +674,5 @@ def load_model(path: str | Path, kernel: bool = False) -> tuple[Nequix, ModelMet
             metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid Nequix model header") from error
-        config = metadata.model_config
-        model = Nequix(
-            key=jax.random.key(0),
-            n_species=len(metadata.atomic_numbers),
-            hidden_irreps=config.hidden_irreps,
-            lmax=config.lmax,
-            cutoff=config.cutoff,
-            n_layers=config.n_layers,
-            radial_basis_size=config.radial_basis_size,
-            radial_mlp_size=config.radial_mlp_size,
-            radial_mlp_layers=config.radial_mlp_layers,
-            radial_polynomial_p=config.radial_polynomial_p,
-            mlp_init_scale=config.mlp_init_scale,
-            index_weights=config.index_weights,
-            layer_norm=config.layer_norm,
-            shift=metadata.shift,
-            scale=metadata.scale,
-            avg_n_neighbors=metadata.avg_n_neighbors,
-            atom_energies=metadata.atom_energies,
-            kernel=kernel,
-        )
-        model = eqx.tree_deserialise_leaves(f, model)
+        model = eqx.tree_deserialise_leaves(f, model_from_metadata(metadata, kernel))
         return model, metadata

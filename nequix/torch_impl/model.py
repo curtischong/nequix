@@ -667,6 +667,30 @@ def save_model(path: str | Path, model: torch.nn.Module, metadata: ModelMetadata
         torch.save(state_dict, f)
 
 
+def model_from_metadata(metadata: ModelMetadata, kernel: bool = False) -> NequixTorch:
+    """Construct an unfitted NequixTorch with the architecture a metadata header describes."""
+    config = metadata.model_config
+    return NequixTorch(
+        n_species=len(metadata.atomic_numbers),
+        hidden_irreps=config.hidden_irreps,
+        lmax=config.lmax,
+        cutoff=config.cutoff,
+        n_layers=config.n_layers,
+        radial_basis_size=config.radial_basis_size,
+        radial_mlp_size=config.radial_mlp_size,
+        radial_mlp_layers=config.radial_mlp_layers,
+        radial_polynomial_p=config.radial_polynomial_p,
+        mlp_init_scale=config.mlp_init_scale,
+        index_weights=config.index_weights,
+        layer_norm=config.layer_norm,
+        shift=metadata.shift,
+        scale=metadata.scale,
+        avg_n_neighbors=metadata.avg_n_neighbors,
+        atom_energies=metadata.atom_energies,
+        kernel=kernel,
+    )
+
+
 def load_model(
     path: str | Path, use_kernel: bool = False
 ) -> tuple[NequixTorch, ModelMetadata]:
@@ -678,26 +702,7 @@ def load_model(
             metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid Nequix model header") from error
-        config = metadata.model_config
-        model = NequixTorch(
-            n_species=len(metadata.atomic_numbers),
-            hidden_irreps=config.hidden_irreps,
-            lmax=config.lmax,
-            cutoff=config.cutoff,
-            n_layers=config.n_layers,
-            radial_basis_size=config.radial_basis_size,
-            radial_mlp_size=config.radial_mlp_size,
-            radial_mlp_layers=config.radial_mlp_layers,
-            radial_polynomial_p=config.radial_polynomial_p,
-            mlp_init_scale=config.mlp_init_scale,
-            index_weights=config.index_weights,
-            layer_norm=config.layer_norm,
-            shift=metadata.shift,
-            scale=metadata.scale,
-            avg_n_neighbors=metadata.avg_n_neighbors,
-            atom_energies=metadata.atom_energies,
-            kernel=use_kernel,
-        )
+        model = model_from_metadata(metadata, use_kernel)
         state_dict = torch.load(f, map_location="cpu", weights_only=True)
         if not isinstance(state_dict, dict):
             raise ValueError("invalid Nequix Torch state dictionary")

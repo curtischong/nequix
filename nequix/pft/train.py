@@ -363,8 +363,8 @@ def train(run_config: PFTTrainerConfig):
         ) = load_training_state(config.resume_from)
 
     wandb_init_kwargs = {
-        "entity": "curtischong",
-        "project": "nequix-phonon",
+        "entity": config.wandb_entity,
+        "project": config.wandb_project,
         "config": config_values(config),
     }
     if wandb_run_id:
@@ -425,22 +425,8 @@ def train(run_config: PFTTrainerConfig):
                 best_val_loss = val_metrics["loss"]
                 save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model, metadata)
 
-            # always save training state to wandb dir
             save_training_state(
-                Path(wandb.run.dir) / "state.pkl",
-                model,
-                ema_model,
-                optim,
-                opt_state,
-                step,
-                epoch + 1,
-                best_val_loss,
-                wandb_run_id=wandb_run_id,
-                training_runtime_seconds=training_runtime_seconds,
-                validation_runtime_seconds=validation_runtime_seconds,
-            )
-            save_training_state(
-                config.state_path,
+                (Path(wandb.run.dir) / "state.pkl", config.state_path),
                 model,
                 ema_model,
                 optim,

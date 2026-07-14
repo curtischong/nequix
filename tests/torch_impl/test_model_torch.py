@@ -10,6 +10,7 @@ from nequix.torch_impl.layer_norm import RMSLayerNorm
 from nequix.torch_impl.model import (
     NequixTorch,
     load_model,
+    model_from_metadata,
     save_model,
     scatter,
 )
@@ -152,25 +153,7 @@ def test_model_save_load():
             layer_norm=config["layer_norm"],
         ),
     )
-    model = NequixTorch(
-        n_species=len(config["atomic_numbers"]),
-        cutoff=config["cutoff"],
-        lmax=config["lmax"],
-        hidden_irreps=config["hidden_irreps"],
-        n_layers=config["n_layers"],
-        radial_basis_size=config["radial_basis_size"],
-        radial_mlp_size=config["radial_mlp_size"],
-        radial_mlp_layers=config["radial_mlp_layers"],
-        radial_polynomial_p=config["radial_polynomial_p"],
-        mlp_init_scale=config["mlp_init_scale"],
-        index_weights=config["index_weights"],
-        layer_norm=config["layer_norm"],
-        shift=config["shift"],
-        scale=config["scale"],
-        avg_n_neighbors=config["avg_n_neighbors"],
-        atom_energies=atom_energies,
-        kernel=config["kernel"],
-    )
+    model = model_from_metadata(metadata, kernel=config["kernel"])
 
     batch = dummy_graph()
     original_energy, original_forces, original_stress = model(

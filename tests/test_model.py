@@ -16,6 +16,7 @@ from nequix.model import (
     Nequix,
     conservative_backbone,
     load_model,
+    model_from_metadata,
     replace_normalization,
     save_model,
     weight_decay_mask,
@@ -170,25 +171,7 @@ def test_model_save_load():
             layer_norm=config["layer_norm"],
         ),
     )
-    model = Nequix(
-        key,
-        n_species=len(config["atomic_numbers"]),
-        cutoff=config["cutoff"],
-        lmax=config["lmax"],
-        hidden_irreps=config["hidden_irreps"],
-        n_layers=config["n_layers"],
-        radial_basis_size=config["radial_basis_size"],
-        radial_mlp_size=config["radial_mlp_size"],
-        radial_mlp_layers=config["radial_mlp_layers"],
-        radial_polynomial_p=config["radial_polynomial_p"],
-        mlp_init_scale=config["mlp_init_scale"],
-        index_weights=config["index_weights"],
-        layer_norm=config["layer_norm"],
-        shift=config["shift"],
-        scale=config["scale"],
-        avg_n_neighbors=config["avg_n_neighbors"],
-        atom_energies=atom_energies,
-    )
+    model = model_from_metadata(metadata, key=key)
 
     batch = dummy_graph()
     batch_padded = jraph.pad_with_graphs(batch, n_node=4, n_edge=3, n_graph=2)

@@ -8,9 +8,9 @@ from ase.io import write
 from atompack import Database, Molecule
 
 from nequix.config import RUNS
-from nequix.data import AtomPackDataset, Dataset, dataset_from_path
+from nequix.data import AtomPackDataset, Dataset
 from nequix.pft.data import PhononDataset
-from nequix.train_utils import wandb_run_name
+from nequix.train import wandb_run_name
 from scripts.preprocess_ase_db import preprocess as preprocess_ase_db
 from scripts.preprocess_data import preprocess
 
@@ -55,10 +55,9 @@ def test_atompack_dataset_builds_graph(tmp_path):
     )
     database.flush()
 
-    dataset = dataset_from_path(str(path), [1, 8], cutoff=1.5, backend="dict")
+    dataset = AtomPackDataset(str(path), [1, 8], cutoff=1.5, backend="dict")
     graph = dataset[0]
 
-    assert isinstance(dataset, AtomPackDataset)
     np.testing.assert_array_equal(graph["species"], [0, 1])
     np.testing.assert_allclose(graph["energy"], [-1.5])
     assert graph["forces"].shape == (2, 3)

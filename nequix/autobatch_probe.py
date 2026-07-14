@@ -13,11 +13,17 @@ import cloudpickle
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import jraph
 
-from nequix.autobatch import ProbeResult, _looks_like_oom
+from nequix.autobatch import (
+    BatchShape,
+    ProbeResult,
+    _looks_like_oom,
+    _shape_from_dict,
+    peak_device_memory_bytes,
+)
+from nequix.config import TrainerConfig
 from nequix.data import DataLoader, ParallelLoader
-from nequix.train import build_model, build_optimizer, make_train_step
+from nequix.train import _batch_counts, build_model, build_optimizer, make_train_step
 
 
 def _block_step(output):
@@ -25,33 +31,8 @@ def _block_step(output):
     return output
 
 
-def _batch_counts(batch):
-    graph_masks = jax.vmap(jraph.get_graph_padding_mask)(batch)
-    node_masks = jax.vmap(jraph.get_node_padding_mask)(batch)
-    return (
-        int(graph_masks.sum().item()),
-        int(node_masks.sum().item()),
-        int((batch.n_edge * graph_masks).sum().item()),
-    )
-
-
-def _peak_memory_bytes():
-    peaks = []
-    for device in jax.devices():
-        statistics = device.memory_stats() or {}
-        for key in ("peak_bytes_in_use", "peak_bytes_in_use_limit", "bytes_in_use"):
-            if key in statistics:
-                peaks.append(int(statistics[key]))
-                break
-    return max(peaks, default=0)
-
-
-def run_probe(payload) -> ProbeResult:
-    config = payload["config"]
-    stats = payload["stats"]
-    dataset = payload["train_dataset"]
-    atom_energies = payload["atom_energies"]
-    shape = payload["shape"]
+def run_probe(config: TrainerConfig, dataset, shape: BatchShape) -> ProbeResult:
+    stats = config.dataset_stats()
     devices = list(jax.devices())
     if not devices or devices[0].platform != "gpu":
         return ProbeResult(shape=shape, status="failed", error="probe did not find a JAX GPU")
@@ -66,10 +47,8 @@ def run_probe(payload) -> ProbeResult:
         avg_n_nodes=stats["avg_n_nodes"],
         avg_n_edges=stats["avg_n_edges"],
         num_workers=min(4, max(1, len(dataset))),
-        packing=payload["packing"],
+        packing="best_fit",
     )
-    if loader.n_node != shape.n_node or loader.n_edge != shape.n_edge:
-        return ProbeResult(shape=shape, status="failed", error="probe loader shape mismatch")
 
     parallel_loader = ParallelLoader(loader, len(devices))
     warmup_steps = 3
@@ -84,7 +63,7 @@ def run_probe(payload) -> ProbeResult:
             shape=shape, status="failed", error="training dataset produced no batches"
         )
 
-    model = build_model(config, stats, atom_energies)
+    model = build_model(config)
     steps_per_epoch = max(1, math.ceil(len(dataset) / (shape.batch_size * len(devices))))
     optim, _ = build_optimizer(config, model, steps_per_epoch)
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
@@ -137,7 +116,7 @@ def run_probe(payload) -> ProbeResult:
         graph_utilization=totals[0] / allocated[0],
         node_utilization=totals[1] / allocated[1],
         edge_utilization=totals[2] / max(allocated[2], 1),
-        peak_memory_bytes=_peak_memory_bytes(),
+        peak_memory_bytes=peak_device_memory_bytes(),
         final_loss=final_loss,
         timed_graphs_per_second=tuple(timed_rates),
     )
@@ -145,15 +124,16 @@ def run_probe(payload) -> ProbeResult:
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    payload_path, result_path = map(Path, argv)
+    payload_path, shape_path, result_path = map(Path, argv)
+    shape = _shape_from_dict(json.loads(shape_path.read_text()))
     with payload_path.open("rb") as payload_file:
         payload = cloudpickle.load(payload_file)
     try:
-        result = run_probe(payload)
+        result = run_probe(payload["config"], payload["train_dataset"], shape)
     except BaseException:
         error = traceback.format_exc()
         result = ProbeResult(
-            shape=payload["shape"],
+            shape=shape,
             status="oom" if _looks_like_oom(error) else "failed",
             error=error[-4000:],
         )
