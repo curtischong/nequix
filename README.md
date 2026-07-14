@@ -91,6 +91,12 @@ training subset is controlled with `train_frac` and sampled deterministically us
 `run_name="nequix_orig"` produce the W&B run name `1m25_4ep_nequix_orig`. Set
 `wandb_run_name` to override the generated name.
 
+At successful completion, training prints a two-line CSV summary (one header and one
+data row) as the final output. It includes final validation metrics, best validation
+loss, run and W&B identifiers, dataset/model/batch sizes, hardware, parameter count,
+training and validation time, compute cost in accelerator-hours, and the complete run
+configuration. PFT summaries also include the extra validation metrics.
+
 For JAX training with kernels:
 
 ```bash

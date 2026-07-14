@@ -33,6 +33,7 @@ from nequix.model import (
     save_model,
     weight_decay_mask,
 )
+from nequix.run_summary import build_run_summary, print_run_summary_csv
 
 TRAINING_STATE_FORMAT = "nequix-training-state-v1"
 
@@ -391,6 +392,7 @@ def _batch_counts(batch):
 
 def train(run_config: TrainerConfig):
     """Train a JAX Nequix model from a registered Python config."""
+    invocation_start = time.perf_counter()
     config = run_config
     if config.force_mode not in {"conservative", "direct"}:
         raise ValueError(f"force mode {config.force_mode!r} is not supported")
@@ -509,6 +511,7 @@ def train(run_config: TrainerConfig):
     wandb_run_id = None
     training_runtime_seconds = 0.0
     validation_runtime_seconds = 0.0
+    final_val_metrics = {}
 
     if resume_exists:
         (
@@ -546,6 +549,7 @@ def train(run_config: TrainerConfig):
     if wandb_run_id:
         wandb_init_kwargs.update({"id": wandb_run_id, "resume": "allow"})
     wandb_run = wandb.init(**wandb_init_kwargs)
+    wandb_run_url = getattr(wandb_run, "url", None)
     wandb_run.define_metric("runtime/training_seconds", summary="last")
     wandb_run.define_metric("runtime/training_hours", summary="last")
     wandb_run.define_metric("runtime/validation_seconds", summary="last")
@@ -582,7 +586,7 @@ def train(run_config: TrainerConfig):
         }
 
     def run_validation(epoch, step_in_epoch, training_seconds):
-        nonlocal best_val_loss, validation_runtime_seconds
+        nonlocal best_val_loss, final_val_metrics, validation_runtime_seconds
 
         validation_start = time.perf_counter()
         ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
@@ -603,7 +607,8 @@ def train(run_config: TrainerConfig):
 
         validation_runtime_seconds += time.perf_counter() - validation_start
 
-        logs = {f"val/{key}": value.item() for key, value in val_metrics.items()}
+        final_val_metrics = {key: value.item() for key, value in val_metrics.items()}
+        logs = {f"val/{key}": value for key, value in final_val_metrics.items()}
         logs["epoch"] = epoch
         logs["step_in_epoch"] = step_in_epoch
         logs.update(runtime_metrics(training_seconds))
@@ -669,12 +674,14 @@ def train(run_config: TrainerConfig):
                 wandb_sync()
 
             if val_every_steps is not None and step_in_epoch % val_every_steps == 0:
+                jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 run_validation(epoch, step_in_epoch, training_runtime_seconds)
                 last_validation_step_in_epoch = step_in_epoch
                 train_segment_start = time.perf_counter()
             start_time = time.perf_counter()
 
+        jax.block_until_ready(model)
         training_runtime_seconds += time.perf_counter() - train_segment_start
         if last_validation_step_in_epoch != step_in_epoch:
             run_validation(epoch, step_in_epoch, training_runtime_seconds)
@@ -693,10 +700,58 @@ def train(run_config: TrainerConfig):
             validation_runtime_seconds=validation_runtime_seconds,
         )
 
+    if not final_val_metrics:
+        run_validation(max(start_epoch - 1, 0), 0, training_runtime_seconds)
+
     final_runtime_metrics = runtime_metrics(training_runtime_seconds)
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary.update(final_runtime_metrics)
     wandb.finish()
+
+    selected_probe = next(
+        (probe for probe in tune_result.probes if probe.shape == selected_shape and probe.safe),
+        None,
+    )
+    devices = jax.devices()
+    summary = build_run_summary(
+        config,
+        run_name=run_name,
+        trainer="standard",
+        final_metrics=final_val_metrics,
+        best_val_loss=best_val_loss,
+        steps_completed=int(step.item()),
+        epochs_completed=config.n_epochs,
+        train_size=len(train_dataset),
+        val_size=len(val_dataset),
+        param_count=param_count,
+        accelerator_count=len(devices),
+        accelerator_type=";".join(sorted({device.device_kind for device in devices})),
+        backend=jax.default_backend(),
+        training_runtime_seconds=training_runtime_seconds,
+        validation_runtime_seconds=validation_runtime_seconds,
+        invocation_runtime_seconds=time.perf_counter() - invocation_start,
+        peak_accelerator_memory_bytes=peak_device_memory_bytes(),
+        run_id=wandb_run_id,
+        run_url=wandb_run_url,
+        extra_values={
+            "steps_per_epoch": steps_per_epoch,
+            "autobatch_batch_size_per_accelerator": selected_shape.batch_size,
+            "autobatch_n_graph_per_accelerator": selected_shape.n_graph,
+            "autobatch_n_node_per_accelerator": selected_shape.n_node,
+            "autobatch_n_edge_per_accelerator": selected_shape.n_edge,
+            "autobatch_cached": tune_result.cached,
+            "autobatch_graphs_per_second": (
+                selected_probe.graphs_per_second if selected_probe is not None else None
+            ),
+            "autobatch_nodes_per_second": (
+                selected_probe.nodes_per_second if selected_probe is not None else None
+            ),
+            "autobatch_edges_per_second": (
+                selected_probe.edges_per_second if selected_probe is not None else None
+            ),
+        },
+    )
+    print_run_summary_csv(summary)
 
 
 if __name__ == "__main__":
