@@ -75,8 +75,8 @@ torch-sim = [
 ]
 oeq = [
   # You need to install openequivariance_extjax separately
-  # uv pip install openequivariance_extjax --no-build-isolation
-  "openequivariance[jax]>=0.6.4",
+  # uv pip install openequivariance_extjax==0.6.4 --no-build-isolation
+  "openequivariance[jax]==0.6.4",
 ]
 pft = [
     "phonopy>=2.43.1",

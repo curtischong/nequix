@@ -32,16 +32,19 @@ def test_config_values_preserves_typed_config_structure():
     assert config["atomic_numbers"][:3] == [1, 2, 3]
     assert config["finetune_from"] == "checkpoints/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
-    assert config["autobatch_memory_scaling_factor"] == 1.6
-    assert "autobatch" not in config
+    assert config["batch_size"] == 128
     assert config["val_every_steps"] is None
 
 
 def test_omat_foundation_curriculum_configs():
+    mp = RUNS["nequix-mp-1"]
     omat = RUNS["nequix-omat-1"]
+    oam = RUNS["nequix-oam-1"]
     direct = RUNS["nequix-omat-foundation-direct"]
     conservative = RUNS["nequix-omat-foundation-conservative"]
 
+    assert mp.batch_size == 64
+    assert omat.batch_size == oam.batch_size == 128
     assert omat.val_every_steps == 10_000
     assert direct.val_every_steps == conservative.val_every_steps == 10_000
     assert direct.train_frac == conservative.train_frac == 1.0

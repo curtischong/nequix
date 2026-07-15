@@ -15,7 +15,6 @@ import optax
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
-from nequix.autobatch import peak_device_memory_bytes, probe_summary, tune_training_batch
 from nequix.config import ModelMetadata, TrainerConfig, config_values
 from nequix.data import (
     AtomPackDataset,
@@ -24,6 +23,7 @@ from nequix.data import (
     ParallelLoader,
     prefetch,
 )
+from nequix.hardware import peak_device_memory_bytes
 from nequix.model import (
     DirectForceNequix,
     conservative_backbone,
@@ -390,15 +390,8 @@ def _batch_counts(batch):
     )
 
 
-def train(run_config: TrainerConfig):
-    """Train a JAX Nequix model from a registered Python config."""
-    invocation_start = time.perf_counter()
-    config = run_config
-    if config.force_mode not in {"conservative", "direct"}:
-        raise ValueError(f"force mode {config.force_mode!r} is not supported")
-    val_every_steps = config.val_every_steps
-    if val_every_steps is not None and val_every_steps <= 0:
-        raise ValueError("val_every_steps must be greater than zero")
+def load_datasets(config: TrainerConfig):
+    """Construct the train and validation datasets shared by training and precomputation."""
 
     def make_dataset(path):
         return AtomPackDataset(
@@ -422,17 +415,28 @@ def train(run_config: TrainerConfig):
         val_dataset = make_dataset(config.valid_path)
 
     train_dataset = train_dataset.subset(float(config.train_frac), seed=config.seed)
-    metadata = model_metadata(config)
+    return train_dataset, val_dataset
 
-    tune_result = tune_training_batch(config, train_dataset)
-    selected_shape = tune_result.shape
-    print(probe_summary(tune_result))
+
+def train(run_config: TrainerConfig):
+    """Train a JAX Nequix model from a registered Python config."""
+    invocation_start = time.perf_counter()
+    config = run_config
+    if config.force_mode not in {"conservative", "direct"}:
+        raise ValueError(f"force mode {config.force_mode!r} is not supported")
+    val_every_steps = config.val_every_steps
+    if val_every_steps is not None and val_every_steps <= 0:
+        raise ValueError("val_every_steps must be greater than zero")
+    if config.batch_size < 1:
+        raise ValueError("batch_size must be at least one")
+
+    train_dataset, val_dataset = load_datasets(config)
+    metadata = model_metadata(config)
 
     num_devices = len(jax.devices())
     per_device_train_loader = DataLoader(
         train_dataset,
-        batch_size=selected_shape.batch_size,
-        n_graph=selected_shape.n_graph,
+        batch_size=config.batch_size,
         shuffle=True,
         max_n_nodes=config.max_n_nodes,
         max_n_edges=config.max_n_edges,
@@ -440,21 +444,21 @@ def train(run_config: TrainerConfig):
         avg_n_edges=config.avg_n_edges,
         seed=config.seed,
         num_workers=16,
-        packing="best_fit",
     )
     train_loader = ParallelLoader(per_device_train_loader, num_devices)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=selected_shape.batch_size,
-        n_graph=selected_shape.n_graph,
+        batch_size=config.batch_size,
         shuffle=False,
         max_n_nodes=config.max_n_nodes,
         max_n_edges=config.max_n_edges,
         avg_n_nodes=config.avg_n_nodes,
         avg_n_edges=config.avg_n_edges,
         num_workers=16,
-        packing="best_fit",
     )
+    n_graph = per_device_train_loader.n_graph
+    n_node = per_device_train_loader.n_node
+    n_edge = per_device_train_loader.n_edge
 
     wandb_sync = (
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
@@ -484,7 +488,7 @@ def train(run_config: TrainerConfig):
 
     steps_per_epoch = max(
         1,
-        math.ceil(len(train_dataset) / (selected_shape.batch_size * jax.device_count())),
+        math.ceil(len(train_dataset) / (config.batch_size * jax.device_count())),
     )
     optim, schedule = build_optimizer(config, model, steps_per_epoch)
 
@@ -520,11 +524,9 @@ def train(run_config: TrainerConfig):
         **config_values(config),
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
-        "autobatch_selected_batch_size": selected_shape.batch_size,
-        "autobatch_n_graph": selected_shape.n_graph,
-        "autobatch_n_node": selected_shape.n_node,
-        "autobatch_n_edge": selected_shape.n_edge,
-        "autobatch_cached": tune_result.cached,
+        "batch_n_graph": n_graph,
+        "batch_n_node": n_node,
+        "batch_n_edge": n_edge,
     }
     wandb_init_kwargs = {
         "entity": config.wandb_entity,
@@ -547,23 +549,11 @@ def train(run_config: TrainerConfig):
         wandb.run.summary["param_count"] = param_count
         wandb.run.summary["train_size"] = len(train_dataset)
         wandb.run.summary["val_size"] = len(val_dataset)
-        wandb.run.summary["autobatch/selected_shape"] = {
-            "n_graph": selected_shape.n_graph,
-            "n_node": selected_shape.n_node,
-            "n_edge": selected_shape.n_edge,
+        wandb.run.summary["batch/shape"] = {
+            "n_graph": n_graph,
+            "n_node": n_node,
+            "n_edge": n_edge,
         }
-        wandb.run.summary["autobatch/probes"] = [
-            {
-                "batch_size": probe.shape.batch_size,
-                "status": probe.status,
-                "graphs_per_second": probe.graphs_per_second,
-                "nodes_per_second": probe.nodes_per_second,
-                "edges_per_second": probe.edges_per_second,
-                "peak_memory_bytes": probe.peak_memory_bytes,
-                "final_loss": probe.final_loss,
-            }
-            for probe in tune_result.probes
-        ]
         wandb_run_id = getattr(wandb.run, "id", None)
 
     def runtime_metrics(training_seconds):
@@ -644,13 +634,13 @@ def train(run_config: TrainerConfig):
                 logs["train/nodes_per_second"] = node_count / train_time
                 logs["train/edges_per_second"] = edge_count / train_time
                 logs["train/graph_padding_utilization"] = graph_count / (
-                    num_devices * (selected_shape.n_graph - 1)
+                    num_devices * (n_graph - 1)
                 )
                 logs["train/node_padding_utilization"] = node_count / (
-                    num_devices * (selected_shape.n_node - 1)
+                    num_devices * (n_node - 1)
                 )
                 logs["train/edge_padding_utilization"] = edge_count / max(
-                    num_devices * selected_shape.n_edge, 1
+                    num_devices * n_edge, 1
                 )
                 logs["train/peak_gpu_memory_bytes"] = peak_device_memory_bytes()
                 current_training_seconds = (
@@ -696,10 +686,6 @@ def train(run_config: TrainerConfig):
         wandb.run.summary.update(final_runtime_metrics)
     wandb.finish()
 
-    selected_probe = next(
-        (probe for probe in tune_result.probes if probe.shape == selected_shape and probe.safe),
-        None,
-    )
     devices = jax.devices()
     summary = build_run_summary(
         config,
@@ -723,20 +709,10 @@ def train(run_config: TrainerConfig):
         run_url=wandb_run_url,
         extra_values={
             "steps_per_epoch": steps_per_epoch,
-            "autobatch_batch_size_per_accelerator": selected_shape.batch_size,
-            "autobatch_n_graph_per_accelerator": selected_shape.n_graph,
-            "autobatch_n_node_per_accelerator": selected_shape.n_node,
-            "autobatch_n_edge_per_accelerator": selected_shape.n_edge,
-            "autobatch_cached": tune_result.cached,
-            "autobatch_graphs_per_second": (
-                selected_probe.graphs_per_second if selected_probe is not None else None
-            ),
-            "autobatch_nodes_per_second": (
-                selected_probe.nodes_per_second if selected_probe is not None else None
-            ),
-            "autobatch_edges_per_second": (
-                selected_probe.edges_per_second if selected_probe is not None else None
-            ),
+            "batch_size_per_accelerator": config.batch_size,
+            "batch_n_graph_per_accelerator": n_graph,
+            "batch_n_node_per_accelerator": n_node,
+            "batch_n_edge_per_accelerator": n_edge,
         },
     )
     print_run_summary_csv(summary)

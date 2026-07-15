@@ -9,8 +9,8 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
-from nequix.autobatch import peak_device_memory_bytes
 from nequix.config import PFTTrainerConfig, config_values
+from nequix.hardware import peak_device_memory_bytes
 from nequix.data import (
     AtomPackDataset,
     ConcatDataset,

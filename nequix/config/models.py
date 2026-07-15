@@ -108,6 +108,7 @@ class TrainerConfig:
     state_path: str
     resume_from: str
     checkpoint_path: str
+    batch_size: int
     model_config: NequixConfig = field(default_factory=NequixConfig)
     kernel: bool = True
     valid_frac: float | None = None
@@ -121,8 +122,6 @@ class TrainerConfig:
     warmup_factor: float = 0.2
     grad_clip_norm: float = 100.0
     weight_decay: float = 1.0e-3
-    autobatch_memory_scaling_factor: float = 1.6
-    autobatch_minimum_speedup: float = 0.02
     n_epochs: int = 100
     energy_weight: float = 20.0
     force_weight: float = 20.0

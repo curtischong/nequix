@@ -2456,7 +2456,7 @@ requires-dist = [
     { name = "matscipy", specifier = ">=1.1.1" },
     { name = "nequix", extras = ["torch"], marker = "extra == 'torch-sim'" },
     { name = "openequivariance", marker = "extra == 'torch'", specifier = ">=0.6.4" },
-    { name = "openequivariance", extras = ["jax"], marker = "extra == 'oeq'", specifier = ">=0.6.4" },
+    { name = "openequivariance", extras = ["jax"], marker = "extra == 'oeq'", specifier = "==0.6.4" },
     { name = "optax", specifier = ">=0.2.5" },
     { name = "phonopy", marker = "extra == 'pft'", specifier = ">=2.43.1" },
     { name = "pyyaml", specifier = ">=6.0" },
