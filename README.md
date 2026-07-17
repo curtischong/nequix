@@ -86,7 +86,8 @@ in one place without YAML inheritance or path handling.
 
 Training and validation data is read exclusively from AtomPack `.atp` files. The
 training subset is controlled with `train_frac` and sampled deterministically using
-`seed`. When `dataset_name` is set, W&B names include the data schedule. For example,
+`seed`; the same seed also controls fresh model initialization and epoch shuffling.
+When `dataset_name` is set, W&B names include the data schedule. For example,
 `dataset_name="1m"`, `train_frac=0.25`, `n_epochs=4`, and
 `run_name="nequix_orig"` produce the W&B run name `1m25_4ep_nequix_orig`. Set
 `wandb_run_name` to override the generated name.
@@ -145,6 +146,44 @@ This will take less than 125 hours on a single 4 x A100 node (<25 hours with ker
 The configured `batch_size` is per device, so you can run on any number of GPUs
 (although hyperparameters like learning rate are often sensitive to the resulting
 global batch size).
+
+### OMat-1M model scaling study
+
+The depth/width scaling scripts use `data/omat-1m/train.atp` and
+`data/omat-1m/val.atp`. They train a 4 x 4 grid of interaction depths and proportional
+hidden-irrep widths for four epochs, with one isolated run per GPU. Each run writes a
+resumable state, checkpoint, log, and CSV summary locally and logs to the
+`nequix-scaling-omat1m` W&B project by default.
+
+Install the OpenEquivariance JAX extension using the commands in the training section
+above before launching the default kernel-enabled sweep. For a slower portable run,
+pass `--no-kernel`; do not mix kernel and non-kernel trials within one study because
+their compute measurements are not comparable.
+
+Preview GPU assignments and commands without starting training:
+
+```bash
+uv run python scripts/run_scaling_sweep.py --gpus 0,1,2,3,4,5,6,7 --dry-run
+```
+
+Run the seed-0 grid, select the compute/force-MAE Pareto endpoints and knee, then run
+two additional seeds for those three finalists:
+
+```bash
+uv run python scripts/run_scaling_sweep.py --gpus 0,1,2,3,4,5,6,7
+```
+
+The command is safe to rerun: completed trial summaries are skipped and incomplete
+trials resume from their epoch state. Use `--phase grid` or `--phase finalists` to run
+only one stage, `--max-parallel` to limit concurrent GPUs, and `--wandb-mode offline`
+or `disabled` when needed. Results default to `scaling_runs/omat1m-depth-width/`.
+
+Regenerate the aggregate CSV files, scaling fits, plots, and recommendation report
+without launching training:
+
+```bash
+uv run python scripts/analyze_scaling.py scaling_runs/omat1m-depth-width
+```
 
 ## Phonon fine-tuning (PFT)
 

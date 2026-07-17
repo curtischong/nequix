@@ -3,6 +3,7 @@
 
 md.traj
 logs/
+scaling_runs/
 wandb/
 data/*.zip
 data/mptrj-gga-ggapu

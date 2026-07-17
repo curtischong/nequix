@@ -536,6 +536,7 @@ def train(run_config: PFTTrainerConfig):
             },
             "extra_train_size": len(extra_train_dataset),
             "extra_val_size": len(extra_val_dataset),
+            "training_examples_seen": len(train_dataset) * config.n_epochs,
             "batch_size": config.batch_size,
             "n_graph": config.n_graph,
             "extra_batch_size": config.extra_batch_size,

@@ -48,6 +48,7 @@ dev = [
     "ase-db-backends>=0.1.0",
     "ipython>=8.36.0",
     "jax-md",
+    "matplotlib>=3.10.0",
     "pandas>=2.3.1",
     "pre-commit>=4.1.0",
     "pytest>=8.3.5",

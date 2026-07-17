@@ -301,13 +301,15 @@ def attach_direct_force_head(model, config: TrainerConfig) -> DirectForceNequix:
     return DirectForceNequix(
         model,
         config.model_config.hidden_irreps,
-        key=jax.random.fold_in(jax.random.key(0), 1),
+        key=jax.random.fold_in(jax.random.key(config.seed), 1),
     )
 
 
 def build_model(config: TrainerConfig):
     """Construct the training architecture shared by real runs and probes."""
-    model = model_from_metadata(model_metadata(config), kernel=config.kernel)
+    model = model_from_metadata(
+        model_metadata(config), kernel=config.kernel, key=jax.random.key(config.seed)
+    )
     if config.force_mode == "direct":
         model = attach_direct_force_head(model, config)
     return model
@@ -464,7 +466,7 @@ def train(run_config: TrainerConfig):
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
     )
 
-    model = model_from_metadata(metadata, kernel=config.kernel)
+    model = model_from_metadata(metadata, kernel=config.kernel, key=jax.random.key(config.seed))
     resume_exists = Path(config.resume_from).exists()
     if config.finetune_from is not None and Path(config.finetune_from).exists():
         model, checkpoint_metadata = load_model(config.finetune_from, config.kernel)
@@ -709,6 +711,7 @@ def train(run_config: TrainerConfig):
         run_url=wandb_run_url,
         extra_values={
             "steps_per_epoch": steps_per_epoch,
+            "training_examples_seen": len(train_dataset) * config.n_epochs,
             "batch_size_per_accelerator": config.batch_size,
             "batch_n_graph_per_accelerator": n_graph,
             "batch_n_node_per_accelerator": n_node,
