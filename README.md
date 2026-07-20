@@ -255,6 +255,59 @@ The OMat recipes run validation every 10,000 optimizer steps within each epoch,
 as well as at the end of every epoch. Set `val_every_steps` to a different
 positive interval (or `None` for epoch-end-only validation) in a derived config.
 
+Expensive downstream evaluations have a separate, global-step cadence. Attach an
+`EvaluationConfig` to a derived `TrainerConfig` to run MLIP Arena, the 100 ps NVE
+energy-conservation protocol used for eSEN, or both:
+
+```python
+from dataclasses import replace
+
+from nequix.config import EvaluationConfig, LongMDEvalConfig, MLIPArenaConfig, RUNS
+
+config = replace(
+    RUNS["nequix-oam-1"],
+    evaluations=EvaluationConfig(
+        every_steps=25_000,
+        mlip_arena=MLIPArenaConfig(
+            tasks=("diatomics",),
+            elements=("H", "C", "O", "Si", "Cu"),
+        ),
+        long_md=LongMDEvalConfig(
+            dataset_root="data/md",
+            dataset="tm23",
+            tm23_regimes=("melt",),
+            max_systems=1,
+        ),
+    ),
+)
+```
+
+`nequix-oam-1` uses this sub-five-minute training subset by default. With fresh
+weights, the no-kernel timer took 3 minutes 19 seconds on the development GPU
+(42 seconds for Arena and 2 minutes 36 seconds for MD).
+The MLIP Arena elements span light, organic, oxide, semiconductor, and transition-
+metal chemistry, while the MD portion runs one complete 100 ps molten-metal
+trajectory. To run the complete offline suites, set all three Arena tasks,
+`elements=None`, all three TM23 regimes, and `max_systems=None`.
+
+TM23 files are expected at
+`data/md/tm23/{element}_{cold,warm,melt}_nequip_test.xyz`; MD22 files are
+expected at `data/md/md22/md22_{molecule}.xyz`. Each trigger evaluates the EMA
+model and writes artifacts below `evaluations/*/step-N/`. Install the official
+MLIP Arena workflow dependency with `uv sync --python 3.12 --extra evals`.
+
+To measure wall time with fresh random weights, run the configured training subset
+or use the short end-to-end smoke mode (MLIP Arena requires Python 3.11 or newer):
+
+```bash
+uv run --python 3.12 --extra evals python scripts/time_evaluations.py --smoke --no-kernel
+uv run --python 3.12 --extra evals python scripts/time_evaluations.py --no-kernel
+```
+
+Without `--real-md-data`, the timer uses one generated vacancy-containing Cu
+system so the configured training evaluation can be timed without downloading
+TM23.
+
 For the two-stage OMat foundation-model curriculum (two direct-force epochs,
 then two conservative-force epochs), run:
 

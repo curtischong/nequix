@@ -23,6 +23,11 @@ from nequix.data import (
     ParallelLoader,
     prefetch,
 )
+from nequix.evaluation import (
+    evaluations_due,
+    run_model_evaluations,
+    validate_evaluation_config,
+)
 from nequix.hardware import peak_device_memory_bytes
 from nequix.model import (
     DirectForceNequix,
@@ -431,6 +436,7 @@ def train(run_config: TrainerConfig):
         raise ValueError("val_every_steps must be greater than zero")
     if config.batch_size < 1:
         raise ValueError("batch_size must be at least one")
+    validate_evaluation_config(config.evaluations)
 
     train_dataset, val_dataset = load_datasets(config)
     metadata = model_metadata(config)
@@ -505,6 +511,7 @@ def train(run_config: TrainerConfig):
     wandb_run_id = None
     training_runtime_seconds = 0.0
     validation_runtime_seconds = 0.0
+    evaluation_runtime_seconds = 0.0
     final_val_metrics = {}
 
     if resume_exists:
@@ -545,7 +552,8 @@ def train(run_config: TrainerConfig):
     wandb_run.define_metric("runtime/training_seconds", summary="last")
     wandb_run.define_metric("runtime/training_hours", summary="last")
     wandb_run.define_metric("runtime/validation_seconds", summary="last")
-    for metric_glob in ("train/*", "val/*"):
+    wandb_run.define_metric("runtime/evaluation_seconds", summary="last")
+    for metric_glob in ("train/*", "val/*", "eval/*"):
         wandb_run.define_metric(metric_glob, step_metric="runtime/training_hours")
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary["param_count"] = param_count
@@ -563,6 +571,7 @@ def train(run_config: TrainerConfig):
             "runtime/training_seconds": training_seconds,
             "runtime/training_hours": training_seconds / 3600.0,
             "runtime/validation_seconds": validation_runtime_seconds,
+            "runtime/evaluation_seconds": evaluation_runtime_seconds,
         }
 
     def run_validation(epoch, step_in_epoch, training_seconds):
@@ -638,12 +647,8 @@ def train(run_config: TrainerConfig):
                 logs["train/graph_padding_utilization"] = graph_count / (
                     num_devices * (n_graph - 1)
                 )
-                logs["train/node_padding_utilization"] = node_count / (
-                    num_devices * (n_node - 1)
-                )
-                logs["train/edge_padding_utilization"] = edge_count / max(
-                    num_devices * n_edge, 1
-                )
+                logs["train/node_padding_utilization"] = node_count / (num_devices * (n_node - 1))
+                logs["train/edge_padding_utilization"] = edge_count / max(num_devices * n_edge, 1)
                 logs["train/peak_gpu_memory_bytes"] = peak_device_memory_bytes()
                 current_training_seconds = (
                     training_runtime_seconds + time.perf_counter() - train_segment_start
@@ -658,6 +663,29 @@ def train(run_config: TrainerConfig):
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 run_validation(epoch, step_in_epoch, training_runtime_seconds)
                 last_validation_step_in_epoch = step_in_epoch
+                train_segment_start = time.perf_counter()
+
+            evaluation_config = config.evaluations
+            if evaluations_due(evaluation_config, int(step.item())):
+                jax.block_until_ready(model)
+                training_runtime_seconds += time.perf_counter() - train_segment_start
+                evaluation_start = time.perf_counter()
+                ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
+                eval_metrics = run_model_evaluations(
+                    conservative_backbone(ema_model_single),
+                    metadata,
+                    evaluation_config,
+                    kernel=config.kernel,
+                    step=int(step.item()),
+                )
+                evaluation_runtime_seconds += time.perf_counter() - evaluation_start
+                logs = {f"eval/{key}": value for key, value in eval_metrics.items()}
+                logs["epoch"] = epoch
+                logs["step_in_epoch"] = step_in_epoch
+                logs.update(runtime_metrics(training_runtime_seconds))
+                wandb.log(logs, step=int(step.item()))
+                print(f"model evaluations at step: {step}, logs: {logs}")
+                wandb_sync()
                 train_segment_start = time.perf_counter()
             start_time = time.perf_counter()
 
@@ -716,6 +744,7 @@ def train(run_config: TrainerConfig):
             "batch_n_graph_per_accelerator": n_graph,
             "batch_n_node_per_accelerator": n_node,
             "batch_n_edge_per_accelerator": n_edge,
+            "evaluation_runtime_seconds": evaluation_runtime_seconds,
         },
     )
     print_run_summary_csv(summary)

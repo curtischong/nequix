@@ -39,6 +39,9 @@ train = "nequix.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 
 [tool.hatch.build]
 include = ["nequix/*"]
@@ -62,6 +65,9 @@ line-length = 100
 jax-md = { git = "https://github.com/jax-md/jax-md.git" }
 
 [project.optional-dependencies]
+evals = [
+  "mlip-arena @ git+https://github.com/atomind-ai/mlip-arena.git@6239aea513c494aeab237fc96ef133b9b1cc204f ; python_version >= '3.11'",
+]
 torch = [
   "e3nn>=0.5.8",
   "openequivariance>=0.6.4",

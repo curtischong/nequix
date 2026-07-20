@@ -34,6 +34,11 @@ def test_config_values_preserves_typed_config_structure():
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
     assert config["batch_size"] == 128
     assert config["val_every_steps"] is None
+    assert config["evaluations"]["every_steps"] == 25_000
+    assert config["evaluations"]["mlip_arena"]["tasks"] == ["diatomics"]
+    assert config["evaluations"]["mlip_arena"]["elements"] == ["H", "C", "O", "Si", "Cu"]
+    assert config["evaluations"]["long_md"]["tm23_regimes"] == ["melt"]
+    assert config["evaluations"]["long_md"]["max_systems"] == 1
 
 
 def test_omat_foundation_curriculum_configs():

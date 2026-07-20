@@ -4,6 +4,9 @@ from dataclasses import replace
 
 from nequix.config.models import (
     ATOMIC_NUMBERS,
+    EvaluationConfig,
+    LongMDEvalConfig,
+    MLIPArenaConfig,
     MP_ATOM_ENERGIES,
     OAM_ATOM_ENERGIES,
     OMAT_ATOM_ENERGIES,
@@ -97,6 +100,19 @@ _OAM = replace(
     warmup_factor=0.0,
     n_epochs=3,
     val_every_steps=None,
+    evaluations=EvaluationConfig(
+        mlip_arena=MLIPArenaConfig(
+            tasks=("diatomics",),
+            # Broad chemical coverage while keeping the training interruption
+            # under the five-minute evaluation budget.
+            elements=("H", "C", "O", "Si", "Cu"),
+        ),
+        long_md=LongMDEvalConfig(
+            dataset="tm23",
+            tm23_regimes=("melt",),
+            max_systems=1,
+        ),
+    ),
 )
 
 

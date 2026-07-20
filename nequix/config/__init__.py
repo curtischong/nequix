@@ -1,5 +1,8 @@
 from nequix.config.models import (
     ATOMIC_NUMBERS,
+    EvaluationConfig,
+    LongMDEvalConfig,
+    MLIPArenaConfig,
     MP_ATOM_ENERGIES,
     MODEL_FORMAT,
     ModelMetadata,
@@ -15,6 +18,9 @@ from nequix.config.runs import RUNS
 
 __all__ = [
     "ATOMIC_NUMBERS",
+    "EvaluationConfig",
+    "LongMDEvalConfig",
+    "MLIPArenaConfig",
     "MP_ATOM_ENERGIES",
     "MODEL_FORMAT",
     "ModelMetadata",

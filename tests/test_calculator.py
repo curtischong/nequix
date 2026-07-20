@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from ase.io import write
 import torch
 import ase.build
 
@@ -72,7 +73,7 @@ def test_nequix_calculator_backends_match_fresh_checkpoint(
         pytest.param("jax", True, marks=skip_no_oeq),
     ],
 )
-def test_calculator_without_cell(jax_model_path, backend, kernel):
+def test_calculator_without_cell(jax_model_path, backend, kernel, tmp_path):
     atoms = ase.build.molecule("H2O")
     calc = NequixCalculator(jax_model_path, backend=backend, use_kernel=kernel)
     atoms.calc = calc
@@ -82,6 +83,7 @@ def test_calculator_without_cell(jax_model_path, backend, kernel):
     assert np.isfinite(energy)
     assert forces.shape == (len(atoms), 3)
     assert np.all(np.isfinite(forces))
+    write(tmp_path / "molecule.extxyz", atoms)
 
 
 @pytest.mark.parametrize("kernel", [False, pytest.param(True, marks=skip_no_oeq)])

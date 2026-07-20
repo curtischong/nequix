@@ -24,9 +24,7 @@ def model_path_backend(model_path: Path) -> str:
         raise ValueError("model checkpoints must use a .nqx or .pt extension") from error
 
 
-def load_model_for_backend(
-    model_path: str | Path, backend: str = "jax", use_kernel: bool = True
-):
+def load_model_for_backend(model_path: str | Path, backend: str = "jax", use_kernel: bool = True):
     """Load an explicit current-format checkpoint for the requested backend."""
     if backend not in {"jax", "torch"}:
         raise ValueError(f"invalid backend: {backend!r}")
@@ -179,9 +177,13 @@ class NequixCalculator(Calculator):
         self.results["energy"] = energy
         self.results["free_energy"] = energy
         self.results["forces"] = np.array(forces)
-        self.results["stress"] = (
-            full_3x3_to_voigt_6_stress(np.array(stress[0])) if stress is not None else None
-        )
+        if stress is not None:
+            self.results["stress"] = full_3x3_to_voigt_6_stress(np.array(stress[0]))
+        else:
+            # ASE's extxyz writer treats a present stress result as an array;
+            # retaining ``stress=None`` makes otherwise valid molecular
+            # calculations impossible to serialize (as in MLIP Arena).
+            self.results.pop("stress", None)
 
     def get_hessian(self, atoms=None):
         assert self.backend == "jax", "Hessian calculation currently only supported for JAX backend"

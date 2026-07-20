@@ -43,6 +43,56 @@ class NequixConfig:
 
 
 @dataclass(frozen=True)
+class MLIPArenaConfig:
+    """Configuration for the official MLIP Arena benchmark flows."""
+
+    tasks: tuple[Literal["diatomics", "eos_bulk", "ev"], ...] = (
+        "diatomics",
+        "eos_bulk",
+        "ev",
+    )
+    output_dir: str = "evaluations/mlip_arena"
+    dataset: str = "atomind/mlip-arena"
+    dataset_file: str = "wbm_subset.db"
+    max_workers: int = 1
+    # ``None`` uses every element in MLIP Arena. Supplying elements is useful
+    # for cheap development/timing runs and avoids evaluating unsupported atoms.
+    elements: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class LongMDEvalConfig:
+    """The 100 ps NVE energy-conservation protocol used to evaluate eSEN."""
+
+    dataset_root: str = "data/md"
+    dataset: Literal["tm23", "md22"] = "tm23"
+    tm23_regimes: tuple[Literal["cold", "warm", "melt"], ...] = (
+        "cold",
+        "warm",
+        "melt",
+    )
+    output_dir: str = "evaluations/long_md"
+    # Protocol defaults: TM23 is 20,000 x 5 fs; MD22 is 100,000 x 1 fs.
+    steps: int | None = None
+    time_step_fs: float | None = None
+    save_frequency: int = 10
+    relaxation_fmax: float = 0.05
+    relaxation_steps: int = 1000
+    seed: int = 0
+    # An optional prefix subset makes timing/smoke runs inexpensive.
+    max_systems: int | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    """Expensive model evaluations run on the EMA weights during training."""
+
+    every_steps: int = 25_000
+    mlip_arena: MLIPArenaConfig | None = None
+    long_md: LongMDEvalConfig | None = None
+
+
+@dataclass(frozen=True)
 class ModelMetadata:
     """The complete, backend-independent schema stored with model weights."""
 
@@ -130,6 +180,7 @@ class TrainerConfig:
     loss_type: str = "mae"
     log_every: int = 100
     val_every_steps: int | None = None
+    evaluations: EvaluationConfig | None = None
     ema_decay: float = 0.999
     finetune_from: str | None = None
     run_name: str | None = None
