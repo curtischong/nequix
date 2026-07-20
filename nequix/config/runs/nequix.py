@@ -35,6 +35,20 @@ _MP = TrainerConfig(
     n_epochs=100,
 )
 
+_TRAINING_EVALUATIONS = EvaluationConfig(
+    mlip_arena=MLIPArenaConfig(
+        tasks=("diatomics",),
+        # Broad chemical coverage while keeping the training interruption
+        # under the five-minute evaluation budget.
+        elements=("H", "C", "O", "Si", "Cu"),
+    ),
+    long_md=LongMDEvalConfig(
+        dataset="tm23",
+        tm23_regimes=("melt",),
+        max_systems=1,
+    ),
+)
+
 _OMAT = replace(
     _MP,
     name="nequix-omat-1",
@@ -56,6 +70,7 @@ _OMAT = replace(
     shift=-3.513482726416955,
     n_epochs=6,
     val_every_steps=10_000,
+    evaluations=_TRAINING_EVALUATIONS,
 )
 
 _OMAT_CURRICULUM_DIRECT = replace(
@@ -100,19 +115,6 @@ _OAM = replace(
     warmup_factor=0.0,
     n_epochs=3,
     val_every_steps=None,
-    evaluations=EvaluationConfig(
-        mlip_arena=MLIPArenaConfig(
-            tasks=("diatomics",),
-            # Broad chemical coverage while keeping the training interruption
-            # under the five-minute evaluation budget.
-            elements=("H", "C", "O", "Si", "Cu"),
-        ),
-        long_md=LongMDEvalConfig(
-            dataset="tm23",
-            tm23_regimes=("melt",),
-            max_systems=1,
-        ),
-    ),
 )
 
 

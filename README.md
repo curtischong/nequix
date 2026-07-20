@@ -282,9 +282,9 @@ config = replace(
 )
 ```
 
-`nequix-oam-1` uses this sub-five-minute training subset by default. With fresh
-weights, the no-kernel timer took 3 minutes 19 seconds on the development GPU
-(42 seconds for Arena and 2 minutes 36 seconds for MD).
+The OMat and OAM training recipes use this sub-five-minute training subset by
+default. With fresh weights, the no-kernel timer took 3 minutes 19 seconds on the
+development GPU (42 seconds for Arena and 2 minutes 36 seconds for MD).
 The MLIP Arena elements span light, organic, oxide, semiconductor, and transition-
 metal chemistry, while the MD portion runs one complete 100 ps molten-metal
 trajectory. To run the complete offline suites, set all three Arena tasks,
