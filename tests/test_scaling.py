@@ -50,7 +50,7 @@ def test_primary_grid_and_trial_config(tmp_path):
     assert config.valid_path == "data/omat-1m/val.atp"
     assert config.n_epochs == 4
     assert config.batch_size == 128
-    assert config.val_every_steps is None
+    assert config.validation.every_steps is None
     assert config.force_mode == "conservative"
     assert config.finetune_from is None
     assert config.model_config.n_layers == 2

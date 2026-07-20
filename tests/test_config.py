@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from types import ModuleType
 
 import pytest
@@ -33,12 +34,12 @@ def test_config_values_preserves_typed_config_structure():
     assert config["finetune_from"] == "checkpoints/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
     assert config["batch_size"] == 128
-    assert config["val_every_steps"] is None
-    assert config["evaluations"]["every_steps"] == 25_000
-    assert config["evaluations"]["mlip_arena"]["tasks"] == ["diatomics"]
-    assert config["evaluations"]["mlip_arena"]["elements"] == ["H", "C", "O", "Si", "Cu"]
-    assert config["evaluations"]["long_md"]["tm23_regimes"] == ["melt"]
-    assert config["evaluations"]["long_md"]["max_systems"] == 1
+    assert config["validation"]["every_steps"] is None
+    assert config["validation"]["evaluation_every_steps"] == 25_000
+    assert config["validation"]["mlip_arena"]["tasks"] == ["diatomics"]
+    assert config["validation"]["mlip_arena"]["elements"] == ["H", "C", "O", "Si", "Cu"]
+    assert config["validation"]["long_md"]["tm23_regimes"] == ["melt"]
+    assert config["validation"]["long_md"]["max_systems"] == 1
 
 
 def test_omat_foundation_curriculum_configs():
@@ -50,12 +51,10 @@ def test_omat_foundation_curriculum_configs():
 
     assert mp.batch_size == 64
     assert omat.batch_size == oam.batch_size == 128
-    assert omat.val_every_steps == 10_000
-    assert direct.val_every_steps == conservative.val_every_steps == 10_000
-    assert omat.evaluations is not None
-    assert omat.evaluations.every_steps == 25_000
-    assert direct.evaluations == conservative.evaluations == omat.evaluations
-    assert oam.evaluations == omat.evaluations
+    assert omat.validation.every_steps == 10_000
+    assert direct.validation == conservative.validation == omat.validation
+    assert omat.validation.evaluation_every_steps == 25_000
+    assert oam.validation == replace(omat.validation, every_steps=None)
     assert direct.train_frac == conservative.train_frac == 1.0
     assert direct.n_epochs == conservative.n_epochs == 2
     assert direct.force_mode == "direct"

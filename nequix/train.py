@@ -26,7 +26,7 @@ from nequix.data import (
 from nequix.evaluation import (
     evaluations_due,
     run_model_evaluations,
-    validate_evaluation_config,
+    validate_validation_config,
 )
 from nequix.hardware import peak_device_memory_bytes
 from nequix.model import (
@@ -431,12 +431,10 @@ def train(run_config: TrainerConfig):
     config = run_config
     if config.force_mode not in {"conservative", "direct"}:
         raise ValueError(f"force mode {config.force_mode!r} is not supported")
-    val_every_steps = config.val_every_steps
-    if val_every_steps is not None and val_every_steps <= 0:
-        raise ValueError("val_every_steps must be greater than zero")
+    validation_config = config.validation
     if config.batch_size < 1:
         raise ValueError("batch_size must be at least one")
-    validate_evaluation_config(config.evaluations)
+    validate_validation_config(validation_config)
 
     train_dataset, val_dataset = load_datasets(config)
     metadata = model_metadata(config)
@@ -658,15 +656,15 @@ def train(run_config: TrainerConfig):
                 print(f"step: {step}, logs: {logs}")
                 wandb_sync()
 
-            if val_every_steps is not None and step_in_epoch % val_every_steps == 0:
+            validation_cadence = validation_config.every_steps
+            if validation_cadence is not None and step_in_epoch % validation_cadence == 0:
                 jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 run_validation(epoch, step_in_epoch, training_runtime_seconds)
                 last_validation_step_in_epoch = step_in_epoch
                 train_segment_start = time.perf_counter()
 
-            evaluation_config = config.evaluations
-            if evaluations_due(evaluation_config, int(step.item())):
+            if evaluations_due(validation_config, int(step.item())):
                 jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 evaluation_start = time.perf_counter()
@@ -674,7 +672,7 @@ def train(run_config: TrainerConfig):
                 eval_metrics = run_model_evaluations(
                     conservative_backbone(ema_model_single),
                     metadata,
-                    evaluation_config,
+                    validation_config,
                     kernel=config.kernel,
                     step=int(step.item()),
                 )

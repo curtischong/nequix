@@ -252,22 +252,22 @@ uv run train nequix-omat-1
 ```
 
 The OMat recipes run validation every 10,000 optimizer steps within each epoch,
-as well as at the end of every epoch. Set `val_every_steps` to a different
+as well as at the end of every epoch. Set `validation.every_steps` to a different
 positive interval (or `None` for epoch-end-only validation) in a derived config.
-
-Expensive downstream evaluations have a separate, global-step cadence. Attach an
-`EvaluationConfig` to a derived `TrainerConfig` to run MLIP Arena, the 100 ps NVE
-energy-conservation protocol used for eSEN, or both:
+The same `ValidationConfig` controls the separate global-step cadence for expensive
+downstream validations such as MLIP Arena and the 100 ps NVE energy-conservation
+protocol used for eSEN:
 
 ```python
 from dataclasses import replace
 
-from nequix.config import EvaluationConfig, LongMDEvalConfig, MLIPArenaConfig, RUNS
+from nequix.config import LongMDEvalConfig, MLIPArenaConfig, RUNS, ValidationConfig
 
 config = replace(
     RUNS["nequix-oam-1"],
-    evaluations=EvaluationConfig(
-        every_steps=25_000,
+    validation=ValidationConfig(
+        every_steps=None,
+        evaluation_every_steps=25_000,
         mlip_arena=MLIPArenaConfig(
             tasks=("diatomics",),
             elements=("H", "C", "O", "Si", "Cu"),

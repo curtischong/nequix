@@ -78,7 +78,7 @@ def make_trial_config(
         seed=trial.seed,
         n_epochs=4,
         batch_size=128,
-        val_every_steps=None,
+        validation=replace(base.validation, every_steps=None),
         force_mode="conservative",
         finetune_from=None,
         state_path=str(state_path),

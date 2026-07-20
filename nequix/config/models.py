@@ -84,10 +84,11 @@ class LongMDEvalConfig:
 
 
 @dataclass(frozen=True)
-class EvaluationConfig:
-    """Expensive model evaluations run on the EMA weights during training."""
+class ValidationConfig:
+    """Dataset and downstream validation run on the EMA weights during training."""
 
-    every_steps: int = 25_000
+    every_steps: int | None = None
+    evaluation_every_steps: int | None = None
     mlip_arena: MLIPArenaConfig | None = None
     long_md: LongMDEvalConfig | None = None
 
@@ -179,8 +180,7 @@ class TrainerConfig:
     force_mode: Literal["conservative", "direct"] = "conservative"
     loss_type: str = "mae"
     log_every: int = 100
-    val_every_steps: int | None = None
-    evaluations: EvaluationConfig | None = None
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     ema_decay: float = 0.999
     finetune_from: str | None = None
     run_name: str | None = None

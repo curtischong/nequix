@@ -18,7 +18,7 @@ from ase.md.verlet import VelocityVerlet
 from ase.optimize import LBFGS
 
 from nequix.calculator import NequixCalculator
-from nequix.config import EvaluationConfig, LongMDEvalConfig, MLIPArenaConfig, ModelMetadata
+from nequix.config import LongMDEvalConfig, MLIPArenaConfig, ModelMetadata, ValidationConfig
 from nequix.model import save_model
 
 
@@ -65,30 +65,36 @@ TM23_MELTING_TEMPERATURES = {
 TM23_TEMPERATURE_FACTORS = {"cold": 0.25, "warm": 0.75, "melt": 1.25}
 
 
-def validate_evaluation_config(config: EvaluationConfig | None) -> None:
-    if config is None:
-        return
-    if config.every_steps <= 0:
-        raise ValueError("evaluations.every_steps must be greater than zero")
-    if config.mlip_arena is None and config.long_md is None:
-        raise ValueError("evaluations must enable mlip_arena and/or long_md")
+def validate_validation_config(config: ValidationConfig) -> None:
+    if config.every_steps is not None and config.every_steps <= 0:
+        raise ValueError("validation.every_steps must be greater than zero")
+    evaluations_enabled = config.mlip_arena is not None or config.long_md is not None
+    if config.evaluation_every_steps is not None and config.evaluation_every_steps <= 0:
+        raise ValueError("validation.evaluation_every_steps must be greater than zero")
+    if evaluations_enabled and config.evaluation_every_steps is None:
+        raise ValueError(
+            "validation.evaluation_every_steps is required when downstream evaluations are enabled"
+        )
+    if not evaluations_enabled and config.evaluation_every_steps is not None:
+        raise ValueError("validation must enable mlip_arena and/or long_md")
     if config.mlip_arena is not None and config.mlip_arena.max_workers <= 0:
-        raise ValueError("evaluations.mlip_arena.max_workers must be greater than zero")
+        raise ValueError("validation.mlip_arena.max_workers must be greater than zero")
     if config.long_md is not None:
         md = config.long_md
         if md.steps is not None and md.steps <= 0:
-            raise ValueError("evaluations.long_md.steps must be greater than zero")
+            raise ValueError("validation.long_md.steps must be greater than zero")
         if md.time_step_fs is not None and md.time_step_fs <= 0:
-            raise ValueError("evaluations.long_md.time_step_fs must be greater than zero")
+            raise ValueError("validation.long_md.time_step_fs must be greater than zero")
         if md.save_frequency <= 0:
-            raise ValueError("evaluations.long_md.save_frequency must be greater than zero")
+            raise ValueError("validation.long_md.save_frequency must be greater than zero")
         if md.max_systems is not None and md.max_systems <= 0:
-            raise ValueError("evaluations.long_md.max_systems must be greater than zero")
+            raise ValueError("validation.long_md.max_systems must be greater than zero")
 
 
-def evaluations_due(config: EvaluationConfig | None, step: int) -> bool:
+def evaluations_due(config: ValidationConfig, step: int) -> bool:
     """Return whether expensive evaluations are scheduled at this global step."""
-    return config is not None and step > 0 and step % config.every_steps == 0
+    cadence = config.evaluation_every_steps
+    return cadence is not None and step > 0 and step % cadence == 0
 
 
 def long_md_protocol(config: LongMDEvalConfig) -> tuple[int, float]:
@@ -305,7 +311,7 @@ def run_mlip_arena_evaluation(
 def run_model_evaluations(
     model: Any,
     metadata: ModelMetadata,
-    config: EvaluationConfig,
+    config: ValidationConfig,
     *,
     kernel: bool,
     step: int,

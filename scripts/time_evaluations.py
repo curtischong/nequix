@@ -13,11 +13,11 @@ from ase.data import chemical_symbols
 
 from nequix.calculator import NequixCalculator
 from nequix.config import (
-    EvaluationConfig,
     LongMDEvalConfig,
     MLIPArenaConfig,
     RUNS,
     TrainerConfig,
+    ValidationConfig,
 )
 from nequix.evaluation import (
     run_long_md_evaluation,
@@ -75,15 +75,18 @@ def main() -> None:
     kernel = not args.no_kernel
     fresh_checkpoint(config, checkpoint, kernel)
     calculator_kwargs = {"model_path": checkpoint, "use_kernel": kernel}
-    training_evaluations = config.evaluations or EvaluationConfig(
-        mlip_arena=MLIPArenaConfig(tasks=("diatomics",)),
-        long_md=LongMDEvalConfig(max_systems=1),
-    )
+    training_validation = config.validation
+    if training_validation.mlip_arena is None and training_validation.long_md is None:
+        training_validation = ValidationConfig(
+            evaluation_every_steps=25_000,
+            mlip_arena=MLIPArenaConfig(tasks=("diatomics",)),
+            long_md=LongMDEvalConfig(max_systems=1),
+        )
     timings = {}
     metrics = {}
 
     if "mlip-arena" in args.evaluations:
-        configured_arena = training_evaluations.mlip_arena or MLIPArenaConfig(tasks=("diatomics",))
+        configured_arena = training_validation.mlip_arena or MLIPArenaConfig(tasks=("diatomics",))
         elements = (
             ("H",)
             if args.smoke
@@ -106,7 +109,7 @@ def main() -> None:
 
     if "long-md" in args.evaluations:
         md_steps = args.md_steps if args.md_steps is not None else (20 if args.smoke else None)
-        configured_md = training_evaluations.long_md or LongMDEvalConfig(max_systems=1)
+        configured_md = training_validation.long_md or LongMDEvalConfig(max_systems=1)
         md_config = replace(
             configured_md,
             dataset=args.dataset,

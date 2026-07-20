@@ -1,6 +1,5 @@
 from nequix.config.models import (
     ATOMIC_NUMBERS,
-    EvaluationConfig,
     LongMDEvalConfig,
     MLIPArenaConfig,
     MP_ATOM_ENERGIES,
@@ -12,13 +11,13 @@ from nequix.config.models import (
     PFTTrainerConfig,
     RunConfig,
     TrainerConfig,
+    ValidationConfig,
     config_values,
 )
 from nequix.config.runs import RUNS
 
 __all__ = [
     "ATOMIC_NUMBERS",
-    "EvaluationConfig",
     "LongMDEvalConfig",
     "MLIPArenaConfig",
     "MP_ATOM_ENERGIES",
@@ -31,5 +30,6 @@ __all__ = [
     "RUNS",
     "RunConfig",
     "TrainerConfig",
+    "ValidationConfig",
     "config_values",
 ]

@@ -4,13 +4,13 @@ from dataclasses import replace
 
 from nequix.config.models import (
     ATOMIC_NUMBERS,
-    EvaluationConfig,
     LongMDEvalConfig,
     MLIPArenaConfig,
     MP_ATOM_ENERGIES,
     OAM_ATOM_ENERGIES,
     OMAT_ATOM_ENERGIES,
     TrainerConfig,
+    ValidationConfig,
 )
 
 
@@ -35,7 +35,9 @@ _MP = TrainerConfig(
     n_epochs=100,
 )
 
-_TRAINING_EVALUATIONS = EvaluationConfig(
+_TRAINING_VALIDATION = ValidationConfig(
+    every_steps=10_000,
+    evaluation_every_steps=25_000,
     mlip_arena=MLIPArenaConfig(
         tasks=("diatomics",),
         # Broad chemical coverage while keeping the training interruption
@@ -69,8 +71,7 @@ _OMAT = replace(
     scale=0.8080419656942678,
     shift=-3.513482726416955,
     n_epochs=6,
-    val_every_steps=10_000,
-    evaluations=_TRAINING_EVALUATIONS,
+    validation=_TRAINING_VALIDATION,
 )
 
 _OMAT_CURRICULUM_DIRECT = replace(
@@ -114,7 +115,7 @@ _OAM = replace(
     warmup_epochs=0.0,
     warmup_factor=0.0,
     n_epochs=3,
-    val_every_steps=None,
+    validation=replace(_TRAINING_VALIDATION, every_steps=None),
 )
 
 
