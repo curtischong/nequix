@@ -26,7 +26,7 @@ DIRECT_CHECKPOINT="checkpoints/nequix-omat-foundation-direct.nqx"
 CONSERVATIVE_STATE="checkpoints/nequix-omat-foundation-conservative.pkl"
 
 echo "Stage 1/2: direct-force pre-training (2 epochs)"
-"$UV_BIN" run train nequix-omat-foundation-direct
+"$UV_BIN" run --no-sync train nequix-omat-foundation-direct
 
 if [[ ! -f "$DIRECT_CHECKPOINT" && ! -f "$CONSERVATIVE_STATE" ]]; then
     echo "Stage one did not produce the weights checkpoint: $DIRECT_CHECKPOINT" >&2
@@ -35,7 +35,7 @@ if [[ ! -f "$DIRECT_CHECKPOINT" && ! -f "$CONSERVATIVE_STATE" ]]; then
 fi
 
 echo "Stage 2/2: conservative fine-tuning (2 epochs, fresh optimizer)"
-"$UV_BIN" run train nequix-omat-foundation-conservative
+"$UV_BIN" run --no-sync train nequix-omat-foundation-conservative
 
 echo "Curriculum complete. Best conservative model:"
 echo "  checkpoints/nequix-omat-foundation-conservative.nqx"

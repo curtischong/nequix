@@ -551,7 +551,7 @@ def train(run_config: TrainerConfig):
     wandb_run.define_metric("runtime/training_hours", summary="last")
     wandb_run.define_metric("runtime/validation_seconds", summary="last")
     wandb_run.define_metric("runtime/evaluation_seconds", summary="last")
-    for metric_glob in ("train/*", "val/*", "eval/*"):
+    for metric_glob in ("train/*", "val/*", "eval/*", "progress/epoch_percent"):
         wandb_run.define_metric(metric_glob, step_metric="runtime/training_hours")
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary["param_count"] = param_count
@@ -650,6 +650,32 @@ def train(run_config: TrainerConfig):
                 logs["train/peak_gpu_memory_bytes"] = peak_device_memory_bytes()
                 current_training_seconds = (
                     training_runtime_seconds + time.perf_counter() - train_segment_start
+                )
+                completed_steps = int(step.item())
+                seconds_per_step = current_training_seconds / max(completed_steps, 1)
+                epoch_fraction = min(step_in_epoch / steps_per_epoch, 1.0)
+                epoch_steps_remaining = max(steps_per_epoch - step_in_epoch, 0)
+                stage_steps_remaining = max(
+                    config.n_epochs * steps_per_epoch - completed_steps,
+                    0,
+                )
+                epoch_eta_seconds = epoch_steps_remaining * seconds_per_step
+                stage_eta_seconds = stage_steps_remaining * seconds_per_step
+                stage_fraction = min(
+                    completed_steps / (config.n_epochs * steps_per_epoch),
+                    1.0,
+                )
+                logs.update(
+                    {
+                        "progress/current_epoch": epoch + 1,
+                        "progress/epoch_percent": 100.0 * epoch_fraction,
+                        "progress/stage_percent": 100.0 * stage_fraction,
+                        "progress/steps_per_epoch": steps_per_epoch,
+                        "progress/epochs_completed": epoch + epoch_fraction,
+                        "progress/epoch_eta_seconds": epoch_eta_seconds,
+                        "progress/epoch_eta_hours": epoch_eta_seconds / 3600.0,
+                        "progress/stage_eta_hours": stage_eta_seconds / 3600.0,
+                    }
                 )
                 logs.update(runtime_metrics(current_training_seconds))
                 wandb.log(logs, step=step)

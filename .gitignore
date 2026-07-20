@@ -19,6 +19,7 @@ data/pbe-mdr-disp
 data/*.tar.gz
 tmp/
 .benchmarks/
+data/md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

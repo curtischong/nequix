@@ -83,6 +83,14 @@ _OMAT_CURRICULUM_DIRECT = replace(
     force_mode="direct",
     stress_weight=0.0,
     n_epochs=2,
+    batch_size=256,
+    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=2_000),
+    model_config=replace(
+        _OMAT.model_config,
+        hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",
+        lmax=4,
+        n_layers=10,
+    ),
 )
 
 _OMAT_CURRICULUM_CONSERVATIVE = replace(
@@ -94,6 +102,14 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     checkpoint_path="checkpoints/nequix-omat-foundation-conservative.nqx",
     force_mode="conservative",
     n_epochs=2,
+    batch_size=256,
+    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=2_000),
+    model_config=replace(
+        _OMAT.model_config,
+        hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",
+        lmax=4,
+        n_layers=10,
+    ),
 )
 
 # Repeat MPtrj so every epoch mixes it 8:1 with sAlex (the eSEN OAM recipe).

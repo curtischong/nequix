@@ -52,7 +52,9 @@ def test_omat_foundation_curriculum_configs():
     assert mp.batch_size == 64
     assert omat.batch_size == oam.batch_size == 128
     assert omat.validation.every_steps == 10_000
-    assert direct.validation == conservative.validation == omat.validation
+    assert direct.batch_size == conservative.batch_size == 256
+    assert direct.validation == conservative.validation
+    assert direct.validation == replace(omat.validation, evaluation_every_steps=2_000)
     assert omat.validation.evaluation_every_steps == 25_000
     assert oam.validation == replace(omat.validation, every_steps=None)
     assert direct.train_frac == conservative.train_frac == 1.0
@@ -62,6 +64,10 @@ def test_omat_foundation_curriculum_configs():
     assert conservative.force_mode == "conservative"
     assert conservative.finetune_from == direct.checkpoint_path
     assert conservative.resume_from != direct.resume_from
+    assert direct.model_config == conservative.model_config
+    assert direct.model_config.hidden_irreps == "195x0e + 97x1o + 49x2e + 49x3o"
+    assert direct.model_config.lmax == 4
+    assert direct.model_config.n_layers == 10
 
 
 @pytest.mark.parametrize("name", EXPECTED_RUNS)
