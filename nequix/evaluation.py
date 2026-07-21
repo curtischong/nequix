@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import sys
 import time
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +81,8 @@ def validate_validation_config(config: ValidationConfig) -> None:
         )
     if not evaluations_enabled and config.evaluation_every_steps is not None:
         raise ValueError("validation must enable mlip_arena and/or long_md")
+    if config.evaluation_workers_per_gpu <= 0:
+        raise ValueError("validation.evaluation_workers_per_gpu must be greater than zero")
     if config.mlip_arena is not None and config.mlip_arena.max_workers <= 0:
         raise ValueError("validation.mlip_arena.max_workers must be greater than zero")
     if config.long_md is not None:
@@ -105,8 +111,7 @@ def long_md_protocol(config: LongMDEvalConfig) -> tuple[int, float]:
     return config.steps or default_steps, config.time_step_fs or default_time_step
 
 
-def load_long_md_systems(config: LongMDEvalConfig) -> list[tuple[str, Atoms, float]]:
-    """Load the TM23/MD22 starting frames and protocol temperatures."""
+def _long_md_specifications(config: LongMDEvalConfig) -> list[tuple[str, Path, float]]:
     root = Path(config.dataset_root)
     specifications: list[tuple[str, Path, float]] = []
     if config.dataset == "tm23":
@@ -123,7 +128,98 @@ def load_long_md_systems(config: LongMDEvalConfig) -> list[tuple[str, Atoms, flo
             specifications.append((molecule, path, temperature))
     if config.max_systems is not None:
         specifications = specifications[: config.max_systems]
-    return [(name, read(path), temperature) for name, path, temperature in specifications]
+    return specifications
+
+
+def load_long_md_systems(config: LongMDEvalConfig) -> list[tuple[str, Atoms, float]]:
+    """Load the TM23/MD22 starting frames and protocol temperatures."""
+    return [
+        (name, read(path), temperature)
+        for name, path, temperature in _long_md_specifications(config)
+    ]
+
+
+def cuda_device_ids() -> tuple[str, ...]:
+    """The CUDA device ids visible to this process, for pinning eval workers."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return tuple(part.strip() for part in visible.split(",") if part.strip())
+    import jax
+
+    return tuple(
+        str(device.local_hardware_id) for device in jax.devices() if device.platform == "gpu"
+    )
+
+
+def _partition(items: Sequence[Any], devices: Sequence[str]) -> list[tuple[str, list[Any]]]:
+    chunks: list[tuple[str, list[Any]]] = [(device, []) for device in devices]
+    for index, item in enumerate(items):
+        chunks[index % len(devices)][1].append(item)
+    return [(device, chunk) for device, chunk in chunks if chunk]
+
+
+def _serializable_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: str(value) if isinstance(value, Path) else value for key, value in kwargs.items()}
+
+
+MPS_PIPE_DIRECTORY = "/tmp/nequix-eval-mps"
+JAX_CACHE_DIRECTORY = "evaluations/jax_cache"
+
+
+def _mps_environment() -> dict[str, str]:
+    """Start (or reuse) a dedicated CUDA MPS daemon for evaluation workers.
+
+    Without MPS, worker processes sharing a GPU time-slice their contexts and
+    the tiny evaluation kernels serialize; MPS lets them execute concurrently.
+    The private pipe directory keeps the training process outside MPS.
+    """
+    control = shutil.which("nvidia-cuda-mps-control")
+    if control is None:
+        return {}
+    Path(MPS_PIPE_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    Path(f"{MPS_PIPE_DIRECTORY}-log").mkdir(parents=True, exist_ok=True)
+    environment = {
+        "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
+        "CUDA_MPS_LOG_DIRECTORY": f"{MPS_PIPE_DIRECTORY}-log",
+    }
+    # Exits immediately with an error if a daemon already serves this pipe.
+    subprocess.run([control, "-d"], env=os.environ | environment, capture_output=True)
+    return {"CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY}
+
+
+def _run_evaluation_workers(payloads: Sequence[dict[str, Any]], scratch_dir: Path) -> None:
+    """Run one pinned-GPU subprocess per payload and wait for all of them."""
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    shared_env = _mps_environment() | {
+        # Workers share their GPU with the paused training process, so they
+        # must allocate on demand instead of claiming the XLA default pool.
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        # Identical jit programs recompile in every worker on every trigger
+        # without a persistent cache.
+        "JAX_COMPILATION_CACHE_DIR": str(Path(JAX_CACHE_DIRECTORY).absolute()),
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+    }
+    processes: list[tuple[subprocess.Popen, Path]] = []
+    for index, payload in enumerate(payloads):
+        payload_path = scratch_dir / f"worker-{index}.json"
+        payload_path.write_text(json.dumps(payload))
+        log_path = scratch_dir / f"worker-{index}.log"
+        env = os.environ | shared_env | {"CUDA_VISIBLE_DEVICES": payload["device"]}
+        with log_path.open("w") as log_file:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "nequix.evaluation", str(payload_path)],
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+        processes.append((process, log_path))
+    failures = [
+        f"{log_path}:\n{log_path.read_text()[-2000:]}"
+        for process, log_path in processes
+        if process.wait() != 0
+    ]
+    if failures:
+        raise RuntimeError("evaluation workers failed:\n" + "\n".join(failures))
 
 
 def _energy_drift(energies: Sequence[float], times_ps: Sequence[float]) -> float:
@@ -139,6 +235,20 @@ def _energy_drift(energies: Sequence[float], times_ps: Sequence[float]) -> float
     if len(energies) < 2 or times_ps[-1] <= times_ps[0]:
         raise ValueError("the trajectory is too short to calculate energy drift")
     return float(1000.0 * abs(energies[-1] - energies[0]) / (times_ps[-1] - times_ps[0]))
+
+
+def _long_md_summary(results: Sequence[dict[str, Any]]) -> dict[str, float]:
+    successful_drifts = [
+        item["drift_mev_per_atom_ps"] for item in results if "drift_mev_per_atom_ps" in item
+    ]
+    return {
+        "drift_mev_per_atom_ps": float(np.mean(successful_drifts))
+        if successful_drifts
+        else float("nan"),
+        "successful_systems": float(len(successful_drifts)),
+        "failed_systems": float(len(results) - len(successful_drifts)),
+        "runtime_seconds": float(sum(item["runtime_seconds"] for item in results)),
+    }
 
 
 def run_long_md_evaluation(
@@ -199,21 +309,102 @@ def run_long_md_evaluation(
             }
         results.append(result)
 
-    successful_drifts = [
-        item["drift_mev_per_atom_ps"] for item in results if "drift_mev_per_atom_ps" in item
-    ]
-    summary = {
-        "drift_mev_per_atom_ps": float(np.mean(successful_drifts))
-        if successful_drifts
-        else float("nan"),
-        "successful_systems": float(len(successful_drifts)),
-        "failed_systems": float(len(results) - len(successful_drifts)),
-        "runtime_seconds": float(sum(item["runtime_seconds"] for item in results)),
-    }
+    summary = _long_md_summary(results)
     (output_dir / "results.json").write_text(
         json.dumps({"summary": summary, "systems": results}, indent=2, allow_nan=True)
     )
     return summary
+
+
+def _system_cost(path: Path) -> int:
+    """The atom count from an xyz header, a proxy for per-step cost."""
+    with path.open() as handle:
+        return int(handle.readline())
+
+
+def _long_md_payloads(
+    config: LongMDEvalConfig,
+    calculator_kwargs: dict[str, Any],
+    slots: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Balance the MD systems over worker slots by total atom count.
+
+    System sizes span roughly 30-80 atoms, so unbalanced assignment leaves the
+    wave waiting on whichever GPU drew the largest systems.
+    """
+    output_dir = Path(config.output_dir)
+    specifications = _long_md_specifications(config)
+    costs = {name: _system_cost(path) for name, path, _ in specifications}
+    groups: list[list[str]] = [[] for _ in slots]
+    totals = [0] * len(slots)
+    for name in sorted(costs, key=lambda key: costs[key], reverse=True):
+        index = totals.index(min(totals))
+        groups[index].append(name)
+        totals[index] += costs[name]
+    return [
+        {
+            "kind": "long_md",
+            "device": device,
+            "systems": group,
+            # The worker already receives an explicit system subset, so its
+            # config must not re-apply the prefix limit.
+            "config": asdict(
+                replace(config, output_dir=str(output_dir / f"worker-{index}"), max_systems=None)
+            ),
+            "calculator_kwargs": _serializable_kwargs(calculator_kwargs),
+        }
+        for index, (device, group) in enumerate(zip(slots, groups))
+        if group
+    ]
+
+
+def _collect_long_md(output_dir: Path, payloads: Sequence[dict[str, Any]]) -> dict[str, float]:
+    results = [
+        system
+        for payload in payloads
+        for system in json.loads(
+            (Path(payload["config"]["output_dir"]) / "results.json").read_text()
+        )["systems"]
+    ]
+    summary = _long_md_summary(results)
+    (output_dir / "results.json").write_text(
+        json.dumps({"summary": summary, "systems": results}, indent=2, allow_nan=True)
+    )
+    return summary
+
+
+def run_long_md_evaluation_parallel(
+    config: LongMDEvalConfig,
+    *,
+    calculator_kwargs: dict[str, Any],
+    gpus: Sequence[str],
+) -> dict[str, float]:
+    """Fan the long-MD systems out across GPUs in pinned worker processes."""
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payloads = _long_md_payloads(config, calculator_kwargs, gpus)
+    _run_evaluation_workers(payloads, output_dir / "workers")
+    return _collect_long_md(output_dir, payloads)
+
+
+def _diatomics_payloads(
+    elements: Sequence[str],
+    calculator_kwargs: dict[str, Any],
+    slots: Sequence[str],
+    task_dir: Path,
+) -> list[dict[str, Any]]:
+    # Each element writes its own trajectory file, so workers can share the
+    # task directory and ``analyze`` merges them.
+    return [
+        {
+            "kind": "diatomics",
+            "device": device,
+            "elements": chunk,
+            "out_dir": str(task_dir),
+            "calculator_kwargs": _serializable_kwargs(calculator_kwargs),
+        }
+        for device, chunk in _partition(elements, slots)
+    ]
 
 
 def _dataframe_summary(frame: Any) -> dict[str, float]:
@@ -235,6 +426,7 @@ def run_mlip_arena_evaluation(
     *,
     calculator: type = NequixCalculator,
     calculator_kwargs: dict[str, Any] | None = None,
+    gpus: Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Run configured tasks using MLIP Arena's official flow implementations."""
     try:
@@ -257,7 +449,16 @@ def run_mlip_arena_evaluation(
         started = time.perf_counter()
         if task_name == "diatomics":
             task_dir = output_dir / "diatomics"
-            if config.elements is None:
+            parallel = (
+                config.elements is not None
+                and gpus is not None
+                and len(gpus) > 1
+                and calculator is NequixCalculator
+            )
+            if parallel:
+                payloads = _diatomics_payloads(config.elements, calculator_kwargs, gpus, task_dir)
+                _run_evaluation_workers(payloads, task_dir / "workers")
+            elif config.elements is None:
                 homonuclear_diatomics.with_options(
                     task_runner=ThreadPoolTaskRunner(max_workers=config.max_workers)
                 )(
@@ -318,30 +519,115 @@ def run_model_evaluations(
 ) -> dict[str, float]:
     """Save an EMA snapshot and run all configured downstream evaluations."""
     metrics: dict[str, float] = {}
-    if config.mlip_arena is not None:
-        arena_dir = Path(config.mlip_arena.output_dir) / f"step-{step}"
+    # Duplicating the device list oversubscribes each GPU: the evaluation
+    # systems are far too small to saturate one, so concurrent (MPS-shared)
+    # workers overlap their host and kernel-launch latency.
+    slots = cuda_device_ids() * config.evaluation_workers_per_gpu
+    arena = config.mlip_arena
+    long_md = config.long_md
+    if (
+        len(slots) > 1
+        and arena is not None
+        and arena.tasks == ("diatomics",)
+        and long_md is not None
+    ):
+        # Fast path: one worker wave runs the diatomic curves and MD systems
+        # together, paying the process/JIT startup tax once and keeping every
+        # GPU busy until the longest trajectory finishes.
+        from mlip_arena.flows.diatomics import analyze
+
+        arena_dir = Path(arena.output_dir) / f"step-{step}"
         checkpoint = arena_dir / "model.nqx"
         save_model(checkpoint, model, metadata)
-        elements = config.mlip_arena.elements
+        calculator_kwargs = {"model_path": str(checkpoint), "use_kernel": kernel}
+        elements = arena.elements
         if elements is None:
             elements = tuple(chemical_symbols[number] for number in metadata.atomic_numbers)
-        arena_config = replace(
-            config.mlip_arena,
-            output_dir=str(arena_dir),
-            elements=elements,
+        task_dir = arena_dir / "diatomics"
+        md_dir = Path(long_md.output_dir) / f"step-{step}"
+        md_config = replace(long_md, output_dir=str(md_dir))
+        md_payloads = _long_md_payloads(md_config, calculator_kwargs, slots)
+        payloads = _diatomics_payloads(elements, calculator_kwargs, slots, task_dir) + md_payloads
+
+        started = time.perf_counter()
+        _run_evaluation_workers(payloads, md_dir / "workers")
+        wave_seconds = time.perf_counter() - started
+
+        arena_summary = _dataframe_summary(analyze(task_dir))
+        arena_summary["runtime_seconds"] = wave_seconds
+        (arena_dir / "summary.json").write_text(
+            json.dumps(
+                {f"diatomics/{key}": value for key, value in arena_summary.items()},
+                indent=2,
+                allow_nan=True,
+            )
         )
+        metrics.update(
+            {f"mlip_arena/diatomics/{key}": value for key, value in arena_summary.items()}
+        )
+        metrics.update(
+            {f"long_md/{key}": value for key, value in _collect_long_md(md_dir, md_payloads).items()}
+        )
+        return metrics
+
+    if arena is not None:
+        arena_dir = Path(arena.output_dir) / f"step-{step}"
+        checkpoint = arena_dir / "model.nqx"
+        save_model(checkpoint, model, metadata)
+        elements = arena.elements
+        if elements is None:
+            elements = tuple(chemical_symbols[number] for number in metadata.atomic_numbers)
+        arena_config = replace(arena, output_dir=str(arena_dir), elements=elements)
         arena_metrics = run_mlip_arena_evaluation(
             arena_config,
             calculator_kwargs={"model_path": checkpoint, "use_kernel": kernel},
+            gpus=slots,
         )
         metrics.update({f"mlip_arena/{key}": value for key, value in arena_metrics.items()})
 
-    if config.long_md is not None:
-        md_dir = Path(config.long_md.output_dir) / f"step-{step}"
+    if long_md is not None:
+        md_dir = Path(long_md.output_dir) / f"step-{step}"
         checkpoint = md_dir / "model.nqx"
         save_model(checkpoint, model, metadata)
-        md_config = replace(config.long_md, output_dir=str(md_dir))
-        calculator_instance = NequixCalculator(checkpoint, use_kernel=kernel)
-        md_metrics = run_long_md_evaluation(md_config, calculator_instance)
+        md_config = replace(long_md, output_dir=str(md_dir))
+        if len(slots) > 1:
+            md_metrics = run_long_md_evaluation_parallel(
+                md_config,
+                calculator_kwargs={"model_path": checkpoint, "use_kernel": kernel},
+                gpus=slots,
+            )
+        else:
+            calculator_instance = NequixCalculator(checkpoint, use_kernel=kernel)
+            md_metrics = run_long_md_evaluation(md_config, calculator_instance)
         metrics.update({f"long_md/{key}": value for key, value in md_metrics.items()})
     return metrics
+
+
+def _worker_main(payload_path: str) -> None:
+    payload = json.loads(Path(payload_path).read_text())
+    calculator_kwargs = payload["calculator_kwargs"]
+    if payload["kind"] == "diatomics":
+        from mlip_arena.flows.diatomics import homonuclear_diatomic
+
+        for element in payload["elements"]:
+            homonuclear_diatomic.fn(
+                symbol=element,
+                calculator=NequixCalculator,
+                calculator_kwargs=calculator_kwargs,
+                out_dir=Path(payload["out_dir"]),
+            )
+    else:
+        config = LongMDEvalConfig(
+            **{**payload["config"], "tm23_regimes": tuple(payload["config"]["tm23_regimes"])}
+        )
+        names = set(payload["systems"])
+        systems = [
+            (name, read(path), temperature)
+            for name, path, temperature in _long_md_specifications(config)
+            if name in names
+        ]
+        run_long_md_evaluation(config, NequixCalculator(**calculator_kwargs), systems=systems)
+
+
+if __name__ == "__main__":
+    _worker_main(sys.argv[1])

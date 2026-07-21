@@ -91,6 +91,9 @@ class ValidationConfig:
     evaluation_every_steps: int | None = None
     mlip_arena: MLIPArenaConfig | None = None
     long_md: LongMDEvalConfig | None = None
+    # Evaluation systems are tiny (2-570 atoms), so a single worker leaves an
+    # accelerator mostly idle; stacking workers per GPU overlaps their latency.
+    evaluation_workers_per_gpu: int = 4
 
 
 @dataclass(frozen=True)

@@ -40,14 +40,17 @@ _TRAINING_VALIDATION = ValidationConfig(
     evaluation_every_steps=25_000,
     mlip_arena=MLIPArenaConfig(
         tasks=("diatomics",),
-        # Broad chemical coverage while keeping the training interruption
-        # under the five-minute evaluation budget.
-        elements=("H", "C", "O", "Si", "Cu"),
+        # Every element the model supports; the curves are fanned out across
+        # all local GPUs in pinned worker processes.
+        elements=None,
     ),
     long_md=LongMDEvalConfig(
         dataset="tm23",
         tm23_regimes=("melt",),
-        max_systems=1,
+        # One 100 ps trajectory per GPU on an 8-GPU node keeps the whole
+        # evaluation wave near five minutes; a second trajectory per GPU
+        # (max_systems=16) raises it to about 7.5 minutes.
+        max_systems=8,
     ),
 )
 
@@ -84,7 +87,7 @@ _OMAT_CURRICULUM_DIRECT = replace(
     stress_weight=0.0,
     n_epochs=2,
     batch_size=256,
-    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=2_000),
+    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=4_000),
     model_config=replace(
         _OMAT.model_config,
         hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",
@@ -103,7 +106,7 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     force_mode="conservative",
     n_epochs=2,
     batch_size=256,
-    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=2_000),
+    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=4_000),
     model_config=replace(
         _OMAT.model_config,
         hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",

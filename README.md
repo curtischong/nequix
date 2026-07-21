@@ -282,13 +282,16 @@ config = replace(
 )
 ```
 
-The OMat and OAM training recipes use this sub-five-minute training subset by
-default. With fresh weights, the no-kernel timer took 3 minutes 19 seconds on the
-development GPU (42 seconds for Arena and 2 minutes 36 seconds for MD).
-The MLIP Arena elements span light, organic, oxide, semiconductor, and transition-
-metal chemistry, while the MD portion runs one complete 100 ps molten-metal
-trajectory. To run the complete offline suites, set all three Arena tasks,
-`elements=None`, all three TM23 regimes, and `max_systems=None`.
+The OMat and OAM training recipes default to `elements=None` (every element the
+model supports) and eight TM23 melt systems (one 100 ps trajectory per GPU on an
+8-GPU node). During training all diatomic curves and MD systems run as a single
+wave of pinned worker subprocesses (`CUDA_VISIBLE_DEVICES` per worker, no XLA
+preallocation) sharing GPUs under a dedicated CUDA MPS daemon, with a persistent
+JAX compilation cache under `evaluations/jax_cache`; the full trigger takes about
+6.5 minutes on 8xH100. Because each system is far too small to saturate a GPU,
+`validation.evaluation_workers_per_gpu` (default 4) diatomics workers share each
+device. To run the complete offline suites, set all three Arena tasks, all three
+TM23 regimes, and `max_systems=None`.
 
 TM23 files are expected at
 `data/md/tm23/{element}_{cold,warm,melt}_nequip_test.xyz`; MD22 files are

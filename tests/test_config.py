@@ -37,9 +37,9 @@ def test_config_values_preserves_typed_config_structure():
     assert config["validation"]["every_steps"] is None
     assert config["validation"]["evaluation_every_steps"] == 25_000
     assert config["validation"]["mlip_arena"]["tasks"] == ["diatomics"]
-    assert config["validation"]["mlip_arena"]["elements"] == ["H", "C", "O", "Si", "Cu"]
+    assert config["validation"]["mlip_arena"]["elements"] is None
     assert config["validation"]["long_md"]["tm23_regimes"] == ["melt"]
-    assert config["validation"]["long_md"]["max_systems"] == 1
+    assert config["validation"]["long_md"]["max_systems"] == 8
 
 
 def test_omat_foundation_curriculum_configs():
@@ -54,7 +54,7 @@ def test_omat_foundation_curriculum_configs():
     assert omat.validation.every_steps == 10_000
     assert direct.batch_size == conservative.batch_size == 256
     assert direct.validation == conservative.validation
-    assert direct.validation == replace(omat.validation, evaluation_every_steps=2_000)
+    assert direct.validation == replace(omat.validation, evaluation_every_steps=4_000)
     assert omat.validation.evaluation_every_steps == 25_000
     assert oam.validation == replace(omat.validation, every_steps=None)
     assert direct.train_frac == conservative.train_frac == 1.0
