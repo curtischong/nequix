@@ -115,7 +115,10 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     ),
 )
 
-# Repeat MPtrj so every epoch mixes it 8:1 with sAlex (the eSEN OAM recipe).
+# The eSEN OAM fine-tuning mix: sAlex plus eight copies of MPtrj, sampled
+# uniformly over the concatenation. OMat24 is deliberately absent — its VASP 54
+# PBE(+U) settings are incompatible with the MP-compatible energies of MPtrj,
+# sAlex, and the WBM test set, so it only enters through pre-training.
 OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
 _OAM = replace(
@@ -137,6 +140,39 @@ _OAM = replace(
     validation=replace(_TRAINING_VALIDATION, every_steps=None),
 )
 
+# Stage three of the foundation curriculum: one conservative epoch on the OAM
+# mix so the energy reference matches the MP DFT settings that Matbench
+# Discovery evaluates against.
+_OAM_FOUNDATION = replace(
+    _OMAT_CURRICULUM_CONSERVATIVE,
+    name="nequix-oam-foundation",
+    state_path="checkpoints/nequix-oam-foundation.pkl",
+    resume_from="checkpoints/nequix-oam-foundation.pkl",
+    finetune_from="checkpoints/nequix-omat-foundation-conservative.nqx",
+    checkpoint_path="checkpoints/nequix-oam-foundation.nqx",
+    train_path=OAM_TRAIN_PATHS,
+    valid_path="data/salex/val.atp",
+    dataset_name="oam",
+    atom_energies=OAM_ATOM_ENERGIES,
+    # Mix-size-weighted blend of the MPtrj and OMat stats (8x1.58M MPtrj vs
+    # ~10.4M sAlex); replace with exact values from
+    # scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp
+    # --atom-energies oam once data/salex/*.atp exist.
+    avg_n_edges=1394.4,
+    avg_n_neighbors=49.2,
+    avg_n_nodes=25.6,
+    max_n_edges=34704,
+    max_n_nodes=444,
+    shift=-4.3250839528546265,
+    # Halve the OMat-stage batch size: the mix nearly doubles avg_n_edges, so
+    # this keeps the dynamic-batch edge budget (and memory) roughly constant.
+    batch_size=128,
+    learning_rate=0.003,
+    warmup_epochs=0.0,
+    warmup_factor=0.0,
+    n_epochs=1,
+)
+
 
 RUNS: list[TrainerConfig] = [
     _MP,
@@ -144,4 +180,5 @@ RUNS: list[TrainerConfig] = [
     _OMAT_CURRICULUM_DIRECT,
     _OMAT_CURRICULUM_CONSERVATIVE,
     _OAM,
+    _OAM_FOUNDATION,
 ]

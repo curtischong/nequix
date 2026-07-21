@@ -80,6 +80,9 @@ torch-sim = [
   "torch-sim-atomistic>=0.5.2; python_version >= '3.12'",
   "torch>=2.8.0; python_version >= '3.12'",
 ]
+mbd = [
+  "matbench-discovery>=1.3.1; python_version >= '3.11'",
+]
 oeq = [
   # You need to install openequivariance_extjax separately
   # uv pip install openequivariance_extjax==0.6.4 --no-build-isolation

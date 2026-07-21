@@ -311,8 +311,42 @@ Without `--real-md-data`, the timer uses one generated vacancy-containing Cu
 system so the configured training evaluation can be timed without downloading
 TM23.
 
-For the two-stage OMat foundation-model curriculum (two direct-force epochs,
-then two conservative-force epochs), run:
+### Matbench Discovery
+
+`scripts/eval_matbench_discovery.py` scores a checkpoint on the full Matbench
+Discovery WBM test set (~257k structures). Stage one relaxes the WBM initial
+structures with the standard force-field protocol (FrechetCellFilter + FIRE,
+`fmax=0.05`, 500 steps); shard it across GPUs by launching one resumable
+process per device. Stage two applies MP2020 energy corrections and writes
+formation-energy predictions, hull distances, and leaderboard metrics (full
+test set and unique-prototype subset) below
+`evaluations/matbench_discovery/<model name>/`:
+
+```bash
+for i in $(seq 0 7); do
+    CUDA_VISIBLE_DEVICES=$i uv run --python 3.12 --extra mbd \
+        python scripts/eval_matbench_discovery.py relax checkpoints/model.nqx \
+        --shard-index $i --num-shards 8 &
+done
+wait
+uv run --python 3.12 --extra mbd \
+    python scripts/eval_matbench_discovery.py join checkpoints/model.nqx
+```
+
+Benchmark data caches under `~/.cache/matbench-discovery`; see the script
+docstring for a workaround if the automatic figshare download fails.
+
+### Foundation-model curriculum
+
+The full curriculum follows the eSEN OAM recipe (the datamix behind the current
+Matbench Discovery leaders): OMat24 is used only for pre-training, and the
+final stage fine-tunes on an MP-compatible mix of sAlex plus eight copies of
+MPtrj. OMat24 never appears in the final mix because its DFT settings (VASP 54
+PBE+U) are incompatible with the MP-compatible energies of MPtrj, sAlex, and
+the WBM test set that Matbench Discovery scores against.
+
+Stages one and two (two direct-force epochs on OMat24, then two
+conservative-force epochs on OMat24):
 
 ```bash
 ./scripts/train_omat_foundation_curriculum.sh
@@ -321,10 +355,37 @@ then two conservative-force epochs), run:
 Both stages use all of `data/omat/train.atp`. Each has an independent resumable
 training-state checkpoint under `checkpoints/`. The second stage initializes from
 the best first-stage backbone checkpoint but deliberately creates a fresh optimizer
-and learning-rate schedule for the new objective. The final best checkpoint is
+and learning-rate schedule for the new objective. The best stage-two checkpoint is
 `checkpoints/nequix-omat-foundation-conservative.nqx`.
 
-The OMat run writes its best checkpoint to `checkpoints/nequix-omat-1.nqx`.
+Stage three (one conservative epoch on sAlex + 8x MPtrj, fine-tuned from the
+stage-two checkpoint) needs the sAlex AtomPack files first:
+
+```bash
+bash data/download_salex.sh
+uv run python scripts/preprocess_ase_db.py data/salex/train data/salex/train.atp --n_workers 32
+uv run python scripts/preprocess_ase_db.py data/salex/val data/salex/val.atp --n_workers 32
+```
+
+The `nequix-oam-foundation` config ships with mix-size-weighted estimates of the
+dataset statistics; recompute them exactly over the training mix (repeat counts
+mirror `train_path`) and copy the output into the config:
+
+```bash
+uv run python scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp \
+    --atom-energies oam --sample-frac 0.05
+```
+
+Then run the fine-tune:
+
+```bash
+./scripts/train_oam_foundation.sh
+```
+
+The final best checkpoint is `checkpoints/nequix-oam-foundation.nqx`; evaluate
+that (not the OMat-stage checkpoints) on Matbench Discovery.
+
+The standalone OMat run writes its best checkpoint to `checkpoints/nequix-omat-1.nqx`.
 To fine-tune the OAM model from that newly trained checkpoint, run
 ```bash
 uv run train nequix-oam-1
