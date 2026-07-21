@@ -22,7 +22,13 @@ from ase.md.verlet import VelocityVerlet
 from ase.optimize import LBFGS
 
 from nequix.calculator import NequixCalculator
-from nequix.config import LongMDEvalConfig, MLIPArenaConfig, ModelMetadata, ValidationConfig
+from nequix.config import (
+    BenchmarkConfig,
+    LongMDEvalConfig,
+    MLIPArenaConfig,
+    ModelMetadata,
+    ValidationConfig,
+)
 from nequix.model import save_model
 
 
@@ -72,34 +78,32 @@ TM23_TEMPERATURE_FACTORS = {"cold": 0.25, "warm": 0.75, "melt": 1.25}
 def validate_validation_config(config: ValidationConfig) -> None:
     if config.every_steps is not None and config.every_steps <= 0:
         raise ValueError("validation.every_steps must be greater than zero")
-    evaluations_enabled = config.mlip_arena is not None or config.long_md is not None
-    if config.evaluation_every_steps is not None and config.evaluation_every_steps <= 0:
-        raise ValueError("validation.evaluation_every_steps must be greater than zero")
-    if evaluations_enabled and config.evaluation_every_steps is None:
-        raise ValueError(
-            "validation.evaluation_every_steps is required when downstream evaluations are enabled"
-        )
-    if not evaluations_enabled and config.evaluation_every_steps is not None:
-        raise ValueError("validation must enable mlip_arena and/or long_md")
-    if config.evaluation_workers_per_gpu <= 0:
-        raise ValueError("validation.evaluation_workers_per_gpu must be greater than zero")
+
+
+def validate_benchmark_config(config: BenchmarkConfig) -> None:
+    if config.every_steps is not None and config.every_steps <= 0:
+        raise ValueError("benchmarks.every_steps must be greater than zero")
+    if config.workers_per_gpu <= 0:
+        raise ValueError("benchmarks.workers_per_gpu must be greater than zero")
     if config.mlip_arena is not None and config.mlip_arena.max_workers <= 0:
-        raise ValueError("validation.mlip_arena.max_workers must be greater than zero")
+        raise ValueError("benchmarks.mlip_arena.max_workers must be greater than zero")
     if config.long_md is not None:
         md = config.long_md
         if md.steps is not None and md.steps <= 0:
-            raise ValueError("validation.long_md.steps must be greater than zero")
+            raise ValueError("benchmarks.long_md.steps must be greater than zero")
         if md.time_step_fs is not None and md.time_step_fs <= 0:
-            raise ValueError("validation.long_md.time_step_fs must be greater than zero")
+            raise ValueError("benchmarks.long_md.time_step_fs must be greater than zero")
         if md.save_frequency <= 0:
-            raise ValueError("validation.long_md.save_frequency must be greater than zero")
+            raise ValueError("benchmarks.long_md.save_frequency must be greater than zero")
         if md.max_systems is not None and md.max_systems <= 0:
-            raise ValueError("validation.long_md.max_systems must be greater than zero")
+            raise ValueError("benchmarks.long_md.max_systems must be greater than zero")
 
 
-def evaluations_due(config: ValidationConfig, step: int) -> bool:
-    """Return whether expensive evaluations are scheduled at this global step."""
-    cadence = config.evaluation_every_steps
+def benchmarks_due(config: BenchmarkConfig, step: int) -> bool:
+    """Return whether the downstream benchmarks are scheduled at this global step."""
+    if config.mlip_arena is None and config.long_md is None:
+        return False
+    cadence = config.every_steps
     return cadence is not None and step > 0 and step % cadence == 0
 
 
@@ -512,17 +516,17 @@ def run_mlip_arena_evaluation(
 def run_model_evaluations(
     model: Any,
     metadata: ModelMetadata,
-    config: ValidationConfig,
+    config: BenchmarkConfig,
     *,
     kernel: bool,
     step: int,
 ) -> dict[str, float]:
-    """Save an EMA snapshot and run all configured downstream evaluations."""
+    """Save an EMA snapshot and run all configured downstream benchmarks."""
     metrics: dict[str, float] = {}
-    # Duplicating the device list oversubscribes each GPU: the evaluation
+    # Duplicating the device list oversubscribes each GPU: the benchmark
     # systems are far too small to saturate one, so concurrent (MPS-shared)
     # workers overlap their host and kernel-launch latency.
-    slots = cuda_device_ids() * config.evaluation_workers_per_gpu
+    slots = cuda_device_ids() * config.workers_per_gpu
     arena = config.mlip_arena
     long_md = config.long_md
     if (

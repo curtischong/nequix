@@ -63,6 +63,8 @@ line-length = 100
 
 [tool.uv.sources]
 jax-md = { git = "https://github.com/jax-md/jax-md.git" }
+# neighbour_list leaks ~0.65 kB/call through matscipy 1.2.0; fork carries the fix
+matscipy = { git = "https://github.com/curtischong/matscipy.git", rev = "c39fc285a9bbe944b0be99bd2190402af7d222c8" }
 
 [project.optional-dependencies]
 evals = [

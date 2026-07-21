@@ -1,5 +1,4 @@
 import sys
-from dataclasses import replace
 from types import ModuleType
 
 import pytest
@@ -14,6 +13,7 @@ EXPECTED_RUNS = {
     "nequix-mp-1-pft-no-cotrain": PFTTrainerConfig,
     "nequix-oam-1": TrainerConfig,
     "nequix-oam-1-pft": PFTTrainerConfig,
+    "nequix-oam-foundation": TrainerConfig,
     "nequix-omat-foundation-conservative": TrainerConfig,
     "nequix-omat-foundation-direct": TrainerConfig,
     "nequix-omat-1": TrainerConfig,
@@ -34,12 +34,12 @@ def test_config_values_preserves_typed_config_structure():
     assert config["finetune_from"] == "checkpoints/nequix-omat-1.nqx"
     assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
     assert config["batch_size"] == 128
-    assert config["validation"]["every_steps"] is None
-    assert config["validation"]["evaluation_every_steps"] == 25_000
-    assert config["validation"]["mlip_arena"]["tasks"] == ["diatomics"]
-    assert config["validation"]["mlip_arena"]["elements"] is None
-    assert config["validation"]["long_md"]["tm23_regimes"] == ["melt"]
-    assert config["validation"]["long_md"]["max_systems"] == 8
+    assert config["validation"]["every_steps"] == 20_000
+    assert config["benchmarks"]["every_steps"] == 20_000
+    assert config["benchmarks"]["mlip_arena"]["tasks"] == ["diatomics"]
+    assert config["benchmarks"]["mlip_arena"]["elements"] is None
+    assert config["benchmarks"]["long_md"]["tm23_regimes"] == ["melt"]
+    assert config["benchmarks"]["long_md"]["max_systems"] == 8
 
 
 def test_omat_foundation_curriculum_configs():
@@ -51,12 +51,13 @@ def test_omat_foundation_curriculum_configs():
 
     assert mp.batch_size == 64
     assert omat.batch_size == oam.batch_size == 128
-    assert omat.validation.every_steps == 10_000
+    assert omat.validation.every_steps == 20_000
     assert direct.batch_size == conservative.batch_size == 256
-    assert direct.validation == conservative.validation
-    assert direct.validation == replace(omat.validation, evaluation_every_steps=4_000)
-    assert omat.validation.evaluation_every_steps == 25_000
-    assert oam.validation == replace(omat.validation, every_steps=None)
+    assert direct.validation == conservative.validation == omat.validation
+    assert omat.benchmarks.every_steps == 20_000
+    assert direct.benchmarks == conservative.benchmarks == omat.benchmarks
+    assert oam.validation == omat.validation
+    assert oam.benchmarks == omat.benchmarks
     assert direct.train_frac == conservative.train_frac == 1.0
     assert direct.n_epochs == conservative.n_epochs == 2
     assert direct.force_mode == "direct"

@@ -1,5 +1,6 @@
 from nequix.config.models import (
     ATOMIC_NUMBERS,
+    BenchmarkConfig,
     LongMDEvalConfig,
     MLIPArenaConfig,
     MP_ATOM_ENERGIES,
@@ -18,6 +19,7 @@ from nequix.config.runs import RUNS
 
 __all__ = [
     "ATOMIC_NUMBERS",
+    "BenchmarkConfig",
     "LongMDEvalConfig",
     "MLIPArenaConfig",
     "MP_ATOM_ENERGIES",

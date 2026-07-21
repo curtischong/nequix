@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -6,46 +7,39 @@ from ase import Atoms
 from ase.calculators.lj import LennardJones
 from ase.io import write
 
-from nequix.config import LongMDEvalConfig, MLIPArenaConfig, ValidationConfig
+from nequix.config import BenchmarkConfig, LongMDEvalConfig, MLIPArenaConfig, ValidationConfig
 from nequix.evaluation import (
     _energy_drift,
-    evaluations_due,
+    benchmarks_due,
     load_long_md_systems,
     long_md_protocol,
     run_long_md_evaluation,
+    validate_benchmark_config,
     validate_validation_config,
 )
 
 
 def test_evaluation_config_and_protocol_defaults():
-    assert ValidationConfig().every_steps is None
-    validation = ValidationConfig(
-        every_steps=50,
-        evaluation_every_steps=100,
-        long_md=LongMDEvalConfig(),
-    )
-    validate_validation_config(validation)
-    assert not evaluations_due(ValidationConfig(), 100)
-    assert not evaluations_due(validation, 99)
-    assert evaluations_due(validation, 100)
-    assert evaluations_due(validation, 200)
+    assert ValidationConfig().every_steps == 20_000
+    assert BenchmarkConfig().every_steps == 20_000
+    benchmarks = BenchmarkConfig(every_steps=100, long_md=LongMDEvalConfig())
+    validate_validation_config(ValidationConfig())
+    validate_benchmark_config(benchmarks)
+    assert not benchmarks_due(BenchmarkConfig(), 100)
+    assert not benchmarks_due(benchmarks, 99)
+    assert benchmarks_due(benchmarks, 100)
+    assert benchmarks_due(benchmarks, 200)
+    assert not benchmarks_due(replace(benchmarks, every_steps=None), 100)
     assert long_md_protocol(LongMDEvalConfig(dataset="tm23")) == (20_000, 5.0)
     assert long_md_protocol(LongMDEvalConfig(dataset="md22")) == (100_000, 1.0)
     assert long_md_protocol(LongMDEvalConfig(steps=12, time_step_fs=0.5)) == (12, 0.5)
 
     with pytest.raises(ValueError, match="every_steps"):
         validate_validation_config(ValidationConfig(every_steps=0))
-    with pytest.raises(ValueError, match="must enable"):
-        validate_validation_config(ValidationConfig(evaluation_every_steps=1))
-    with pytest.raises(ValueError, match="is required"):
-        validate_validation_config(ValidationConfig(mlip_arena=MLIPArenaConfig()))
+    with pytest.raises(ValueError, match="every_steps"):
+        validate_benchmark_config(BenchmarkConfig(every_steps=0))
     with pytest.raises(ValueError, match="max_workers"):
-        validate_validation_config(
-            ValidationConfig(
-                evaluation_every_steps=1,
-                mlip_arena=MLIPArenaConfig(max_workers=0),
-            )
-        )
+        validate_benchmark_config(BenchmarkConfig(mlip_arena=MLIPArenaConfig(max_workers=0)))
 
 
 def test_energy_drift_uses_per_ps_slope_after_equilibration():

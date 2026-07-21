@@ -85,15 +85,21 @@ class LongMDEvalConfig:
 
 @dataclass(frozen=True)
 class ValidationConfig:
-    """Dataset and downstream validation run on the EMA weights during training."""
+    """Validation-set loss/MAE computed on the EMA weights during training."""
 
-    every_steps: int | None = None
-    evaluation_every_steps: int | None = None
+    every_steps: int | None = 20_000
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """Downstream benchmarks (MLIP Arena, long MD) run on the EMA weights during training."""
+
+    every_steps: int | None = 20_000
     mlip_arena: MLIPArenaConfig | None = None
     long_md: LongMDEvalConfig | None = None
-    # Evaluation systems are tiny (2-570 atoms), so a single worker leaves an
+    # Benchmark systems are tiny (2-570 atoms), so a single worker leaves an
     # accelerator mostly idle; stacking workers per GPU overlaps their latency.
-    evaluation_workers_per_gpu: int = 4
+    workers_per_gpu: int = 4
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,7 @@ class TrainerConfig:
     loss_type: str = "mae"
     log_every: int = 100
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    benchmarks: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     ema_decay: float = 0.999
     finetune_from: str | None = None
     run_name: str | None = None

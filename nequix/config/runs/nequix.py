@@ -4,13 +4,13 @@ from dataclasses import replace
 
 from nequix.config.models import (
     ATOMIC_NUMBERS,
+    BenchmarkConfig,
     LongMDEvalConfig,
     MLIPArenaConfig,
     MP_ATOM_ENERGIES,
     OAM_ATOM_ENERGIES,
     OMAT_ATOM_ENERGIES,
     TrainerConfig,
-    ValidationConfig,
 )
 
 
@@ -35,9 +35,7 @@ _MP = TrainerConfig(
     n_epochs=100,
 )
 
-_TRAINING_VALIDATION = ValidationConfig(
-    every_steps=10_000,
-    evaluation_every_steps=25_000,
+_TRAINING_BENCHMARKS = BenchmarkConfig(
     mlip_arena=MLIPArenaConfig(
         tasks=("diatomics",),
         # Every element the model supports; the curves are fanned out across
@@ -74,7 +72,7 @@ _OMAT = replace(
     scale=0.8080419656942678,
     shift=-3.513482726416955,
     n_epochs=6,
-    validation=_TRAINING_VALIDATION,
+    benchmarks=_TRAINING_BENCHMARKS,
 )
 
 _OMAT_CURRICULUM_DIRECT = replace(
@@ -87,7 +85,6 @@ _OMAT_CURRICULUM_DIRECT = replace(
     stress_weight=0.0,
     n_epochs=2,
     batch_size=256,
-    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=4_000),
     model_config=replace(
         _OMAT.model_config,
         hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",
@@ -106,7 +103,6 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     force_mode="conservative",
     n_epochs=2,
     batch_size=256,
-    validation=replace(_TRAINING_VALIDATION, evaluation_every_steps=4_000),
     model_config=replace(
         _OMAT.model_config,
         hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",
@@ -137,7 +133,6 @@ _OAM = replace(
     warmup_epochs=0.0,
     warmup_factor=0.0,
     n_epochs=3,
-    validation=replace(_TRAINING_VALIDATION, every_steps=None),
 )
 
 # Stage three of the foundation curriculum: one conservative epoch on the OAM

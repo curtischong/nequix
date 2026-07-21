@@ -24,8 +24,9 @@ from nequix.data import (
     prefetch,
 )
 from nequix.evaluation import (
-    evaluations_due,
+    benchmarks_due,
     run_model_evaluations,
+    validate_benchmark_config,
     validate_validation_config,
 )
 from nequix.hardware import peak_device_memory_bytes
@@ -432,9 +433,11 @@ def train(run_config: TrainerConfig):
     if config.force_mode not in {"conservative", "direct"}:
         raise ValueError(f"force mode {config.force_mode!r} is not supported")
     validation_config = config.validation
+    benchmark_config = config.benchmarks
     if config.batch_size < 1:
         raise ValueError("batch_size must be at least one")
     validate_validation_config(validation_config)
+    validate_benchmark_config(benchmark_config)
 
     train_dataset, val_dataset = load_datasets(config)
     metadata = model_metadata(config)
@@ -690,7 +693,7 @@ def train(run_config: TrainerConfig):
                 last_validation_step_in_epoch = step_in_epoch
                 train_segment_start = time.perf_counter()
 
-            if evaluations_due(validation_config, int(step.item())):
+            if benchmarks_due(benchmark_config, int(step.item())):
                 jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 evaluation_start = time.perf_counter()
@@ -698,7 +701,7 @@ def train(run_config: TrainerConfig):
                 eval_metrics = run_model_evaluations(
                     conservative_backbone(ema_model_single),
                     metadata,
-                    validation_config,
+                    benchmark_config,
                     kernel=config.kernel,
                     step=int(step.item()),
                 )
