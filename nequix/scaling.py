@@ -64,8 +64,6 @@ def make_trial_config(
     if not isinstance(base, TrainerConfig):  # pragma: no cover - registry invariant
         raise TypeError("nequix-omat-1 must be a standard trainer config")
 
-    trial_dir = Path(trial_dir)
-    state_path = trial_dir / "state.pkl"
     name = f"omat1m-{trial.trial_id}"
     return replace(
         base,
@@ -81,9 +79,7 @@ def make_trial_config(
         validation=replace(base.validation, every_steps=None),
         force_mode="conservative",
         finetune_from=None,
-        state_path=str(state_path),
-        resume_from=str(state_path),
-        checkpoint_path=str(trial_dir / "checkpoint.nqx"),
+        checkpoint_root=str(trial_dir),
         model_config=replace(
             base.model_config,
             n_layers=trial.depth,

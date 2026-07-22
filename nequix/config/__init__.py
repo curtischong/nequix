@@ -13,6 +13,7 @@ from nequix.config.models import (
     RunConfig,
     TrainerConfig,
     ValidationConfig,
+    checkpoint_dir,
     config_values,
 )
 from nequix.config.runs import RUNS
@@ -33,5 +34,6 @@ __all__ = [
     "RunConfig",
     "TrainerConfig",
     "ValidationConfig",
+    "checkpoint_dir",
     "config_values",
 ]

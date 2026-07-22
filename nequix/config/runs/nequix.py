@@ -16,9 +16,6 @@ from nequix.config.models import (
 
 _MP = TrainerConfig(
     name="nequix-mp-1",
-    state_path="checkpoints/nequix-mp-1.pkl",
-    resume_from="checkpoints/nequix-mp-1.pkl",
-    checkpoint_path="checkpoints/nequix-mp-1.nqx",
     batch_size=64,
     train_path="data/mptrj.atp",
     valid_frac=0.05,
@@ -55,9 +52,6 @@ _TRAINING_BENCHMARKS = BenchmarkConfig(
 _OMAT = replace(
     _MP,
     name="nequix-omat-1",
-    state_path="checkpoints/nequix-omat-1-jax.pkl",
-    resume_from="checkpoints/nequix-omat-1-jax.pkl",
-    checkpoint_path="checkpoints/nequix-omat-1.nqx",
     train_path="data/omat/train.atp",
     valid_frac=None,
     valid_path="data/omat/val.atp",
@@ -78,9 +72,6 @@ _OMAT = replace(
 _OMAT_CURRICULUM_DIRECT = replace(
     _OMAT,
     name="nequix-omat-foundation-direct",
-    state_path="checkpoints/nequix-omat-foundation-direct.pkl",
-    resume_from="checkpoints/nequix-omat-foundation-direct.pkl",
-    checkpoint_path="checkpoints/nequix-omat-foundation-direct.nqx",
     force_mode="direct",
     stress_weight=0.0,
     n_epochs=2,
@@ -96,10 +87,7 @@ _OMAT_CURRICULUM_DIRECT = replace(
 _OMAT_CURRICULUM_CONSERVATIVE = replace(
     _OMAT,
     name="nequix-omat-foundation-conservative",
-    state_path="checkpoints/nequix-omat-foundation-conservative.pkl",
-    resume_from="checkpoints/nequix-omat-foundation-conservative.pkl",
-    finetune_from="checkpoints/nequix-omat-foundation-direct.nqx",
-    checkpoint_path="checkpoints/nequix-omat-foundation-conservative.nqx",
+    finetune_from="checkpoints/nequix-omat-foundation-direct/best.pkl",
     force_mode="conservative",
     n_epochs=2,
     # conservative forces + stress differentiate through the network, so the
@@ -122,10 +110,7 @@ OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 _OAM = replace(
     _OMAT,
     name="nequix-oam-1",
-    state_path="checkpoints/nequix-oam-1-jax.pkl",
-    resume_from="checkpoints/nequix-oam-1-jax.pkl",
-    finetune_from="checkpoints/nequix-omat-1.nqx",
-    checkpoint_path="checkpoints/nequix-oam-1.nqx",
+    finetune_from="checkpoints/nequix-omat-1/best.pkl",
     train_path=OAM_TRAIN_PATHS,
     valid_path="data/salex/val.atp",
     dataset_name="oam",
@@ -143,10 +128,7 @@ _OAM = replace(
 _OAM_FOUNDATION = replace(
     _OMAT_CURRICULUM_CONSERVATIVE,
     name="nequix-oam-foundation",
-    state_path="checkpoints/nequix-oam-foundation.pkl",
-    resume_from="checkpoints/nequix-oam-foundation.pkl",
-    finetune_from="checkpoints/nequix-omat-foundation-conservative.nqx",
-    checkpoint_path="checkpoints/nequix-oam-foundation.nqx",
+    finetune_from="checkpoints/nequix-omat-foundation-conservative/best.pkl",
     train_path=OAM_TRAIN_PATHS,
     valid_path="data/salex/val.atp",
     dataset_name="oam",

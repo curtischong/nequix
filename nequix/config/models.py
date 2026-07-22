@@ -165,10 +165,8 @@ class TrainerConfig:
     max_n_nodes: int
     scale: float
     shift: float
-    state_path: str
-    resume_from: str
-    checkpoint_path: str
     batch_size: int
+    checkpoint_root: str = "checkpoints"
     model_config: NequixConfig = field(default_factory=NequixConfig)
     kernel: bool = True
     valid_frac: float | None = None
@@ -219,8 +217,6 @@ class TrainerConfig:
 @dataclass
 class PFTTrainerConfig:
     name: str
-    state_path: str
-    resume_from: str
     finetune_from: str
     train_path: str
     val_path: str
@@ -234,6 +230,7 @@ class PFTTrainerConfig:
     extra_max_n_edges: int
     extra_max_n_nodes: int
     extra_batch_size: int
+    checkpoint_root: str = "checkpoints"
     extra_val_frac: float | None = None
     extra_val_path: str | None = None
     extra_train_steps: int = 4
@@ -261,6 +258,11 @@ class PFTTrainerConfig:
 
 
 RunConfig = TrainerConfig | PFTTrainerConfig
+
+
+def checkpoint_dir(config: RunConfig) -> Path:
+    """Per-run folder holding every step_*.pkl plus the latest.pkl/best.pkl symlinks."""
+    return Path(config.checkpoint_root) / config.name
 
 
 def config_values(config: RunConfig) -> dict[str, Any]:

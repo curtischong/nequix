@@ -1,7 +1,6 @@
 import functools
 import math
 import os
-import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -15,7 +14,7 @@ import optax
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
-from nequix.config import ModelMetadata, TrainerConfig, config_values
+from nequix.config import ModelMetadata, TrainerConfig, checkpoint_dir, config_values
 from nequix.data import (
     AtomPackDataset,
     ConcatDataset,
@@ -33,15 +32,13 @@ from nequix.hardware import peak_device_memory_bytes
 from nequix.model import (
     DirectForceNequix,
     conservative_backbone,
-    load_model,
     model_from_metadata,
     replace_normalization,
-    save_model,
     weight_decay_mask,
 )
 from nequix.run_summary import build_run_summary, print_run_summary_csv
 
-TRAINING_STATE_FORMAT = "nequix-training-state-v1"
+TRAINING_STATE_FORMAT = "nequix-training-state-v2"
 
 
 def _format_percentage(fraction: float) -> str:
@@ -223,8 +220,13 @@ def evaluate(
     return total_metrics
 
 
+def unreplicate(tree):
+    """Return the single-device copy of a pmap-replicated pytree."""
+    return jax.tree.map(lambda x: x[0], tree)
+
+
 def save_training_state(
-    paths,
+    path,
     model,
     ema_model,
     optim,
@@ -236,7 +238,7 @@ def save_training_state(
     training_runtime_seconds=0.0,
     validation_runtime_seconds=0.0,
 ):
-    """Serialize the training state once and write it to every path."""
+    """Serialize the complete, unreplicated training state to ``path``."""
     state = {
         "format": TRAINING_STATE_FORMAT,
         "model": model,
@@ -250,11 +252,57 @@ def save_training_state(
         "training_runtime_seconds": training_runtime_seconds,
         "validation_runtime_seconds": validation_runtime_seconds,
     }
-    data = cloudpickle.dumps(state)
-    for path in paths:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(cloudpickle.dumps(state))
+
+
+def _repoint_symlink(link: Path, target: Path) -> None:
+    """Atomically point ``link`` at a sibling checkpoint file."""
+    tmp = link.with_name(link.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target.name)
+    tmp.replace(link)
+
+
+def save_checkpoint(
+    run_dir,
+    model,
+    ema_model,
+    optim,
+    opt_state,
+    step,
+    epoch,
+    best_val_loss,
+    *,
+    best=False,
+    wandb_run_id=None,
+    training_runtime_seconds=0.0,
+    validation_runtime_seconds=0.0,
+) -> Path:
+    """Write a step-stamped checkpoint and repoint the latest.pkl/best.pkl symlinks.
+
+    Every checkpoint is kept as ``step_<global step>.pkl``; ``latest.pkl`` always
+    points at the newest one and ``best.pkl`` at the best-validation one.
+    """
+    path = Path(run_dir) / f"step_{int(step):09d}.pkl"
+    save_training_state(
+        path,
+        model,
+        ema_model,
+        optim,
+        opt_state,
+        step,
+        epoch,
+        best_val_loss,
+        wandb_run_id=wandb_run_id,
+        training_runtime_seconds=training_runtime_seconds,
+        validation_runtime_seconds=validation_runtime_seconds,
+    )
+    _repoint_symlink(path.with_name("latest.pkl"), path)
+    if best:
+        _repoint_symlink(path.with_name("best.pkl"), path)
+    return path
 
 
 def load_training_state(path):
@@ -301,6 +349,19 @@ def model_metadata(config: TrainerConfig) -> ModelMetadata:
         avg_n_neighbors=config.avg_n_neighbors,
         model_config=config.model_config,
     )
+
+
+def same_architecture(a, b) -> bool:
+    """Whether two models have identical parameter counts, shapes, and dtypes.
+
+    Model statics hold callables that only compare by identity, so full pytree
+    equality is too strict even for two identical builds.
+    """
+    arrays_a = jax.tree.leaves(eqx.filter(a, eqx.is_array))
+    arrays_b = jax.tree.leaves(eqx.filter(b, eqx.is_array))
+    if len(arrays_a) != len(arrays_b):
+        return False
+    return all(x.shape == y.shape and x.dtype == y.dtype for x, y in zip(arrays_a, arrays_b))
 
 
 def attach_direct_force_head(model, config: TrainerConfig) -> DirectForceNequix:
@@ -474,19 +535,20 @@ def train(run_config: TrainerConfig):
     )
 
     model = model_from_metadata(metadata, kernel=config.kernel, key=jax.random.key(config.seed))
-    resume_exists = Path(config.resume_from).exists()
+    run_dir = checkpoint_dir(config)
+    resume_path = run_dir / "latest.pkl"
+    resume_exists = resume_path.exists()
     if config.finetune_from is not None and Path(config.finetune_from).exists():
-        model, checkpoint_metadata = load_model(config.finetune_from, config.kernel)
-        if checkpoint_metadata.atomic_numbers != config.atomic_numbers:
-            raise ValueError("fine-tuning checkpoint and run config use different elements")
-        if checkpoint_metadata.model_config != config.model_config:
-            raise ValueError("fine-tuning checkpoint and run config use different architectures")
-        model = replace_normalization(
-            model,
+        _, finetune_model, *_ = load_training_state(config.finetune_from)
+        finetune_model = replace_normalization(
+            conservative_backbone(finetune_model),
             atom_energies=metadata.atom_energies,
             shift=config.shift,
             scale=config.scale,
         )
+        if not same_architecture(finetune_model, model):
+            raise ValueError("fine-tuning checkpoint and run config use different architectures")
+        model = finetune_model
     elif config.finetune_from is not None and not resume_exists:
         raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config.finetune_from}")
 
@@ -503,9 +565,7 @@ def train(run_config: TrainerConfig):
 
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
-    model = jax.device_put_replicated(model, list(jax.devices()))
-    opt_state = jax.device_put_replicated(opt_state, list(jax.devices()))
-    ema_model = jax.tree.map(lambda x: x.copy(), model)  # copy model
+    ema_model = model
     step = jnp.array(0)
     start_epoch = 0
     best_val_loss = float("inf")
@@ -527,7 +587,12 @@ def train(run_config: TrainerConfig):
             wandb_run_id,
             training_runtime_seconds,
             validation_runtime_seconds,
-        ) = load_training_state(config.resume_from)
+        ) = load_training_state(resume_path)
+
+    devices = list(jax.devices())
+    model = jax.device_put_replicated(model, devices)
+    ema_model = jax.device_put_replicated(ema_model, devices)
+    opt_state = jax.device_put_replicated(opt_state, devices)
 
     run_name = wandb_run_name(config)
     wandb_config = {
@@ -579,7 +644,7 @@ def train(run_config: TrainerConfig):
         nonlocal best_val_loss, final_val_metrics, validation_runtime_seconds
 
         validation_start = time.perf_counter()
-        ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
+        ema_model_single = unreplicate(ema_model)
         val_metrics = evaluate(
             ema_model_single,
             val_loader,
@@ -591,9 +656,20 @@ def train(run_config: TrainerConfig):
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            checkpoint_model = conservative_backbone(ema_model_single)
-            save_model(config.checkpoint_path, checkpoint_model, metadata)
-            shutil.copyfile(config.checkpoint_path, Path(wandb.run.dir) / "checkpoint.nqx")
+            save_checkpoint(
+                run_dir,
+                unreplicate(model),
+                ema_model_single,
+                optim,
+                unreplicate(opt_state),
+                step,
+                epoch,
+                best_val_loss,
+                best=True,
+                wandb_run_id=wandb_run_id,
+                training_runtime_seconds=training_seconds,
+                validation_runtime_seconds=validation_runtime_seconds,
+            )
 
         validation_runtime_seconds += time.perf_counter() - validation_start
 
@@ -697,7 +773,7 @@ def train(run_config: TrainerConfig):
                 jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 evaluation_start = time.perf_counter()
-                ema_model_single = jax.tree.map(lambda x: x[0], ema_model)
+                ema_model_single = unreplicate(ema_model)
                 eval_metrics = run_model_evaluations(
                     conservative_backbone(ema_model_single),
                     metadata,
@@ -721,12 +797,12 @@ def train(run_config: TrainerConfig):
         if last_validation_step_in_epoch != step_in_epoch:
             run_validation(epoch, step_in_epoch, training_runtime_seconds)
 
-        save_training_state(
-            (Path(wandb.run.dir) / "state.pkl", config.state_path),
-            model,
-            ema_model,
+        save_checkpoint(
+            run_dir,
+            unreplicate(model),
+            unreplicate(ema_model),
             optim,
-            opt_state,
+            unreplicate(opt_state),
             step,
             epoch + 1,
             best_val_loss,

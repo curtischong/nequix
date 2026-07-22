@@ -55,7 +55,7 @@ def test_primary_grid_and_trial_config(tmp_path):
     assert config.finetune_from is None
     assert config.model_config.n_layers == 2
     assert config.model_config.hidden_irreps == smallest.hidden_irreps
-    assert config.resume_from == config.state_path
+    assert config.checkpoint_root == str(tmp_path / smallest.trial_id)
     assert config.wandb_mode == "disabled"
     assert config.kernel is False
 

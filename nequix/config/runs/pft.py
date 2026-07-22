@@ -8,8 +8,6 @@ from nequix.config.runs.nequix import OAM_TRAIN_PATHS
 
 _MP_PFT = PFTTrainerConfig(
     name="nequix-mp-1-pft",
-    state_path="checkpoints/nequix-mp-1-pft.pkl",
-    resume_from="checkpoints/nequix-mp-1-pft.pkl",
     finetune_from="checkpoints/nequix-mp-1.nqx",
     train_path="data/pbe-mdr/train.atp",
     val_path="data/pbe-mdr/val.atp",
@@ -29,8 +27,6 @@ _MP_PFT = PFTTrainerConfig(
 _MP_PFT_NO_COTRAIN = replace(
     _MP_PFT,
     name="nequix-mp-1-pft-no-cotrain",
-    state_path="checkpoints/nequix-mp-1-pft-nocotrain.pkl",
-    resume_from="checkpoints/nequix-mp-1-pft-nocotrain.pkl",
     extra_train_steps=0,
     n_epochs=200,
     energy_weight=20.0,
@@ -39,8 +35,6 @@ _MP_PFT_NO_COTRAIN = replace(
 _OAM_PFT = replace(
     _MP_PFT,
     name="nequix-oam-1-pft",
-    state_path="checkpoints/nequix-oam-1-pft.pkl",
-    resume_from="checkpoints/nequix-oam-1-pft.pkl",
     finetune_from="checkpoints/nequix-oam-1.nqx",
     extra_train_path=OAM_TRAIN_PATHS,
     extra_val_frac=None,

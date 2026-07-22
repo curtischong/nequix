@@ -2,14 +2,13 @@ import itertools
 import time
 from collections import defaultdict
 from functools import partial
-from pathlib import Path
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jraph
 import optax
-from nequix.config import PFTTrainerConfig, config_values
+from nequix.config import PFTTrainerConfig, checkpoint_dir, config_values
 from nequix.hardware import peak_device_memory_bytes
 from nequix.data import (
     AtomPackDataset,
@@ -17,11 +16,11 @@ from nequix.data import (
     DataLoader,
     prefetch,
 )
-from nequix.model import load_model, node_graph_idx, save_model, weight_decay_mask
+from nequix.model import load_model, node_graph_idx, weight_decay_mask
 from nequix.pft.data import PhononDataset
 from nequix.run_summary import build_run_summary, print_run_summary_csv
 from nequix.train import evaluate as efs_evaluate
-from nequix.train import load_training_state, loss as efs_loss, save_training_state
+from nequix.train import load_training_state, loss as efs_loss, save_checkpoint
 
 import wandb
 
@@ -354,7 +353,9 @@ def train(run_config: PFTTrainerConfig):
     final_val_metrics = {}
     final_extra_val_metrics = {}
 
-    if Path(config.resume_from).exists():
+    run_dir = checkpoint_dir(config)
+    resume_path = run_dir / "latest.pkl"
+    if resume_path.exists():
         (
             model,
             ema_model,
@@ -366,7 +367,7 @@ def train(run_config: PFTTrainerConfig):
             wandb_run_id,
             training_runtime_seconds,
             validation_runtime_seconds,
-        ) = load_training_state(config.resume_from)
+        ) = load_training_state(resume_path)
 
     wandb_init_kwargs = {
         "entity": config.wandb_entity,
@@ -434,9 +435,9 @@ def train(run_config: PFTTrainerConfig):
                 config.checkpoint_grad_energy,
             )
 
-            if val_metrics["loss"] < best_val_loss:
+            improved = val_metrics["loss"] < best_val_loss
+            if improved:
                 best_val_loss = val_metrics["loss"]
-                save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model, metadata)
 
             final_val_metrics = {key: value.mean().item() for key, value in val_metrics.items()}
             logs = {f"val/{key}": value for key, value in final_val_metrics.items()}
@@ -461,8 +462,8 @@ def train(run_config: PFTTrainerConfig):
             print(f"epoch {epoch:03d} extra val metrics: {extra_logs}")
 
             validation_runtime_seconds += time.perf_counter() - validation_start
-            save_training_state(
-                (Path(wandb.run.dir) / "state.pkl", config.state_path),
+            save_checkpoint(
+                run_dir,
                 model,
                 ema_model,
                 optim,
@@ -470,6 +471,7 @@ def train(run_config: PFTTrainerConfig):
                 step,
                 epoch + 1,
                 best_val_loss,
+                best=improved,
                 wandb_run_id=wandb_run_id,
                 training_runtime_seconds=training_runtime_seconds,
                 validation_runtime_seconds=validation_runtime_seconds,

@@ -4,7 +4,7 @@ from types import ModuleType
 import pytest
 
 from nequix.cli import main, run
-from nequix.config import PFTTrainerConfig, RUNS, TrainerConfig, config_values
+from nequix.config import PFTTrainerConfig, RUNS, TrainerConfig, checkpoint_dir, config_values
 
 
 EXPECTED_RUNS = {
@@ -31,8 +31,8 @@ def test_config_values_preserves_typed_config_structure():
     assert config["model_config"]["hidden_irreps"] == "128x0e + 64x1o + 32x2e + 32x3o"
     assert config["train_path"] == ["data/mptrj.atp"] * 8 + ["data/salex/train.atp"]
     assert config["atomic_numbers"][:3] == [1, 2, 3]
-    assert config["finetune_from"] == "checkpoints/nequix-omat-1.nqx"
-    assert config["resume_from"] == "checkpoints/nequix-oam-1-jax.pkl"
+    assert config["finetune_from"] == "checkpoints/nequix-omat-1/best.pkl"
+    assert config["checkpoint_root"] == "checkpoints"
     assert config["batch_size"] == 128
     assert config["validation"]["every_steps"] == 20_000
     assert config["benchmarks"]["every_steps"] == 20_000
@@ -64,8 +64,8 @@ def test_omat_foundation_curriculum_configs():
     assert direct.force_mode == "direct"
     assert direct.stress_weight == 0.0
     assert conservative.force_mode == "conservative"
-    assert conservative.finetune_from == direct.checkpoint_path
-    assert conservative.resume_from != direct.resume_from
+    assert conservative.finetune_from == str(checkpoint_dir(direct) / "best.pkl")
+    assert checkpoint_dir(conservative) != checkpoint_dir(direct)
     assert direct.model_config == conservative.model_config
     assert direct.model_config.hidden_irreps == "195x0e + 97x1o + 49x2e + 49x3o"
     assert direct.model_config.lmax == 4
