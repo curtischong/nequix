@@ -205,10 +205,7 @@ class AseDBDataset(Dataset):
 
 def _dataloader_worker(dataset, index_queue, output_queue):
     while True:
-        try:
-            index = index_queue.get(timeout=0)
-        except queue.Empty:
-            continue
+        index = index_queue.get()
         if index is None:
             break
         output_queue.put((index, dataset[index]))
@@ -273,6 +270,18 @@ class DataLoader:
             worker.start()
             self.workers.append(worker)
 
+    def shutdown(self):
+        if not self._started:
+            return
+        for _ in self.workers:
+            self.index_queue.put(None)
+        for worker in self.workers:
+            worker.join()
+        self.index_queue.close()
+        self.output_queue.close()
+        self.workers = []
+        self._started = False
+
     def set_epoch(self, epoch):
         self.rng = np.random.default_rng(seed=hash((self.seed, epoch)) % 2**32)
 
@@ -299,11 +308,7 @@ class DataLoader:
                 del cache[real_idx]
             else:
                 while True:
-                    try:
-                        (index, data) = self.output_queue.get(timeout=0)
-                    except queue.Empty:
-                        continue
-
+                    (index, data) = self.output_queue.get()
                     if index == real_idx:
                         item = data
                         break
