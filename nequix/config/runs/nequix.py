@@ -102,7 +102,9 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
     checkpoint_path="checkpoints/nequix-omat-foundation-conservative.nqx",
     force_mode="conservative",
     n_epochs=2,
-    batch_size=256,
+    # conservative forces + stress differentiate through the network, so the
+    # direct stage's 256 OOMs; 240 peaks at 57.4GB of the 63.8GB pool on H100
+    batch_size=240,
     model_config=replace(
         _OMAT.model_config,
         hidden_irreps="195x0e + 97x1o + 49x2e + 49x3o",

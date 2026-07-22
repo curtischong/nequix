@@ -499,6 +499,9 @@ def train(run_config: PFTTrainerConfig):
         }
         validation_runtime_seconds += time.perf_counter() - validation_start
 
+    for loader in (train_loader, val_loader, extra_train_loader, extra_val_loader):
+        loader.shutdown()
+
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary.update(
             {

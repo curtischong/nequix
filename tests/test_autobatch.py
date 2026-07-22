@@ -58,6 +58,24 @@ def test_data_loader_uses_ordered_jraph_dynamic_batches():
     assert identifiers == [[0], [1, 2], [3, 4]]
 
 
+def test_data_loader_shutdown_stops_workers():
+    graphs = [_graph(index, n_node) for index, n_node in enumerate((6, 4, 5, 3, 2))]
+    loader = DataLoader(
+        graphs,
+        max_n_nodes=9,
+        max_n_edges=0,
+        avg_n_nodes=0,
+        avg_n_edges=0,
+        batch_size=2,
+        num_workers=2,
+    )
+    assert sum(1 for _ in loader) == 3
+    workers = list(loader.workers)
+    loader.shutdown()
+    assert all(not worker.is_alive() for worker in workers)
+    assert not loader._started
+
+
 def test_parallel_loader_uses_only_complete_device_groups():
     batches = [_padded([_graph(index, 1)], n_graph=2, n_node=2) for index in range(3)]
 

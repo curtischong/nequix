@@ -52,7 +52,8 @@ def test_omat_foundation_curriculum_configs():
     assert mp.batch_size == 64
     assert omat.batch_size == oam.batch_size == 128
     assert omat.validation.every_steps == 20_000
-    assert direct.batch_size == conservative.batch_size == 256
+    assert direct.batch_size == 256
+    assert conservative.batch_size == 240
     assert direct.validation == conservative.validation == omat.validation
     assert omat.benchmarks.every_steps == 20_000
     assert direct.benchmarks == conservative.benchmarks == omat.benchmarks

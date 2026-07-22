@@ -84,6 +84,8 @@ torch-sim = [
 ]
 mbd = [
   "matbench-discovery>=1.3.1; python_version >= '3.11'",
+  # older pymatviz resolutions are incompatible with plotly 6
+  "pymatviz>=0.18.0; python_version >= '3.11'",
 ]
 oeq = [
   # You need to install openequivariance_extjax separately

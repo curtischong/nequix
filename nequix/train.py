@@ -738,6 +738,9 @@ def train(run_config: TrainerConfig):
     if not final_val_metrics:
         run_validation(max(start_epoch - 1, 0), 0, training_runtime_seconds)
 
+    per_device_train_loader.shutdown()
+    val_loader.shutdown()
+
     final_runtime_metrics = runtime_metrics(training_runtime_seconds)
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary.update(final_runtime_metrics)
