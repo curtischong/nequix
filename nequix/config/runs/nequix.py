@@ -107,6 +107,23 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
 # sAlex, and the WBM test set, so it only enters through pre-training.
 OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
+# Stats for the 8x MPtrj + sAlex mix from
+# scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp
+# --atom-energies oam --cutoff 6.0 --sample-frac 0.005; the script's
+# default cutoff is 5.0, not the model's 6.0. The cutoff-independent
+# shift/scale/node stats come from the full-dataset run. Sampled runs
+# underestimate max_n_*; MPtrj is in the mix, so its full-dataset max at
+# this cutoff is a floor.
+_OAM_MIX_STATS = dict(
+    avg_n_edges=1264.9728203440332,
+    avg_n_neighbors=51.27093835667581,
+    avg_n_nodes=21.74594045063158,
+    max_n_edges=34704,
+    max_n_nodes=444,
+    shift=-4.089559490159454,
+    scale=0.7653674612006598,
+)
+
 _OAM = replace(
     _OMAT,
     name="nequix-oam-1",
@@ -115,7 +132,10 @@ _OAM = replace(
     valid_path="data/salex/val.atp",
     dataset_name="oam",
     atom_energies=OAM_ATOM_ENERGIES,
-    shift=-4.3250839528546265,
+    **_OAM_MIX_STATS,
+    # 74 x 1265 avg edges keeps the OMat stage's edge budget (128 x 736) and
+    # per-step memory.
+    batch_size=74,
     learning_rate=0.003,
     warmup_epochs=0.0,
     warmup_factor=0.0,
@@ -133,20 +153,7 @@ _OAM_FOUNDATION = replace(
     valid_path="data/salex/val.atp",
     dataset_name="oam",
     atom_energies=OAM_ATOM_ENERGIES,
-    # Stats for the 8x MPtrj + sAlex mix from
-    # scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp
-    # --atom-energies oam --cutoff 6.0 --sample-frac 0.005; the script's
-    # default cutoff is 5.0, not the model's 6.0. The cutoff-independent
-    # shift/scale/node stats come from the full-dataset run.
-    avg_n_edges=1264.9728203440332,
-    avg_n_neighbors=51.27093835667581,
-    avg_n_nodes=21.74594045063158,
-    # Sampled runs underestimate max_n_*; MPtrj is in the mix, so its
-    # full-dataset max at this cutoff is a floor.
-    max_n_edges=34704,
-    max_n_nodes=444,
-    shift=-4.089559490159454,
-    scale=0.7653674612006598,
+    **_OAM_MIX_STATS,
     # 140 x 1265 avg edges matches the conservative stage's probe-confirmed
     # edge budget (240 x 736), keeping per-step memory at its 57.4GB peak.
     batch_size=140,

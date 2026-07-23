@@ -33,7 +33,7 @@ def test_config_values_preserves_typed_config_structure():
     assert config["atomic_numbers"][:3] == [1, 2, 3]
     assert config["finetune_from"] == "checkpoints/nequix-omat-1/best.pkl"
     assert config["checkpoint_root"] == "checkpoints"
-    assert config["batch_size"] == 128
+    assert config["batch_size"] == 74
     assert config["validation"]["every_steps"] == 20_000
     assert config["benchmarks"]["every_steps"] == 20_000
     assert config["benchmarks"]["mlip_arena"]["tasks"] == ["diatomics"]
@@ -50,7 +50,8 @@ def test_omat_foundation_curriculum_configs():
     conservative = RUNS["nequix-omat-foundation-conservative"]
 
     assert mp.batch_size == 64
-    assert omat.batch_size == oam.batch_size == 128
+    assert omat.batch_size == 128
+    assert oam.batch_size == 74
     assert omat.validation.every_steps == 20_000
     assert direct.batch_size == 256
     assert conservative.batch_size == 240
