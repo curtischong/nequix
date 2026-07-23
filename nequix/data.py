@@ -319,15 +319,18 @@ class DataLoader:
         if self._started:
             return
 
-        # NB: we can use fork here, only because we are not using jax
-        # in the workers (data is just numpy arrays)
-        # multiprocessing.set_start_method("spawn", force=True)
+        # Workers start once training is already iterating, by which point JAX
+        # has initialized its multithreaded runtime. Forking that runtime
+        # deadlocks the workers (and the parent) on inherited locks, so fork
+        # from a clean forkserver instead. The dataset reopens its database per
+        # process (see __getstate__), so it pickles cheaply to each worker.
         self._started = True
-        self.index_queue = multiprocessing.Queue()
-        self.output_queue = multiprocessing.Queue()
+        ctx = multiprocessing.get_context("forkserver")
+        self.index_queue = ctx.Queue()
+        self.output_queue = ctx.Queue()
 
         for _ in range(self.num_workers):
-            worker = multiprocessing.Process(
+            worker = ctx.Process(
                 target=_dataloader_worker,
                 args=(self.dataset, self.index_queue, self.output_queue),
             )
