@@ -23,7 +23,9 @@ from nequix.data import (
     prefetch,
 )
 from nequix.evaluation import (
+    EvaluationWave,
     benchmarks_due,
+    launch_model_evaluations,
     run_model_evaluations,
     validate_benchmark_config,
     validate_validation_config,
@@ -686,7 +688,25 @@ def train(run_config: TrainerConfig):
         )
         wandb_sync()
 
+    def log_model_evaluations(
+        eval_metrics: dict[str, float],
+        trigger_step: int,
+        epoch: int,
+        step_in_epoch: int,
+        training_seconds: float,
+    ) -> None:
+        logs = {f"eval/{key}": value for key, value in eval_metrics.items()}
+        logs["eval/trigger_step"] = trigger_step
+        logs["epoch"] = epoch
+        logs["step_in_epoch"] = step_in_epoch
+        logs.update(runtime_metrics(training_seconds))
+        global_step = int(step.item())
+        wandb.log(logs, step=global_step)
+        print(f"model evaluations from step {trigger_step} logged at step {global_step}: {logs}")
+        wandb_sync()
+
     train_step = make_train_step(optim, config)
+    pending_evaluation: EvaluationWave | None = None
 
     for epoch in range(start_epoch, config.n_epochs):
         train_segment_start = time.perf_counter()
@@ -769,31 +789,72 @@ def train(run_config: TrainerConfig):
                 last_validation_step_in_epoch = step_in_epoch
                 train_segment_start = time.perf_counter()
 
+            if pending_evaluation is not None:
+                eval_metrics = pending_evaluation.poll()
+                if eval_metrics is not None:
+                    log_model_evaluations(
+                        eval_metrics,
+                        pending_evaluation.step,
+                        epoch,
+                        step_in_epoch,
+                        training_runtime_seconds + time.perf_counter() - train_segment_start,
+                    )
+                    pending_evaluation = None
+
             if benchmarks_due(benchmark_config, int(step.item())):
                 jax.block_until_ready(model)
                 training_runtime_seconds += time.perf_counter() - train_segment_start
                 evaluation_start = time.perf_counter()
-                ema_model_single = unreplicate(ema_model)
-                eval_metrics = run_model_evaluations(
-                    conservative_backbone(ema_model_single),
+                if pending_evaluation is not None:
+                    log_model_evaluations(
+                        pending_evaluation.wait(),
+                        pending_evaluation.step,
+                        epoch,
+                        step_in_epoch,
+                        training_runtime_seconds,
+                    )
+                    pending_evaluation = None
+                ema_backbone = conservative_backbone(unreplicate(ema_model))
+                trigger_step = int(step.item())
+                # The wave runs concurrently with training in pinned worker
+                # subprocesses; its metrics are polled for and logged once
+                # every worker exits.
+                pending_evaluation = launch_model_evaluations(
+                    ema_backbone,
                     metadata,
                     benchmark_config,
                     kernel=config.kernel,
-                    step=int(step.item()),
+                    step=trigger_step,
                 )
+                if pending_evaluation is None:
+                    log_model_evaluations(
+                        run_model_evaluations(
+                            ema_backbone,
+                            metadata,
+                            benchmark_config,
+                            kernel=config.kernel,
+                            step=trigger_step,
+                        ),
+                        trigger_step,
+                        epoch,
+                        step_in_epoch,
+                        training_runtime_seconds,
+                    )
                 evaluation_runtime_seconds += time.perf_counter() - evaluation_start
-                logs = {f"eval/{key}": value for key, value in eval_metrics.items()}
-                logs["epoch"] = epoch
-                logs["step_in_epoch"] = step_in_epoch
-                logs.update(runtime_metrics(training_runtime_seconds))
-                wandb.log(logs, step=int(step.item()))
-                print(f"model evaluations at step: {step}, logs: {logs}")
-                wandb_sync()
                 train_segment_start = time.perf_counter()
             start_time = time.perf_counter()
 
         jax.block_until_ready(model)
         training_runtime_seconds += time.perf_counter() - train_segment_start
+        if pending_evaluation is not None:
+            log_model_evaluations(
+                pending_evaluation.wait(),
+                pending_evaluation.step,
+                epoch,
+                step_in_epoch,
+                training_runtime_seconds,
+            )
+            pending_evaluation = None
         if last_validation_step_in_epoch != step_in_epoch:
             run_validation(epoch, step_in_epoch, training_runtime_seconds)
 

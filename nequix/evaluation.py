@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +176,10 @@ def _mps_environment() -> dict[str, str]:
     Without MPS, worker processes sharing a GPU time-slice their contexts and
     the tiny evaluation kernels serialize; MPS lets them execute concurrently.
     The private pipe directory keeps the training process outside MPS.
+    Set NEQUIX_DISABLE_MPS=1 to run the workers without MPS.
     """
+    if os.environ.get("NEQUIX_DISABLE_MPS"):
+        return {}
     control = shutil.which("nvidia-cuda-mps-control")
     if control is None:
         return {}
@@ -191,12 +194,14 @@ def _mps_environment() -> dict[str, str]:
     return {"CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY}
 
 
-def _run_evaluation_workers(payloads: Sequence[dict[str, Any]], scratch_dir: Path) -> None:
-    """Run one pinned-GPU subprocess per payload and wait for all of them."""
+def _spawn_evaluation_workers(
+    payloads: Sequence[dict[str, Any]], scratch_dir: Path
+) -> list[tuple[subprocess.Popen, Path]]:
+    """Start one pinned-GPU subprocess per payload."""
     scratch_dir.mkdir(parents=True, exist_ok=True)
     shared_env = _mps_environment() | {
-        # Workers share their GPU with the paused training process, so they
-        # must allocate on demand instead of claiming the XLA default pool.
+        # Workers share their GPU with the training process, so they must
+        # allocate on demand instead of claiming the XLA default pool.
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         # Identical jit programs recompile in every worker on every trigger
         # without a persistent cache.
@@ -217,6 +222,10 @@ def _run_evaluation_workers(payloads: Sequence[dict[str, Any]], scratch_dir: Pat
                 stderr=subprocess.STDOUT,
             )
         processes.append((process, log_path))
+    return processes
+
+
+def _wait_for_workers(processes: Sequence[tuple[subprocess.Popen, Path]]) -> None:
     failures = [
         f"{log_path}:\n{log_path.read_text()[-2000:]}"
         for process, log_path in processes
@@ -224,6 +233,11 @@ def _run_evaluation_workers(payloads: Sequence[dict[str, Any]], scratch_dir: Pat
     ]
     if failures:
         raise RuntimeError("evaluation workers failed:\n" + "\n".join(failures))
+
+
+def _run_evaluation_workers(payloads: Sequence[dict[str, Any]], scratch_dir: Path) -> None:
+    """Run one pinned-GPU subprocess per payload and wait for all of them."""
+    _wait_for_workers(_spawn_evaluation_workers(payloads, scratch_dir))
 
 
 def _energy_drift(energies: Sequence[float], times_ps: Sequence[float]) -> float:
@@ -513,6 +527,97 @@ def run_mlip_arena_evaluation(
     return summary
 
 
+@dataclass
+class EvaluationWave:
+    """A wave of evaluation workers running concurrently with training."""
+
+    step: int
+    processes: list[tuple[subprocess.Popen, Path]]
+    arena_dir: Path
+    task_dir: Path
+    md_dir: Path
+    md_payloads: list[dict[str, Any]]
+    started: float
+
+    def poll(self) -> dict[str, float] | None:
+        """The wave's metrics once every worker has exited, None until then."""
+        if any(process.poll() is None for process, _ in self.processes):
+            return None
+        return self._collect()
+
+    def wait(self) -> dict[str, float]:
+        for process, _ in self.processes:
+            process.wait()
+        return self._collect()
+
+    def _collect(self) -> dict[str, float]:
+        from mlip_arena.flows.diatomics import analyze
+
+        _wait_for_workers(self.processes)
+        wave_seconds = time.perf_counter() - self.started
+        arena_summary = _dataframe_summary(analyze(self.task_dir))
+        arena_summary["runtime_seconds"] = wave_seconds
+        (self.arena_dir / "summary.json").write_text(
+            json.dumps(
+                {f"diatomics/{key}": value for key, value in arena_summary.items()},
+                indent=2,
+                allow_nan=True,
+            )
+        )
+        metrics = {f"mlip_arena/diatomics/{key}": value for key, value in arena_summary.items()}
+        metrics.update(
+            {
+                f"long_md/{key}": value
+                for key, value in _collect_long_md(self.md_dir, self.md_payloads).items()
+            }
+        )
+        return metrics
+
+
+def launch_model_evaluations(
+    model: Any,
+    metadata: ModelMetadata,
+    config: BenchmarkConfig,
+    *,
+    kernel: bool,
+    step: int,
+) -> EvaluationWave | None:
+    """Save an EMA snapshot and start the benchmark worker wave without waiting.
+
+    One wave runs the diatomic curves and MD systems together, paying the
+    process/JIT startup tax once. Duplicating the device list oversubscribes
+    each GPU: the benchmark systems are far too small to saturate one, so
+    concurrent (MPS-shared) workers overlap their host and kernel-launch
+    latency while training keeps stepping. Returns None for configurations
+    the single-wave path does not cover.
+    """
+    slots = cuda_device_ids() * config.workers_per_gpu
+    arena = config.mlip_arena
+    long_md = config.long_md
+    if (
+        len(slots) < 2
+        or arena is None
+        or arena.tasks != ("diatomics",)
+        or long_md is None
+    ):
+        return None
+    arena_dir = Path(arena.output_dir) / f"step-{step}"
+    checkpoint = arena_dir / "model.nqx"
+    save_model(checkpoint, model, metadata)
+    calculator_kwargs = {"model_path": str(checkpoint), "use_kernel": kernel}
+    elements = arena.elements
+    if elements is None:
+        elements = tuple(chemical_symbols[number] for number in metadata.atomic_numbers)
+    task_dir = arena_dir / "diatomics"
+    md_dir = Path(long_md.output_dir) / f"step-{step}"
+    md_config = replace(long_md, output_dir=str(md_dir))
+    md_payloads = _long_md_payloads(md_config, calculator_kwargs, slots)
+    payloads = _diatomics_payloads(elements, calculator_kwargs, slots, task_dir) + md_payloads
+    started = time.perf_counter()
+    processes = _spawn_evaluation_workers(payloads, md_dir / "workers")
+    return EvaluationWave(step, processes, arena_dir, task_dir, md_dir, md_payloads, started)
+
+
 def run_model_evaluations(
     model: Any,
     metadata: ModelMetadata,
@@ -522,58 +627,13 @@ def run_model_evaluations(
     step: int,
 ) -> dict[str, float]:
     """Save an EMA snapshot and run all configured downstream benchmarks."""
+    wave = launch_model_evaluations(model, metadata, config, kernel=kernel, step=step)
+    if wave is not None:
+        return wave.wait()
     metrics: dict[str, float] = {}
-    # Duplicating the device list oversubscribes each GPU: the benchmark
-    # systems are far too small to saturate one, so concurrent (MPS-shared)
-    # workers overlap their host and kernel-launch latency.
     slots = cuda_device_ids() * config.workers_per_gpu
     arena = config.mlip_arena
     long_md = config.long_md
-    if (
-        len(slots) > 1
-        and arena is not None
-        and arena.tasks == ("diatomics",)
-        and long_md is not None
-    ):
-        # Fast path: one worker wave runs the diatomic curves and MD systems
-        # together, paying the process/JIT startup tax once and keeping every
-        # GPU busy until the longest trajectory finishes.
-        from mlip_arena.flows.diatomics import analyze
-
-        arena_dir = Path(arena.output_dir) / f"step-{step}"
-        checkpoint = arena_dir / "model.nqx"
-        save_model(checkpoint, model, metadata)
-        calculator_kwargs = {"model_path": str(checkpoint), "use_kernel": kernel}
-        elements = arena.elements
-        if elements is None:
-            elements = tuple(chemical_symbols[number] for number in metadata.atomic_numbers)
-        task_dir = arena_dir / "diatomics"
-        md_dir = Path(long_md.output_dir) / f"step-{step}"
-        md_config = replace(long_md, output_dir=str(md_dir))
-        md_payloads = _long_md_payloads(md_config, calculator_kwargs, slots)
-        payloads = _diatomics_payloads(elements, calculator_kwargs, slots, task_dir) + md_payloads
-
-        started = time.perf_counter()
-        _run_evaluation_workers(payloads, md_dir / "workers")
-        wave_seconds = time.perf_counter() - started
-
-        arena_summary = _dataframe_summary(analyze(task_dir))
-        arena_summary["runtime_seconds"] = wave_seconds
-        (arena_dir / "summary.json").write_text(
-            json.dumps(
-                {f"diatomics/{key}": value for key, value in arena_summary.items()},
-                indent=2,
-                allow_nan=True,
-            )
-        )
-        metrics.update(
-            {f"mlip_arena/diatomics/{key}": value for key, value in arena_summary.items()}
-        )
-        metrics.update(
-            {f"long_md/{key}": value for key, value in _collect_long_md(md_dir, md_payloads).items()}
-        )
-        return metrics
-
     if arena is not None:
         arena_dir = Path(arena.output_dir) / f"step-{step}"
         checkpoint = arena_dir / "model.nqx"

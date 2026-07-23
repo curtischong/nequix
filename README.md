@@ -287,8 +287,10 @@ model supports) and eight TM23 melt systems (one 100 ps trajectory per GPU on an
 8-GPU node). During training all diatomic curves and MD systems run as a single
 wave of pinned worker subprocesses (`CUDA_VISIBLE_DEVICES` per worker, no XLA
 preallocation) sharing GPUs under a dedicated CUDA MPS daemon, with a persistent
-JAX compilation cache under `evaluations/jax_cache`; the full trigger takes about
-6.5 minutes on 8xH100. Because each system is far too small to saturate a GPU,
+JAX compilation cache under `evaluations/jax_cache`. Training keeps stepping
+while the wave runs; the loop polls the workers and logs their metrics (tagged
+with `eval/trigger_step`) once the last one exits, about 6 minutes after the
+trigger on 8xH100. Because each system is far too small to saturate a GPU,
 `validation.evaluation_workers_per_gpu` (default 4) diatomics workers share each
 device. To run the complete offline suites, set all three Arena tasks, all three
 TM23 regimes, and `max_systems=None`.
