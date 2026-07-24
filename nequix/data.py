@@ -1,18 +1,20 @@
-import multiprocessing
-from abc import ABC, abstractmethod
-import queue
 import bisect
+import multiprocessing
+import os
+import queue
 import threading
+from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Callable
 
 import ase
-import ase.db
+from atompack import Database
 from ase.geometry import complete_cell
+from ase.stress import voigt_6_to_full_3x3_stress
 import jax
 import jraph
 import matscipy.neighbours
 import numpy as np
-import yaml
 from tqdm import tqdm
 
 
@@ -144,6 +146,21 @@ class Dataset(ABC):
         n_tr = int(round(n * (1 - valid_frac)))
         return IndexDataset(self, perm[:n_tr]), IndexDataset(self, perm[n_tr:])
 
+    def subset(self, fraction: float, seed: int = 0):
+        """Return a deterministic random fraction of this dataset."""
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"dataset fraction must be in (0, 1], got {fraction}")
+        if fraction == 1.0:
+            return self
+
+        size = int(len(self) * fraction)
+        if size == 0:
+            raise ValueError(
+                f"dataset fraction {fraction} selects no items from a dataset of size {len(self)}"
+            )
+        indices = np.random.default_rng(seed).permutation(len(self))[:size]
+        return IndexDataset(self, indices)
+
 
 class IndexDataset(Dataset):
     def __init__(self, base: Dataset, indices: np.ndarray):
@@ -173,9 +190,9 @@ class ConcatDataset(Dataset):
         return self.datasets[ds_idx]._get_graph_dict(idx)
 
 
-# aselmdb dataset for loading omat/omal/odac/salex databases from fairchem
-# based on https://github.com/facebookresearch/fairchem/blob/ccc1416/src/fairchem/core/datasets/ase_datasets.py#L382
-class AseDBDataset(Dataset):
+class AtomPackDataset(Dataset):
+    """Random-access AtomPack dataset, reopened independently in each worker process."""
+
     def __init__(
         self, file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
     ):
@@ -183,32 +200,77 @@ class AseDBDataset(Dataset):
         self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
         self.file_path = Path(file_path)
         self.cutoff = cutoff
-        if self.file_path.is_dir():
-            files = sorted(self.file_path.rglob("*.aselmdb"))
-            self.dbs = [ase.db.connect(fp, readonly=True, use_lock_file=False) for fp in files]
-        else:
-            self.dbs = [ase.db.connect(file_path, readonly=True, use_lock_file=False)]
-        self.db_ids = [db.ids for db in self.dbs]
-        self.id_cumulative = np.cumsum([len(ids) for ids in self.db_ids])
+        database = Database.open(str(self.file_path))
+        self._length = len(database)
+        del database
+        self._database = None
+        self._database_pid = None
 
     def __len__(self):
-        return self.id_cumulative[-1]
+        return self._length
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_database"] = None
+        state["_database_pid"] = None
+        return state
+
+    def _get_database(self):
+        pid = os.getpid()
+        if self._database is None or self._database_pid != pid:
+            self._database = Database.open(str(self.file_path))
+            self._database_pid = pid
+        return self._database
+
+    def _get_molecule(self, idx: int):
+        return self._get_database().get_molecule(idx)
+
+    def _molecule_to_graph_dict(self, molecule, idx: int):
+        if molecule.energy is None or molecule.forces is None:
+            raise ValueError(
+                f"AtomPack training record {idx} in {self.file_path} must contain energy and forces"
+            )
+
+        positions = np.asarray(molecule.positions)
+        atomic_numbers = np.asarray(molecule.atomic_numbers)
+        pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
+        raw_cell = np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
+        cell = complete_cell(raw_cell)
+        src, dst, shift = matscipy.neighbours.neighbour_list(
+            "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
+        )
+
+        stress = molecule.stress
+        if stress is not None:
+            stress = np.asarray(stress)
+            if stress.shape == (6,):
+                stress = voigt_6_to_full_3x3_stress(stress)
+
+        graph = {
+            "n_node": np.array([len(atomic_numbers)], dtype=np.int32),
+            "n_edge": np.array([len(src)], dtype=np.int32),
+            "senders": dst.astype(np.int32),
+            "receivers": src.astype(np.int32),
+            "species": np.array(
+                [self.atomic_indices[int(number)] for number in atomic_numbers], dtype=np.int32
+            ),
+            "positions": positions.astype(np.float32),
+            "shifts": shift.astype(np.float32),
+            "cell": raw_cell.astype(np.float32) if pbc.all() else None,
+            "forces": np.asarray(molecule.forces, dtype=np.float32),
+            "energy": np.array([molecule.energy], dtype=np.float32),
+        }
+        if stress is not None:
+            graph["stress"] = stress.astype(np.float32)
+        return graph
 
     def _get_graph_dict(self, idx: int):
-        db_idx = bisect.bisect(self.id_cumulative, idx)
-        if db_idx > 0:
-            idx = idx - self.id_cumulative[db_idx - 1]
-        atoms = self.dbs[db_idx]._get_row(self.db_ids[db_idx][idx]).toatoms()
-        graph = preprocess_graph(atoms, self.atomic_indices, self.cutoff, True)
-        return graph
+        return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
 
 
 def _dataloader_worker(dataset, index_queue, output_queue):
     while True:
-        try:
-            index = index_queue.get(timeout=0)
-        except queue.Empty:
-            continue
+        index = index_queue.get()
         if index is None:
             break
         output_queue.put((index, dataset[index]))
@@ -257,21 +319,36 @@ class DataLoader:
         if self._started:
             return
 
-        # NB: we can use fork here, only because we are not using jax
-        # in the workers (data is just numpy arrays)
-        # multiprocessing.set_start_method("spawn", force=True)
+        # Workers start once training is already iterating, by which point JAX
+        # has initialized its multithreaded runtime. Forking that runtime
+        # deadlocks the workers (and the parent) on inherited locks, so fork
+        # from a clean forkserver instead. The dataset reopens its database per
+        # process (see __getstate__), so it pickles cheaply to each worker.
         self._started = True
-        self.index_queue = multiprocessing.Queue()
-        self.output_queue = multiprocessing.Queue()
+        ctx = multiprocessing.get_context("forkserver")
+        self.index_queue = ctx.Queue()
+        self.output_queue = ctx.Queue()
 
         for _ in range(self.num_workers):
-            worker = multiprocessing.Process(
+            worker = ctx.Process(
                 target=_dataloader_worker,
                 args=(self.dataset, self.index_queue, self.output_queue),
             )
             worker.daemon = True
             worker.start()
             self.workers.append(worker)
+
+    def shutdown(self):
+        if not self._started:
+            return
+        for _ in self.workers:
+            self.index_queue.put(None)
+        for worker in self.workers:
+            worker.join()
+        self.index_queue.close()
+        self.output_queue.close()
+        self.workers = []
+        self._started = False
 
     def set_epoch(self, epoch):
         self.rng = np.random.default_rng(seed=hash((self.seed, epoch)) % 2**32)
@@ -299,11 +376,7 @@ class DataLoader:
                 del cache[real_idx]
             else:
                 while True:
-                    try:
-                        (index, data) = self.output_queue.get(timeout=0)
-                    except queue.Empty:
-                        continue
-
+                    (index, data) = self.output_queue.get()
                     if index == real_idx:
                         item = data
                         break
@@ -384,90 +457,36 @@ def prefetch(loader, queue_size=4):
         thread.join(timeout=1.0)
 
 
-# based on https://github.com/ACEsuit/mace/blob/d39cc6b/mace/data/utils.py#L300
-def average_atom_energies(dataset: Dataset) -> list[float]:
-    """Compute the average energy of each species in the dataset."""
-    atomic_indices = dataset.atomic_indices
-    A = np.zeros((len(dataset), len(atomic_indices)), dtype=np.float32)
-    B = np.zeros((len(dataset),), dtype=np.float32)
-    for i, graph in tqdm(enumerate(dataset), total=len(dataset)):
-        A[i] = np.bincount(graph.nodes["species"], minlength=len(atomic_indices))
-        B[i] = graph.globals["energy"][0]
-    E0s = np.linalg.lstsq(A, B, rcond=None)[0].tolist()
-    idx_to_atomic_number = {v: k for k, v in atomic_indices.items()}
-    atom_energies = {idx_to_atomic_number[i]: e0 for i, e0 in enumerate(E0s)}
-    print("computed energies, add to config yml file to avoid recomputing:")
-    print(yaml.dump({"atom_energies": atom_energies}))
-    return E0s
+def write_atompack_database(
+    input_path: str | Path,
+    output_path: str | Path,
+    glob_pattern: str,
+    read_molecules: Callable,
+    n_workers: int = 16,
+):
+    """Convert input files into one AtomPack database, in parallel across files.
 
+    ``read_molecules`` must be a picklable top-level function that maps one input
+    file path to a list of AtomPack molecules.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if output_path.suffix != ".atp":
+        raise ValueError(f"AtomPack output path must end in .atp: {output_path}")
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1")
 
-def dataset_stats(dataset: Dataset, atom_energies: list[float], num_workers: int = 16) -> dict:
-    """Compute the statistics of the dataset."""
-    atom_energies = np.array(atom_energies)
-    num_graphs = len(dataset)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_paths = sorted(input_path.rglob(glob_pattern)) if input_path.is_dir() else [input_path]
+    if not file_paths:
+        raise ValueError(f"no {glob_pattern} files found in {input_path}")
 
-    sum_energy_per_atom = 0.0
-    sum_force_sq = 0.0
-    num_force_components = 0
-    sum_neighbors = 0.0
-    sum_nodes = 0
-    sum_edges = 0
-    max_nodes = 0
-    max_edges = 0
-
-    # use DataLoader so we can parallelize workers to compute stats
-    loader = DataLoader(
-        dataset,
-        max_n_nodes=1,
-        max_n_edges=1,
-        avg_n_nodes=1,
-        avg_n_edges=1,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=1,
-    )
-    loader._start_workers()
-    loader.idx = 0
-    iterator = loader.make_generator()
-
-    try:
-        for graph in tqdm(prefetch(iterator), total=num_graphs):
-            n_node = int(np.asarray(graph.n_node).item())
-            n_edge = int(np.asarray(graph.n_edge).item())
-
-            sum_nodes += n_node
-            sum_edges += n_edge
-            if n_node > max_nodes:
-                max_nodes = n_node
-            if n_edge > max_edges:
-                max_edges = n_edge
-
-            graph_e0 = np.sum(atom_energies[graph.nodes["species"]])
-            energy_per_atom = float((graph.globals["energy"][0] - graph_e0) / n_node)
-            sum_energy_per_atom += energy_per_atom
-            sum_force_sq += float(np.sum(graph.nodes["forces"] ** 2))
-            num_force_components += graph.nodes["forces"].size
-            sum_neighbors += n_edge / n_node
-    finally:
-        for _ in loader.workers:
-            loader.index_queue.put(None)
-        for w in loader.workers:
-            w.join(timeout=1.0)
-
-    mean = sum_energy_per_atom / num_graphs
-    rms = float(np.sqrt(sum_force_sq / num_force_components))
-    avg_n_neighbors = sum_neighbors / num_graphs
-
-    stats = {
-        "shift": float(mean),
-        "scale": float(rms),
-        "avg_n_neighbors": float(avg_n_neighbors),
-        "avg_n_nodes": float(sum_nodes / num_graphs),
-        "avg_n_edges": float(sum_edges / num_graphs),
-        "max_n_nodes": int(max_nodes),
-        "max_n_edges": int(max_edges),
-    }
-    print("computed dataset statistics, add to config yml file to avoid recomputing:")
-    print(yaml.dump(stats))
-    return stats
+    database = Database(str(output_path), overwrite=True)
+    if n_workers == 1 or len(file_paths) == 1:
+        for molecules in tqdm(map(read_molecules, file_paths), total=len(file_paths)):
+            database.add_molecules(molecules)
+    else:
+        with multiprocessing.Pool(min(n_workers, len(file_paths))) as pool:
+            for molecules in tqdm(pool.imap(read_molecules, file_paths), total=len(file_paths)):
+                database.add_molecules(molecules)
+    database.flush()

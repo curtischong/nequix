@@ -1,6 +1,8 @@
+import copy
 import json
 import math
 import os
+from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import e3nn_jax as e3nn
@@ -10,6 +12,7 @@ import jax.numpy as jnp
 import jraph
 
 from nequix.layer_norm import RMSLayerNorm
+from nequix.config import ModelMetadata
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
@@ -372,6 +375,24 @@ class Nequix(eqx.Module):
         senders: jax.Array,
         receivers: jax.Array,
     ):
+        node_energies, _ = self.node_energies_and_penultimate_features(
+            displacements, species, senders, receivers
+        )
+        return node_energies
+
+    def node_energies_and_penultimate_features(
+        self,
+        displacements: jax.Array,
+        species: jax.Array,
+        senders: jax.Array,
+        receivers: jax.Array,
+    ) -> tuple[jax.Array, e3nn.IrrepsArray]:
+        """Return energies and the features feeding the final scalar convolution.
+
+        The penultimate equivariant features are useful for auxiliary pre-training
+        heads. Keeping those heads outside :class:`Nequix` lets training discard the
+        auxiliary parameters and retain the conservative backbone.
+        """
         # input features are one-hot encoded species
         features = e3nn.IrrepsArray(
             e3nn.Irreps(f"{self.n_species}x0e"), jax.nn.one_hot(species, self.n_species)
@@ -398,15 +419,10 @@ class Nequix(eqx.Module):
             normalization="component",
         )
 
-        for layer in self.layers:
-            features = layer(
-                features,
-                species,
-                sh,
-                radial_basis,
-                senders,
-                receivers,
-            )
+        for layer in self.layers[:-1]:
+            features = layer(features, species, sh, radial_basis, senders, receivers)
+        penultimate_features = features
+        features = self.layers[-1](features, species, sh, radial_basis, senders, receivers)
 
         node_energies = self.readout(features)
 
@@ -418,7 +434,7 @@ class Nequix(eqx.Module):
         # add isolated atom energies to each node as prior
         node_energies = node_energies + jax.lax.stop_gradient(self.atom_energies[species, None])
 
-        return node_energies.array
+        return node_energies.array, penultimate_features
 
     def __call__(self, data: jraph.GraphsTuple):
         if data.globals["cell"] is None:
@@ -492,6 +508,96 @@ class Nequix(eqx.Module):
         return graph_energies[:, 0], -minus_forces, stress
 
 
+class DirectForceNequix(eqx.Module):
+    """Training-only direct-force head attached to a conservative Nequix backbone.
+
+    The force head consumes the equivariant features immediately before the
+    backbone's final scalar-only convolution. It is intentionally separate from the
+    backbone so direct-force pre-training can hand its Nequix weights to conservative
+    fine-tuning.
+    """
+
+    backbone: Nequix
+    force_readout: e3nn.equinox.Linear
+
+    def __init__(self, backbone: Nequix, hidden_irreps: str, *, key: jax.Array):
+        if len(backbone.layers) < 2:
+            raise ValueError("direct-force pre-training requires at least two model layers")
+        force_irreps = e3nn.Irreps(hidden_irreps)
+        if force_irreps.count("1o") == 0:
+            raise ValueError("direct-force pre-training requires 1o hidden features")
+
+        self.backbone = backbone
+        self.force_readout = e3nn.equinox.Linear(
+            irreps_in=force_irreps,
+            irreps_out="1o",
+            key=key,
+        )
+
+    def __call__(self, data: jraph.GraphsTuple):
+        positions = data.nodes["positions"]
+        displacements = positions[data.senders] - positions[data.receivers]
+        if data.globals["cell"] is not None:
+            cell_per_edge = jnp.repeat(
+                data.globals["cell"],
+                data.n_edge,
+                axis=0,
+                total_repeat_length=data.edges["shifts"].shape[0],
+            )
+            displacements = displacements + jnp.einsum(
+                "ij,ijk->ik", data.edges["shifts"], cell_per_edge
+            )
+
+        node_energies, features = self.backbone.node_energies_and_penultimate_features(
+            displacements,
+            data.nodes["species"],
+            data.senders,
+            data.receivers,
+        )
+        forces = self.force_readout(features).array
+        forces = jnp.where(jraph.get_node_padding_mask(data)[:, None], forces, 0.0)
+        graph_energies = jraph.segment_sum(
+            node_energies,
+            node_graph_idx(data),
+            num_segments=data.n_node.shape[0],
+            indices_are_sorted=True,
+        )
+        return graph_energies[:, 0], forces, None
+
+
+def conservative_backbone(model: Nequix | DirectForceNequix) -> Nequix:
+    """Return the inference model, dropping any training-only direct-force head."""
+    return model.backbone if isinstance(model, DirectForceNequix) else model
+
+
+def replace_normalization(
+    model: Nequix,
+    *,
+    atom_energies: Sequence[float],
+    shift: float,
+    scale: float,
+) -> Nequix:
+    """Return a model with new energy references while preserving learned weights.
+
+    ``shift`` and ``scale`` are static Equinox fields, so they cannot be changed with
+    ``eqx.tree_at``. A shallow copy safely gives the returned model a new PyTree
+    definition; the learned parameter arrays remain shared until training updates them.
+    """
+    if len(atom_energies) != model.n_species:
+        raise ValueError(
+            f"expected {model.n_species} isolated-atom energies, got {len(atom_energies)}"
+        )
+
+    updated = copy.copy(model)
+    object.__setattr__(updated, "shift", float(shift))
+    object.__setattr__(updated, "scale", float(scale))
+    return eqx.tree_at(
+        lambda candidate: candidate.atom_energies,
+        updated,
+        jnp.asarray(atom_energies, dtype=model.atom_energies.dtype),
+    )
+
+
 def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
     """Returns the index of the graph for each node."""
     # based on https://github.com/google-deepmind/jraph/blob/51f5990/jraph/_src/models.py#L209-L216
@@ -525,37 +631,48 @@ def weight_decay_mask(model):
     return mask
 
 
-def save_model(path: str, model: eqx.Module, config: dict):
-    """Save a model and its config to a file."""
-    with open(path, "wb") as f:
-        config_str = json.dumps(config)
-        f.write((config_str + "\n").encode())
+def save_model(path: str | Path, model: Nequix, metadata: ModelMetadata) -> None:
+    """Save model weights with the current strict metadata schema."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        f.write((json.dumps(metadata.to_header()) + "\n").encode())
         eqx.tree_serialise_leaves(f, model)
 
 
-def load_model(path: str, kernel: bool = False) -> tuple[Nequix, dict]:
-    """Load a model and its config from a file."""
+def model_from_metadata(
+    metadata: ModelMetadata, kernel: bool = False, *, key: jax.Array | None = None
+) -> Nequix:
+    """Construct an unfitted Nequix with the architecture a metadata header describes."""
+    config = metadata.model_config
+    return Nequix(
+        key=key if key is not None else jax.random.key(0),
+        n_species=len(metadata.atomic_numbers),
+        hidden_irreps=config.hidden_irreps,
+        lmax=config.lmax,
+        cutoff=config.cutoff,
+        n_layers=config.n_layers,
+        radial_basis_size=config.radial_basis_size,
+        radial_mlp_size=config.radial_mlp_size,
+        radial_mlp_layers=config.radial_mlp_layers,
+        radial_polynomial_p=config.radial_polynomial_p,
+        mlp_init_scale=config.mlp_init_scale,
+        index_weights=config.index_weights,
+        layer_norm=config.layer_norm,
+        shift=metadata.shift,
+        scale=metadata.scale,
+        avg_n_neighbors=metadata.avg_n_neighbors,
+        atom_energies=metadata.atom_energies,
+        kernel=kernel,
+    )
+
+
+def load_model(path: str | Path, kernel: bool = False) -> tuple[Nequix, ModelMetadata]:
+    """Load weights written with the current Nequix model format."""
     with open(path, "rb") as f:
-        config = json.loads(f.readline().decode())
-        model = Nequix(
-            key=jax.random.key(0),
-            n_species=len(config["atomic_numbers"]),
-            hidden_irreps=config["hidden_irreps"],
-            lmax=config["lmax"],
-            cutoff=config["cutoff"],
-            n_layers=config["n_layers"],
-            radial_basis_size=config["radial_basis_size"],
-            radial_mlp_size=config["radial_mlp_size"],
-            radial_mlp_layers=config["radial_mlp_layers"],
-            radial_polynomial_p=config["radial_polynomial_p"],
-            mlp_init_scale=config["mlp_init_scale"],
-            index_weights=config["index_weights"],
-            layer_norm=config["layer_norm"],
-            shift=config["shift"],
-            scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"],
-            kernel=kernel,
-            # NOTE: atom_energies will be in model weights
-        )
-        model = eqx.tree_deserialise_leaves(f, model)
-        return model, config
+        try:
+            metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid Nequix model header") from error
+        model = eqx.tree_deserialise_leaves(f, model_from_metadata(metadata, kernel))
+        return model, metadata

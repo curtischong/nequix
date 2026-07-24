@@ -1,8 +1,6 @@
-import bisect
-
 import jraph
 import numpy as np
-from nequix.data import AseDBDataset, dict_to_graphstuple, preprocess_graph
+from nequix.data import AtomPackDataset, dict_to_graphstuple
 
 
 # adds a single column of the hessian, and the corresponding vector to
@@ -14,7 +12,7 @@ def add_hessian_col_to_graph(graph, hessian_ref, col):
     return graph._replace(nodes={**graph.nodes, "vs": vs, "hessian_col": hessian_col})
 
 
-class PhononDataset(AseDBDataset):
+class PhononDataset(AtomPackDataset):
     def __init__(
         self,
         file_path: str,
@@ -30,17 +28,13 @@ class PhononDataset(AseDBDataset):
         assert self.backend == "jax", "PhononDataset only supports jax backend for now"
 
     def _get_graph_dict(self, idx: int):
-        db_idx = bisect.bisect(self.id_cumulative, idx)
-        if db_idx > 0:
-            idx = idx - self.id_cumulative[db_idx - 1]
-        row = self.dbs[db_idx]._get_row(self.db_ids[db_idx][idx])
-        atoms = row.toatoms()
-        # TODO: this should probably be added in the AseDBDataset implementation
-        # add data to atoms.info
-        if isinstance(row.data, dict):
-            atoms.info.update(row.data)
-        graph = preprocess_graph(atoms, self.atomic_indices, self.cutoff, True)
-        graph["hessian"] = atoms.info["hessian"].astype(np.float32)
+        molecule = self._get_molecule(idx)
+        graph = self._molecule_to_graph_dict(molecule, idx)
+        if not molecule.has_property("hessian"):
+            raise ValueError(
+                f"AtomPack phonon record {idx} in {self.file_path} must contain a hessian"
+            )
+        graph["hessian"] = np.asarray(molecule.get_property("hessian"), dtype=np.float32)
         return graph
 
     def __getitem__(self, idx: int) -> jraph.GraphsTuple:

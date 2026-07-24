@@ -3,19 +3,23 @@
 
 md.traj
 logs/
+scaling_runs/
 wandb/
 data/*.zip
 data/mptrj-gga-ggapu
-data/mptrj-aselmdb
+data/*.atp
 data/2024-09-03-mp-trj/
 data/dataset_3BPA/
 data/cache/
 data/omat
+data/omat-1m
 data/salex
 data/pbe-mdr
 data/pbe-mdr-disp
+data/*.tar.gz
 tmp/
 .benchmarks/
+data/md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -188,3 +192,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+/checkpoints
+/evaluations

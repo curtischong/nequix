@@ -28,16 +28,16 @@ def si_atoms():
 
 
 @pytest.fixture
-def nequix_calculator():
+def nequix_calculator(jax_model_path):
     """Create Nequix ASE calculator for consistency testing."""
-    return NequixCalculator("nequix-mp-1", backend="torch", use_compile=False, use_kernel=False)
+    return NequixCalculator(jax_model_path, backend="torch", use_compile=False, use_kernel=False)
 
 
 @pytest.fixture
-def ts_nequix_model():
+def ts_nequix_model(jax_model_path):
     """Create NequixTorchSimModel wrapper."""
     return NequixTorchSimModel(
-        model="nequix-mp-1",
+        model=jax_model_path,
         use_kernel=False,
         device=DEVICE,
         dtype=DTYPE,
@@ -50,10 +50,10 @@ def test_validate_model_outputs(ts_nequix_model):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_nequix_dtype_working(si_atoms, dtype):
+def test_nequix_dtype_working(jax_model_path, si_atoms, dtype):
     """Test that the model works with both float32 and float64."""
     model = NequixTorchSimModel(
-        model="nequix-mp-1",
+        model=jax_model_path,
         use_kernel=False,
         device=DEVICE,
         dtype=dtype,

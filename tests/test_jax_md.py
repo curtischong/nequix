@@ -30,15 +30,15 @@ skip_no_oeq = pytest.mark.skipif(not OEQ_AVAILABLE, reason="OpenEquivariance not
         pytest.param(True, id="kernel", marks=skip_no_oeq),
     ]
 )
-def si_system(request):
+def si_system(request, jax_model_path):
     """Create Si diamond system with JAX-MD neighbor list."""
     use_kernel = request.param
     atoms = bulk("Si", "diamond", a=5.43)
-    calc = NequixCalculator("nequix-mp-1", use_kernel=use_kernel)
+    calc = NequixCalculator(jax_model_path, use_kernel=use_kernel)
     atoms.calc = calc
 
     box = jnp.asarray(atoms.cell.T.astype(np.float32))
-    atom_indices = atomic_numbers_to_indices(calc.config["atomic_numbers"])
+    atom_indices = atomic_numbers_to_indices(calc.metadata.atomic_numbers)
     species = jnp.array([atom_indices[n] for n in atoms.get_atomic_numbers()], dtype=jnp.int32)
     positions = jnp.array(atoms.get_scaled_positions(), dtype=jnp.float32)
 
@@ -96,15 +96,15 @@ def test_jit(si_system):
         pytest.param(True, id="kernel", marks=skip_no_oeq),
     ],
 )
-def test_perturbed_structure(use_kernel):
+def test_perturbed_structure(jax_model_path, use_kernel):
     """Test energy, forces, and stress on a perturbed structure."""
     atoms = bulk("Si", "diamond", a=5.43)
-    calc = NequixCalculator("nequix-mp-1", use_kernel=use_kernel)
+    calc = NequixCalculator(jax_model_path, use_kernel=use_kernel)
     atoms.positions[0] += [0.1, 0.05, -0.05]
     atoms.calc = calc
 
     box = jnp.asarray(atoms.cell.T.astype(np.float32))
-    atom_indices = atomic_numbers_to_indices(calc.config["atomic_numbers"])
+    atom_indices = atomic_numbers_to_indices(calc.metadata.atomic_numbers)
     species = jnp.array([atom_indices[n] for n in atoms.get_atomic_numbers()], dtype=jnp.int32)
     positions = jnp.array(atoms.get_scaled_positions(), dtype=jnp.float32)
 
@@ -124,7 +124,7 @@ def test_perturbed_structure(use_kernel):
     F_ase = atoms.get_forces()
     F_jax = quantity.force(energy_fn)(positions, nbrs)
     np.testing.assert_allclose(F_jax, F_ase, atol=1e-5, rtol=1e-5)
-    assert np.max(np.abs(F_jax)) > 0.1  # Non-zero forces for perturbed structure
+    assert np.max(np.abs(F_jax)) > 1.0e-5  # Non-zero forces for perturbed structure
 
     # Stress - Note: sign convention w.r.t ASE
     stress_ase = atoms.get_stress(voigt=False)

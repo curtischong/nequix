@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from pathlib import Path
 
+from nequix.calculator import model_path_backend
 from nequix.model import load_model as load_model_jax
 from nequix.model import save_model as save_model_jax
 from nequix.torch_impl.model import load_model as load_model_torch
@@ -16,9 +17,9 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input_path)
-    input_backend = "jax" if input_path.suffix == ".nqx" else "torch"
     output_path = Path(args.output_path)
-    output_backend = "torch" if output_path.suffix == ".pt" else "jax"
+    input_backend = model_path_backend(input_path)
+    output_backend = model_path_backend(output_path)
 
     if input_backend == "jax" and output_backend == "torch":
         model, config = load_model_jax(input_path)
