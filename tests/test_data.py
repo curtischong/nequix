@@ -4,31 +4,22 @@ import numpy as np
 from nequix.data import DataLoader
 
 
-def _graph(identifier: int, n_node: int, n_edge: int = 0) -> jraph.GraphsTuple:
-    senders = np.arange(n_edge, dtype=np.int32) % n_node
-    receivers = (senders + 1) % n_node
-    feature = float(identifier + 1)
+def _graph(n_node: int) -> jraph.GraphsTuple:
+    # Payload is irrelevant to the loader; only node/graph counts drive batching.
     return jraph.GraphsTuple(
         n_node=np.array([n_node], dtype=np.int32),
-        n_edge=np.array([n_edge], dtype=np.int32),
-        nodes={
-            "positions": np.full((n_node, 3), feature, dtype=np.float32),
-            "forces": np.full((n_node, 3), feature / 3, dtype=np.float32),
-        },
-        edges={"shifts": np.zeros((n_edge, 3), dtype=np.float32)},
-        senders=senders,
-        receivers=receivers,
-        globals={
-            "energy": np.array([feature / 2], dtype=np.float32),
-            "identifier": np.array([identifier], dtype=np.int32),
-        },
+        n_edge=np.array([0], dtype=np.int32),
+        nodes=np.zeros((n_node, 1), dtype=np.float32),
+        edges=None,
+        senders=np.zeros(0, dtype=np.int32),
+        receivers=np.zeros(0, dtype=np.int32),
+        globals=None,
     )
 
 
 def test_data_loader_shutdown_stops_workers():
-    graphs = [_graph(index, n_node) for index, n_node in enumerate((6, 4, 5, 3, 2))]
     loader = DataLoader(
-        graphs,
+        [_graph(n) for n in (6, 4, 5, 3, 2)],
         max_n_nodes=9,
         max_n_edges=0,
         avg_n_nodes=0,
@@ -36,10 +27,14 @@ def test_data_loader_shutdown_stops_workers():
         batch_size=2,
         num_workers=2,
     )
+
     assert sum(1 for _ in loader) == 3
     workers = list(loader.workers)
+
     loader.shutdown()
-    assert all(not worker.is_alive() for worker in workers)
+    assert all(not w.is_alive() for w in workers)
     assert not loader._started
+
+    # loader is reusable after shutdown
     assert sum(1 for _ in loader) == 3
     loader.shutdown()
