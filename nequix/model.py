@@ -633,6 +633,16 @@ def weight_decay_mask(model):
 
 def save_model(path: str | Path, model: Nequix, metadata: ModelMetadata) -> None:
     """Save model weights with the current strict metadata schema."""
+    # Statics are rebuilt from the header at load time, so a mismatch silently
+    # changes the served model's energies.
+    statics = {
+        "avg_n_neighbors": (metadata.avg_n_neighbors, model.layers[0].avg_n_neighbors),
+        "shift": (metadata.shift, model.shift),
+        "scale": (metadata.scale, model.scale),
+    }
+    mismatched = {name: pair for name, pair in statics.items() if pair[0] != pair[1]}
+    if mismatched:
+        raise ValueError(f"metadata does not match model statics: {mismatched}")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:

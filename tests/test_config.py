@@ -14,6 +14,7 @@ EXPECTED_RUNS = {
     "nequix-oam-1": TrainerConfig,
     "nequix-oam-1-pft": PFTTrainerConfig,
     "nequix-oam-foundation": TrainerConfig,
+    "nequix-oam-foundation-esen-lr": TrainerConfig,
     "nequix-omat-foundation-conservative": TrainerConfig,
     "nequix-omat-foundation-direct": TrainerConfig,
     "nequix-omat-1": TrainerConfig,

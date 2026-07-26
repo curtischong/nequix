@@ -3,6 +3,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import cloudpickle
@@ -551,6 +552,10 @@ def train(run_config: TrainerConfig):
         if not same_architecture(finetune_model, model):
             raise ValueError("fine-tuning checkpoint and run config use different architectures")
         model = finetune_model
+        # The checkpoint keeps its pre-training message normalization, which
+        # same_architecture cannot see; the serving metadata must describe the
+        # model's static, not this run's dataset stats.
+        metadata = replace(metadata, avg_n_neighbors=model.layers[0].avg_n_neighbors)
     elif config.finetune_from is not None and not resume_exists:
         raise FileNotFoundError(f"fine-tuning checkpoint does not exist: {config.finetune_from}")
 

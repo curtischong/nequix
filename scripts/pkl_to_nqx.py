@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from nequix.config import RUNS, TrainerConfig, checkpoint_dir
@@ -32,12 +33,14 @@ def main() -> None:
         path = checkpoint_dir(config) / args.checkpoint
     _, ema_model, *_ = load_training_state(path)
 
+    model = conservative_backbone(ema_model)
     if isinstance(config, TrainerConfig):
-        metadata = model_metadata(config)
+        # Fine-tuned checkpoints keep their pre-training message normalization,
+        # so the header must describe the model, not the run's dataset stats.
+        metadata = replace(model_metadata(config), avg_n_neighbors=model.layers[0].avg_n_neighbors)
     else:
         with open(config.finetune_from, "rb") as f:
             metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
-    model = conservative_backbone(ema_model)
 
     output = args.output or path.resolve().with_suffix(".nqx")
     save_model(output, model, metadata)

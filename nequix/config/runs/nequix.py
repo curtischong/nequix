@@ -164,6 +164,18 @@ _OAM_FOUNDATION = replace(
 )
 
 
+# Stage three rerun matching the eSEN OAM fine-tuning schedule (Table 6 of
+# arXiv:2502.12147): peak LR 2e-4 — half their OMat pre-train LR — with a
+# 0.1-epoch warmup at factor 0.2, vs the 3e-3 no-warmup first attempt.
+_OAM_FOUNDATION_ESEN_LR = replace(
+    _OAM_FOUNDATION,
+    name="nequix-oam-foundation-esen-lr",
+    learning_rate=2e-4,
+    warmup_epochs=0.1,
+    warmup_factor=0.2,
+)
+
+
 RUNS: list[TrainerConfig] = [
     _MP,
     _OMAT,
@@ -171,4 +183,5 @@ RUNS: list[TrainerConfig] = [
     _OMAT_CURRICULUM_CONSERVATIVE,
     _OAM,
     _OAM_FOUNDATION,
+    _OAM_FOUNDATION_ESEN_LR,
 ]
