@@ -104,7 +104,17 @@ class NequixTorchSimModel(ModelInterface):
             )
         n_systems = int(system_idx.max().item()) + 1
 
-        species = self._z_to_species[sim_state.atomic_numbers]
+        atomic_numbers = sim_state.atomic_numbers
+        # An unchecked lookup would hit a device-side assert (GPU) or wrap
+        # around (CPU) for elements outside the model's support.
+        n_z = self._z_to_species.shape[0]
+        supported = (atomic_numbers < n_z) & (
+            self._z_to_species[atomic_numbers.clamp(max=n_z - 1)] >= 0
+        )
+        if not bool(supported.all()):
+            unsupported = sorted(set(atomic_numbers[~supported].tolist()))
+            raise ValueError(f"model does not support atomic numbers: {unsupported}")
+        species = self._z_to_species[atomic_numbers]
 
         wrapped_positions = (
             ts.transforms.pbc_wrap_batched(

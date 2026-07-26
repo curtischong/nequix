@@ -50,7 +50,7 @@ def create_batch(size: int, metadata) -> jraph.GraphsTuple:
 
     graph = preprocess_graph(atoms, atomic_indices, cutoff, targets=False)
     graph = dict_to_graphstuple(graph)
-    batch = jraph.pad_with_graphs(graph, n_node=graph.n_node + 1, n_edge=graph.n_edge)
+    batch = jraph.pad_with_graphs(graph, n_node=int(graph.n_node[0]) + 1, n_edge=int(graph.n_edge[0]))
     return batch
 
 

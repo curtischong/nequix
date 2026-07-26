@@ -6,9 +6,13 @@ from nequix.model import model_from_metadata, save_model
 
 @pytest.fixture(scope="session")
 def model_metadata():
+    # Covers every element torch_sim's validation and bulk consistency
+    # generators produce (Si+Fe, Cu, Mg, Sb, TiO2, Ga, NiTi, Ti, SiO2, Ar,
+    # CaSiO3, OsN2, Al) plus H and C.
+    atomic_numbers = (1, 6, 7, 8, 12, 13, 14, 18, 20, 22, 26, 28, 29, 31, 51, 76)
     return ModelMetadata(
-        atomic_numbers=(1, 6, 8, 14),
-        atom_energies=(-1.0, -2.0, -3.0, -4.0),
+        atomic_numbers=atomic_numbers,
+        atom_energies=tuple(-float(i + 1) for i in range(len(atomic_numbers))),
         shift=0.1,
         scale=0.8,
         avg_n_neighbors=4.0,
