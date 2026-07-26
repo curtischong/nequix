@@ -296,6 +296,16 @@ def compute_metrics(args: argparse.Namespace) -> None:
     preds.to_csv(args.out_dir / "preds.csv.gz")
     (args.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     print(json.dumps(metrics, indent=2))
+    csv_text = write_leaderboard_csv(metrics["leaderboard"], args.out_dir)
+    print(csv_text)
+
+
+def write_leaderboard_csv(leaderboard: dict[str, Any], out_dir: Path) -> str:
+    header = ",".join(["model", *leaderboard])
+    row = ",".join([out_dir.name, *("" if v is None else str(v) for v in leaderboard.values())])
+    csv_text = f"{header}\n{row}\n"
+    (out_dir / "leaderboard.csv").write_text(csv_text)
+    return csv_text
 
 
 def main() -> None:
