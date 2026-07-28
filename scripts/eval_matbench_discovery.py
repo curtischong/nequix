@@ -183,6 +183,11 @@ def kappa_metrics_if_complete(out_dir: Path) -> dict[str, float | None] | None:
         )
         return None
     merged = merge_kappa_shards(str(out_dir / "kappa"), model_key=manifest.model_key)
+    # Only records that skipped conductivity (imaginary modes) carry the
+    # conductivity_skipped flag; pandas fills NaN — which is truthy — into every
+    # other row on read, failing the whole run instead of that one structure.
+    for record in merged.records:
+        record.result.setdefault("conductivity_skipped", False)
     pred_path = out_dir / "kappa-preds.json.gz"
     write_kappa_artifacts(merged, pred_file_path=str(pred_path))
     if len(manifest.material_ids) != PHONONDB_N_STRUCTURES:

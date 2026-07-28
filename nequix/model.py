@@ -1,4 +1,5 @@
 import copy
+import itertools
 import json
 import math
 import os
@@ -565,9 +566,123 @@ class DirectForceNequix(eqx.Module):
         return graph_energies[:, 0], forces, None
 
 
+class LoRALinear(eqx.Module):
+    """Frozen ``Linear`` plus a trainable low-rank delta on its weight matrix."""
+
+    base: Linear
+    lora_a: jax.Array
+    lora_b: jax.Array
+    scaling: float = eqx.field(static=True)
+
+    def __init__(self, base: Linear, rank: int, alpha: float, *, key: jax.Array):
+        n_in, n_out = base.weights.shape
+        effective_rank = min(rank, n_in, n_out)
+        self.base = base
+        self.lora_a = jax.random.normal(key, (n_in, effective_rank)) / math.sqrt(n_in)
+        self.lora_b = jnp.zeros((effective_rank, n_out))
+        self.scaling = alpha / rank
+
+    def _with_delta(self, base: Linear) -> Linear:
+        weights = base.weights + self.scaling * self.lora_a @ self.lora_b
+        return eqx.tree_at(lambda module: module.weights, base, weights)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self._with_delta(jax.lax.stop_gradient(self.base))(x)
+
+    def merge(self) -> Linear:
+        return self._with_delta(self.base)
+
+
+class LoRAE3nnLinear(eqx.Module):
+    """Frozen ``e3nn.equinox.Linear`` plus trainable low-rank deltas per weight block.
+
+    Every block maps one input irrep chunk to one output irrep chunk with a plain
+    ``(..., in, out)`` matrix, so a per-block ``(..., in, r) @ (..., r, out)`` delta
+    stays within the same equivariant weight space and merges exactly.
+    """
+
+    base: e3nn.equinox.Linear
+    lora_a: dict[str, jax.Array]
+    lora_b: dict[str, jax.Array]
+    scaling: float = eqx.field(static=True)
+
+    def __init__(self, base: e3nn.equinox.Linear, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        lora_a: dict[str, jax.Array] = {}
+        lora_b: dict[str, jax.Array] = {}
+        for i, name in enumerate(sorted(base._weights)):
+            *batch_shape, n_in, n_out = base._weights[name].shape
+            effective_rank = min(rank, n_in, n_out)
+            lora_a[name] = jax.random.normal(
+                jax.random.fold_in(key, i), (*batch_shape, n_in, effective_rank)
+            ) / math.sqrt(n_in)
+            lora_b[name] = jnp.zeros((*batch_shape, effective_rank, n_out))
+        self.lora_a = lora_a
+        self.lora_b = lora_b
+        self.scaling = alpha / rank
+
+    def _with_delta(self, base_weights: dict[str, jax.Array]) -> e3nn.equinox.Linear:
+        weights = {
+            name: weight + self.scaling * self.lora_a[name] @ self.lora_b[name]
+            for name, weight in base_weights.items()
+        }
+        return eqx.tree_at(lambda module: module._weights, self.base, weights)
+
+    def __call__(self, *args) -> e3nn.IrrepsArray:
+        return self._with_delta(jax.lax.stop_gradient(self.base._weights))(*args)
+
+    def merge(self) -> e3nn.equinox.Linear:
+        return self._with_delta(self.base._weights)
+
+
+def _is_linear(x) -> bool:
+    return isinstance(x, (Linear, e3nn.equinox.Linear))
+
+
+def _is_lora(x) -> bool:
+    return isinstance(x, (LoRALinear, LoRAE3nnLinear))
+
+
+def apply_lora(model, rank: int, alpha: float | None = None, *, key: jax.Array):
+    """Wrap every linear layer with a frozen-base LoRA adapter (zero delta at init).
+
+    Layer-norm scales and biases stay trainable; the atom-energy prior is already
+    behind a ``stop_gradient`` in the forward pass.
+    """
+    if alpha is None:
+        alpha = 2.0 * rank
+    counter = itertools.count()
+
+    def wrap(x):
+        if not _is_linear(x):
+            return x
+        wrapper = LoRALinear if isinstance(x, Linear) else LoRAE3nnLinear
+        return wrapper(x, rank, alpha, key=jax.random.fold_in(key, next(counter)))
+
+    return jax.tree.map(wrap, model, is_leaf=_is_linear)
+
+
+def merge_lora(model):
+    """Fold LoRA deltas into their base linear layers; identity for plain models."""
+    leaves = jax.tree.flatten(model, is_leaf=_is_lora)[0]
+    if not any(_is_lora(leaf) for leaf in leaves):
+        return model
+    return jax.tree.map(lambda x: x.merge() if _is_lora(x) else x, model, is_leaf=_is_lora)
+
+
+def lora_param_count(model) -> int:
+    """Number of trainable adapter parameters in a LoRA-wrapped model."""
+    total = 0
+    for leaf in jax.tree.flatten(model, is_leaf=_is_lora)[0]:
+        if _is_lora(leaf):
+            total += sum(p.size for p in jax.tree.leaves((leaf.lora_a, leaf.lora_b)))
+    return total
+
+
 def conservative_backbone(model: Nequix | DirectForceNequix) -> Nequix:
-    """Return the inference model, dropping any training-only direct-force head."""
-    return model.backbone if isinstance(model, DirectForceNequix) else model
+    """Return the inference model, dropping any training-only direct-force head
+    and folding LoRA adapters into their base weights."""
+    return merge_lora(model.backbone if isinstance(model, DirectForceNequix) else model)
 
 
 def replace_normalization(
@@ -610,13 +725,20 @@ def node_graph_idx(data: jraph.GraphsTuple) -> jnp.ndarray:
 
 
 def weight_decay_mask(model):
-    """weight decay mask (only apply decay to linear weights)"""
+    """weight decay mask (only apply decay to linear weights; LoRA bases are frozen)"""
 
     def is_layer(x):
-        return isinstance(x, Linear) or isinstance(x, e3nn.equinox.Linear)
+        return _is_linear(x) or _is_lora(x)
 
     def set_mask(x):
-        if isinstance(x, Linear):
+        if _is_lora(x):
+            mask = jax.tree.map(lambda _: False, x)
+            return eqx.tree_at(
+                lambda m: (m.lora_a, m.lora_b),
+                mask,
+                jax.tree.map(lambda _: True, (x.lora_a, x.lora_b)),
+            )
+        elif isinstance(x, Linear):
             mask = jax.tree.map(lambda _: True, x)
             mask = eqx.tree_at(lambda m: m.bias, mask, False)
             return mask
@@ -624,8 +746,6 @@ def weight_decay_mask(model):
             return jax.tree.map(lambda _: True, x)
         else:
             return jax.tree.map(lambda _: False, x)
-
-        return mask
 
     mask = jax.tree.map(set_mask, model, is_leaf=is_layer)
     return mask

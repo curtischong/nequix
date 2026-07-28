@@ -176,6 +176,75 @@ _OAM_FOUNDATION_ESEN_LR = replace(
 )
 
 
+# LoRA variant of stage three: the conservative OMat foundation stays frozen and
+# only rank-64 adapters on every linear layer (plus the layer-norm scales) train
+# on the OAM mix. AdamW replaces muon because Newton-Schulz orthogonalization
+# rescales the zero-initialized adapters' tiny early gradients too aggressively;
+# LoRA's decoupled adapters conventionally take ~5x the full-fine-tune LR.
+_OAM_FOUNDATION_LORA = replace(
+    _OAM_FOUNDATION_ESEN_LR,
+    name="nequix-oam-foundation-lora",
+    lora_rank=64,
+    lora_alpha=128.0,
+    optimizer="adamw",
+    learning_rate=1e-3,
+    weight_decay=0.0,
+)
+
+
+# Low-parameter LoRA: rank 5 is 307k adapter parameters (~8% of the rank-64
+# variant), the closest rank to a 300k budget.
+_OAM_FOUNDATION_LORA_R5 = replace(
+    _OAM_FOUNDATION_LORA,
+    name="nequix-oam-foundation-lora-r5",
+    lora_rank=5,
+    lora_alpha=10.0,
+)
+
+
+# Doubled-width curriculum: the original Nequix irreps (128/64/32/32) times
+# two with l=1..3 doubled again to 256/128/128, extended to l=6 with 64
+# channels per extra degree, and spherical harmonics raised to lmax=6.
+_2X_IRREPS = "256x0e + 256x1o + 128x2e + 128x3o + 64x4e + 64x5o + 64x6e"
+_2X_LMAX = 6
+
+# The pre-training epoch split follows TECE-OAM-RRA: one direct epoch, then
+# two conservative epochs.
+_OMAT_FOUNDATION_DIRECT_2X = replace(
+    _OMAT_CURRICULUM_DIRECT,
+    name="nequix-omat-foundation-direct-2x",
+    batch_size=65,
+    n_epochs=1,
+    model_config=replace(
+        _OMAT_CURRICULUM_DIRECT.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
+    ),
+)
+
+_OMAT_FOUNDATION_CONSERVATIVE_2X = replace(
+    _OMAT_CURRICULUM_CONSERVATIVE,
+    name="nequix-omat-foundation-conservative-2x",
+    finetune_from="checkpoints/nequix-omat-foundation-direct-2x/best.pkl",
+    batch_size=61,
+    n_epochs=2,
+    model_config=replace(
+        _OMAT_CURRICULUM_CONSERVATIVE.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
+    ),
+)
+
+# Stage three keeps the esen-lr schedule but runs two OAM epochs like
+# TECE-OAM-RRA; 35 x 1265 avg edges matches the conservative stage's
+# 61 x 736 edge budget.
+_OAM_FOUNDATION_2X = replace(
+    _OAM_FOUNDATION_ESEN_LR,
+    name="nequix-oam-foundation-2x",
+    finetune_from="checkpoints/nequix-omat-foundation-conservative-2x/best.pkl",
+    batch_size=35,
+    n_epochs=2,
+    model_config=replace(
+        _OAM_FOUNDATION_ESEN_LR.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
+    ),
+)
+
 RUNS: list[TrainerConfig] = [
     _MP,
     _OMAT,
@@ -184,4 +253,9 @@ RUNS: list[TrainerConfig] = [
     _OAM,
     _OAM_FOUNDATION,
     _OAM_FOUNDATION_ESEN_LR,
+    _OAM_FOUNDATION_LORA,
+    _OAM_FOUNDATION_LORA_R5,
+    _OMAT_FOUNDATION_DIRECT_2X,
+    _OMAT_FOUNDATION_CONSERVATIVE_2X,
+    _OAM_FOUNDATION_2X,
 ]

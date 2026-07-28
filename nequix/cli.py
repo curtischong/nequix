@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+
+# JAX reads this when the backend initializes on first device use; setting it
+# before any nequix/jax import keeps every import order safe.
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.97")
+
 import argparse
 from collections.abc import Sequence
 

@@ -100,6 +100,10 @@ class BenchmarkConfig:
     # Benchmark systems are tiny (2-570 atoms), so a single worker leaves an
     # accelerator mostly idle; stacking workers per GPU overlaps their latency.
     workers_per_gpu: int = 4
+    # Async waves overlap training but need GPU memory headroom for the eval
+    # workers; with the trainer's 97% XLA memory fraction the default blocks
+    # training while a wave runs.
+    async_evals: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,10 @@ class TrainerConfig:
     force_weight: float = 20.0
     stress_weight: float = 5.0
     force_mode: Literal["conservative", "direct"] = "conservative"
+    # LoRA fine-tuning: freeze pre-trained linear weights and train low-rank
+    # adapters of this rank on every linear layer. ``None`` trains all weights.
+    lora_rank: int | None = None
+    lora_alpha: float | None = None  # defaults to 2 * lora_rank
     loss_type: str = "mae"
     log_every: int = 100
     validation: ValidationConfig = field(default_factory=ValidationConfig)

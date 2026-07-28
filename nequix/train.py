@@ -34,7 +34,9 @@ from nequix.evaluation import (
 from nequix.hardware import peak_device_memory_bytes
 from nequix.model import (
     DirectForceNequix,
+    apply_lora,
     conservative_backbone,
+    lora_param_count,
     model_from_metadata,
     replace_normalization,
     weight_decay_mask,
@@ -375,6 +377,15 @@ def attach_direct_force_head(model, config: TrainerConfig) -> DirectForceNequix:
     )
 
 
+def attach_lora_adapters(model, config: TrainerConfig):
+    return apply_lora(
+        model,
+        config.lora_rank,
+        config.lora_alpha,
+        key=jax.random.fold_in(jax.random.key(config.seed), 2),
+    )
+
+
 def build_model(config: TrainerConfig):
     """Construct the training architecture shared by real runs and probes."""
     model = model_from_metadata(
@@ -382,6 +393,8 @@ def build_model(config: TrainerConfig):
     )
     if config.force_mode == "direct":
         model = attach_direct_force_head(model, config)
+    if config.lora_rank is not None:
+        model = attach_lora_adapters(model, config)
     return model
 
 
@@ -562,6 +575,12 @@ def train(run_config: TrainerConfig):
     if config.force_mode == "direct":
         model = attach_direct_force_head(model, config)
 
+    if config.lora_rank is not None:
+        if config.finetune_from is None:
+            raise ValueError("LoRA fine-tuning requires finetune_from")
+        model = attach_lora_adapters(model, config)
+        print(f"LoRA adapters: {lora_param_count(model)} trainable parameters")
+
     param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
 
     steps_per_epoch = max(
@@ -630,6 +649,8 @@ def train(run_config: TrainerConfig):
         wandb_run.define_metric(metric_glob, step_metric="runtime/training_hours")
     if hasattr(wandb, "run") and wandb.run is not None:
         wandb.run.summary["param_count"] = param_count
+        if config.lora_rank is not None:
+            wandb.run.summary["lora_param_count"] = lora_param_count(unreplicate(model))
         wandb.run.summary["train_size"] = len(train_dataset)
         wandb.run.summary["val_size"] = len(val_dataset)
         wandb.run.summary["batch/shape"] = {
@@ -821,15 +842,19 @@ def train(run_config: TrainerConfig):
                     pending_evaluation = None
                 ema_backbone = conservative_backbone(unreplicate(ema_model))
                 trigger_step = int(step.item())
-                # The wave runs concurrently with training in pinned worker
-                # subprocesses; its metrics are polled for and logged once
-                # every worker exits.
-                pending_evaluation = launch_model_evaluations(
-                    ema_backbone,
-                    metadata,
-                    benchmark_config,
-                    kernel=config.kernel,
-                    step=trigger_step,
+                # An async wave runs concurrently with training in pinned
+                # worker subprocesses; its metrics are polled for and logged
+                # once every worker exits.
+                pending_evaluation = (
+                    launch_model_evaluations(
+                        ema_backbone,
+                        metadata,
+                        benchmark_config,
+                        kernel=config.kernel,
+                        step=trigger_step,
+                    )
+                    if benchmark_config.async_evals
+                    else None
                 )
                 if pending_evaluation is None:
                     log_model_evaluations(

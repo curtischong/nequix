@@ -15,8 +15,13 @@ EXPECTED_RUNS = {
     "nequix-oam-1-pft": PFTTrainerConfig,
     "nequix-oam-foundation": TrainerConfig,
     "nequix-oam-foundation-esen-lr": TrainerConfig,
+    "nequix-oam-foundation-2x": TrainerConfig,
+    "nequix-oam-foundation-lora": TrainerConfig,
+    "nequix-oam-foundation-lora-r5": TrainerConfig,
     "nequix-omat-foundation-conservative": TrainerConfig,
+    "nequix-omat-foundation-conservative-2x": TrainerConfig,
     "nequix-omat-foundation-direct": TrainerConfig,
+    "nequix-omat-foundation-direct-2x": TrainerConfig,
     "nequix-omat-1": TrainerConfig,
 }
 

@@ -13,9 +13,13 @@ from nequix.layer_norm import RMSLayerNorm
 from nequix.config import ModelMetadata, NequixConfig
 from nequix.model import (
     DirectForceNequix,
+    LoRAE3nnLinear,
+    LoRALinear,
     Nequix,
+    apply_lora,
     conservative_backbone,
     load_model,
+    merge_lora,
     model_from_metadata,
     replace_normalization,
     save_model,
@@ -113,6 +117,67 @@ def test_direct_force_training_head_reuses_conservative_backbone():
     assert forces.shape == batch.nodes["forces"].shape
     assert stress is None
     assert conservative_backbone(model) is backbone
+
+
+def test_lora():
+    model = Nequix(
+        jax.random.key(0),
+        n_species=2,
+        lmax=1,
+        hidden_irreps="8x0e+8x1o",
+        n_layers=2,
+        radial_basis_size=4,
+        radial_mlp_size=8,
+        radial_mlp_layers=2,
+    )
+    batch = jraph.pad_with_graphs(dummy_graph(), n_node=4, n_edge=4, n_graph=2)
+    wrapped = apply_lora(model, rank=4, key=jax.random.key(1))
+
+    def is_lora(x):
+        return isinstance(x, (LoRALinear, LoRAE3nnLinear))
+
+    # zero-initialized deltas leave the pre-trained model unchanged
+    energy, forces, stress = model(batch)
+    lora_energy, lora_forces, lora_stress = wrapped(batch)
+    assert jnp.allclose(energy, lora_energy, atol=1e-6)
+    assert jnp.allclose(forces, lora_forces, atol=1e-6)
+    assert jnp.allclose(stress, lora_stress, atol=1e-6)
+
+    # gradients reach the adapters but never the frozen base weights
+    def loss_fn(m):
+        e, f, _ = m(batch)
+        return jnp.sum(e**2) + jnp.sum(f**2)
+
+    grads = eqx.filter_grad(loss_fn)(wrapped)
+    lora_b_grads = []
+    for leaf in jax.tree.flatten(grads, is_leaf=is_lora)[0]:
+        if is_lora(leaf):
+            assert all(
+                jnp.all(g == 0) for g in jax.tree.leaves(eqx.filter(leaf.base, eqx.is_array))
+            )
+            lora_b_grads.extend(jax.tree.leaves(leaf.lora_b))
+    assert any(jnp.any(g != 0) for g in lora_b_grads)
+
+    # weight decay only targets the adapters inside LoRA wrappers
+    mask = weight_decay_mask(wrapped)
+    assert all(jax.tree.leaves(mask.layers[0].linear_1.lora_a))
+    assert not any(jax.tree.leaves(mask.layers[0].linear_1.base))
+    assert mask.layers[0].radial_mlp.layers[0].lora_a
+    assert not any(jax.tree.leaves(mask.layers[0].radial_mlp.layers[0].base))
+
+    # after an adapter update, merging reproduces the wrapped model as a plain Nequix
+    trained = eqx.apply_updates(wrapped, jax.tree.map(lambda g: -0.01 * g, grads))
+    merged = conservative_backbone(trained)
+    assert isinstance(merged, Nequix)
+    assert not any(is_lora(leaf) for leaf in jax.tree.flatten(merged, is_leaf=is_lora)[0])
+    assert jax.tree.structure(eqx.filter(merged, eqx.is_array)) == jax.tree.structure(
+        eqx.filter(model, eqx.is_array)
+    )
+    trained_energy, trained_forces, _ = trained(batch)
+    merged_energy, merged_forces, _ = merged(batch)
+    assert jnp.allclose(trained_energy, merged_energy, atol=1e-5)
+    assert jnp.allclose(trained_forces, merged_forces, atol=1e-5)
+    assert merge_lora(model) is model
 
 
 @pytest.mark.parametrize("centering", [True, False])
