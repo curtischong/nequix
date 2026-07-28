@@ -31,7 +31,7 @@ from nequix.evaluation import (
     validate_benchmark_config,
     validate_validation_config,
 )
-from nequix.hardware import peak_device_memory_bytes
+from nequix.hardware import peak_device_memory_bytes, release_device_memory_pools
 from nequix.model import (
     DirectForceNequix,
     apply_lora,
@@ -857,6 +857,9 @@ def train(run_config: TrainerConfig):
                     else None
                 )
                 if pending_evaluation is None:
+                    # Training blocks on the wave, so hand the workers the
+                    # trainer's cached-but-free memory (cuda_async only).
+                    release_device_memory_pools()
                     log_model_evaluations(
                         run_model_evaluations(
                             ema_backbone,

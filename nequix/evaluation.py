@@ -203,6 +203,9 @@ def _spawn_evaluation_workers(
         # Workers share their GPU with the training process, so they must
         # allocate on demand instead of claiming the XLA default pool.
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        # CUDA-graph instantiation needs device memory beyond the allocator's
+        # accounting; next to a full training pool it OOMs the whole wave.
+        "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
         # Identical jit programs recompile in every worker on every trigger
         # without a persistent cache.
         "JAX_COMPILATION_CACHE_DIR": str(Path(JAX_CACHE_DIRECTORY).absolute()),

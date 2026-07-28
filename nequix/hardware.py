@@ -1,4 +1,23 @@
+import ctypes
+
 import jax
+
+
+def release_device_memory_pools() -> None:
+    """Return each CUDA device mempool's cached-but-free memory to the driver.
+
+    Under ``XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`` XLA frees buffers into
+    the device's default mempool but pins its release threshold to the memory
+    fraction, so the driver never gets the memory back; trimming hands the
+    idle trainer's cache to concurrently launched evaluation workers. It is a
+    no-op under the default preallocated BFC pool, which cudart cannot trim.
+    """
+    lib = ctypes.CDLL("libcudart.so.12")
+    for index in range(jax.local_device_count()):
+        lib.cudaSetDevice(index)
+        pool = ctypes.c_void_p()
+        lib.cudaDeviceGetDefaultMemPool(ctypes.byref(pool), index)
+        lib.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0))
 
 
 def peak_device_memory_bytes() -> int:

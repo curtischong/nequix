@@ -178,6 +178,14 @@ class TrainerConfig:
     dataset_name: str | None = None
     train_frac: float = 1.0
     seed: int = 0
+    # Fraction of GPU memory the JAX pool preallocates. Runs with synchronous
+    # in-training benchmarks must leave enough free for the eval workers,
+    # which run in separate processes outside this pool.
+    mem_fraction: float = 0.97
+    # "cuda_async" returns freed memory to the driver instead of holding a
+    # preallocated pool, letting eval workers use the GPU while training is
+    # paused on a synchronous wave. ``None`` keeps the XLA default (bfc).
+    allocator: str | None = None
     optimizer: str = "muon"
     learning_rate: float = 0.01
     warmup_epochs: float = 0.1

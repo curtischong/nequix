@@ -11,6 +11,7 @@ from nequix.config.models import (
     OAM_ATOM_ENERGIES,
     OMAT_ATOM_ENERGIES,
     TrainerConfig,
+    ValidationConfig,
 )
 
 
@@ -208,13 +209,29 @@ _OAM_FOUNDATION_LORA_R5 = replace(
 _2X_IRREPS = "256x0e + 256x1o + 128x2e + 128x3o + 64x4e + 64x5o + 64x6e"
 _2X_LMAX = 6
 
+# Synchronous waves run beside the trainer's memory pool, so the 2x stages
+# reserve headroom for them. A wave puts one diatomics worker AND one MD
+# worker on each GPU concurrently (~1.3 GiB at 32 atoms, ~4.2 GiB at 108;
+# TM23 melt systems are 31-71 atoms), and 0.90 left too little: the first
+# wave OOMed on CUDA-graph instantiation and killed the run. 0.85 leaves
+# ~9 GiB per H100 for the pair.
+_2X_BENCHMARKS = replace(_TRAINING_BENCHMARKS, every_steps=5_000, workers_per_gpu=1)
+_2X_VALIDATION = ValidationConfig(every_steps=10_000)
+_2X_MEM_FRACTION = 0.85
+
 # The pre-training epoch split follows TECE-OAM-RRA: one direct epoch, then
-# two conservative epochs.
+# two conservative epochs. Batch sizes come from single-GPU capacity probes
+# targeting 92% of the 0.85-fraction pool (67.3 GiB on H100); peaks fit
+# linearly in batch size (direct 0.42 GiB/graph, conservative 1.21,
+# OAM mix 1.99).
 _OMAT_FOUNDATION_DIRECT_2X = replace(
     _OMAT_CURRICULUM_DIRECT,
     name="nequix-omat-foundation-direct-2x",
-    batch_size=65,
+    batch_size=145,
     n_epochs=1,
+    mem_fraction=_2X_MEM_FRACTION,
+    validation=_2X_VALIDATION,
+    benchmarks=_2X_BENCHMARKS,
     model_config=replace(
         _OMAT_CURRICULUM_DIRECT.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
     ),
@@ -224,22 +241,28 @@ _OMAT_FOUNDATION_CONSERVATIVE_2X = replace(
     _OMAT_CURRICULUM_CONSERVATIVE,
     name="nequix-omat-foundation-conservative-2x",
     finetune_from="checkpoints/nequix-omat-foundation-direct-2x/best.pkl",
-    batch_size=61,
+    batch_size=50,
     n_epochs=2,
+    mem_fraction=_2X_MEM_FRACTION,
+    validation=_2X_VALIDATION,
+    benchmarks=_2X_BENCHMARKS,
     model_config=replace(
         _OMAT_CURRICULUM_CONSERVATIVE.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
     ),
 )
 
 # Stage three keeps the esen-lr schedule but runs two OAM epochs like
-# TECE-OAM-RRA; 35 x 1265 avg edges matches the conservative stage's
-# 61 x 736 edge budget.
+# TECE-OAM-RRA; 30 x 1265 avg edges roughly matches the conservative stage's
+# 50 x 736 edge budget.
 _OAM_FOUNDATION_2X = replace(
     _OAM_FOUNDATION_ESEN_LR,
     name="nequix-oam-foundation-2x",
     finetune_from="checkpoints/nequix-omat-foundation-conservative-2x/best.pkl",
-    batch_size=35,
+    batch_size=30,
     n_epochs=2,
+    mem_fraction=_2X_MEM_FRACTION,
+    validation=_2X_VALIDATION,
+    benchmarks=_2X_BENCHMARKS,
     model_config=replace(
         _OAM_FOUNDATION_ESEN_LR.model_config, hidden_irreps=_2X_IRREPS, lmax=_2X_LMAX
     ),
