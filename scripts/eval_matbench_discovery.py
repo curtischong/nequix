@@ -102,7 +102,14 @@ def run_relaxations(args: argparse.Namespace) -> None:
     out_path = shard_path(args.out_dir, args.shard_index, args.num_shards)
     done = set()
     if out_path.exists():
-        done = {json.loads(line)["material_id"] for line in out_path.read_text().splitlines()}
+        # error records are excluded so structures that hit a transient failure
+        # (e.g. a neighbor's OOM) are retried on resume; the join stage keeps
+        # the successful record when both exist
+        done = {
+            record["material_id"]
+            for line in out_path.read_text().splitlines()
+            if "energy" in (record := json.loads(line))
+        }
 
     atoms_list = ase_atoms_from_zip(DataFiles.wbm_initial_atoms.path, limit=args.limit)
     atoms_list.sort(key=lambda atoms: atoms.info["material_id"])
@@ -217,14 +224,16 @@ def compute_metrics(args: argparse.Namespace) -> None:
     from pymatgen.entries.computed_entries import ComputedStructureEntry
 
     records: dict[str, dict[str, Any]] = {}
-    n_failed = 0
+    failed: set[str] = set()
     for path in sorted(args.out_dir.glob("relaxations-*.jsonl")):
         for line in path.read_text().splitlines():
             record = json.loads(line)
             if "energy" in record:
                 records[record["material_id"]] = record
             else:
-                n_failed += 1
+                failed.add(record["material_id"])
+    # a failed attempt followed by a successful retry counts as success
+    n_failed = len(failed - records.keys())
     print(f"loaded {len(records)} relaxations ({n_failed} failed) from {args.out_dir}")
 
     cse_frame = pd.read_json(DataFiles.wbm_computed_structure_entries.path, lines=True)

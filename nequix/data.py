@@ -274,6 +274,9 @@ def _dataloader_worker(dataset, index_queue, output_queue):
         if index is None:
             break
         output_queue.put((index, dataset[index]))
+    # allow exit without flushing queued results, otherwise a mid-iteration
+    # shutdown deadlocks the join on unflushed results
+    output_queue.cancel_join_thread()
 
 
 # multiprocess data loader with dynamic batching, based on

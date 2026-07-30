@@ -214,7 +214,16 @@ _2X_LMAX = 6
 # (release_device_memory_pools), dropping an idle H100 from ~79 GB held to
 # ~1.2 GB, and the pool regrows on the next train step. The default BFC pool
 # can't do this - it OOMed the wave workers at every fraction above 0.85.
-_2X_BENCHMARKS = replace(_TRAINING_BENCHMARKS, every_steps=10_000)
+# The in-training MD is cut to 10 ps: the full 100 ps protocol takes ~55
+# minutes per trajectory with this model (measured at the smoke test's
+# step-200 wave), and a synchronous wave stops training for its whole
+# duration. 10 ps keeps the drift trend and takes ~6 minutes; the full
+# protocol remains for offline evaluation.
+_2X_BENCHMARKS = replace(
+    _TRAINING_BENCHMARKS,
+    every_steps=10_000,
+    long_md=replace(_TRAINING_BENCHMARKS.long_md, steps=2_000),
+)
 _2X_VALIDATION = ValidationConfig(every_steps=10_000)
 _2X_MEM_FRACTION = 0.97
 _2X_ALLOCATOR = "cuda_async"
