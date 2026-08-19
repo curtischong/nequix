@@ -316,12 +316,17 @@ TM23.
 ### Matbench Discovery
 
 `scripts/eval_matbench_discovery.py` scores a checkpoint on the full Matbench
-Discovery WBM test set (~257k structures). Stage one relaxes the WBM initial
-structures with the standard force-field protocol (FrechetCellFilter + FIRE,
-`fmax=0.05`, 500 steps); shard it across GPUs by launching one resumable
-process per device. Stage two applies MP2020 energy corrections and writes
-formation-energy predictions, hull distances, and leaderboard metrics (full
-test set and unique-prototype subset) below
+Discovery WBM test set (~257k structures). The relax stage relaxes the WBM
+initial structures with the standard force-field protocol (FrechetCellFilter,
+`fmax=0.05`, 500 steps), batched through torch-sim with L-BFGS in its
+ASE-compatibility mode — WBM cells average ten atoms, so relaxing hundreds per
+graph keeps the GPU full where the one-at-a-time ASE loop left it mostly idle.
+Shard it across GPUs by launching one resumable process per device. The kappa
+stage runs the PhononDB-103 thermal-conductivity benchmark the same sharded
+way. The join stage hydrates the shards into matbench-discovery's own artifact
+pipeline (MP2020 corrections, formation energies, hull distances, RMSD and
+symmetry metrics) and writes leaderboard columns (CPS, F1, DAF, ..., on the
+site's default unique-prototypes subset) below
 `evaluations/matbench_discovery/<model name>/`:
 
 ```bash
