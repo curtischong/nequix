@@ -15,6 +15,7 @@ from nequix.config.models import (
     ValidationConfig,
     checkpoint_dir,
     config_values,
+    layer_cutoffs,
 )
 from nequix.config.runs import RUNS
 
@@ -36,4 +37,5 @@ __all__ = [
     "ValidationConfig",
     "checkpoint_dir",
     "config_values",
+    "layer_cutoffs",
 ]

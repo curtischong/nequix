@@ -39,6 +39,7 @@ from nequix.model import (
     lora_param_count,
     model_from_metadata,
     replace_normalization,
+    sort_inner_edges_first,
     weight_decay_mask,
 )
 from nequix.run_summary import build_run_summary, print_run_summary_csv
@@ -68,9 +69,9 @@ def wandb_run_name(config: TrainerConfig) -> str:
     return f"{dataset_name}{fraction_suffix}_{config.n_epochs}ep_{run_name}"
 
 
-def _loss_statistics(model, batch, loss_type="huber"):
+def _loss_statistics(model, batch, loss_type="huber", n_inner_edges=None):
     """Return unnormalized loss/metric sums and their real-sample counts."""
-    energy, forces, stress = model(batch)
+    energy, forces, stress = model(batch, n_inner_edges)
     graph_mask = jraph.get_graph_padding_mask(batch)
     node_mask = jraph.get_node_padding_mask(batch)
 
@@ -170,13 +171,17 @@ def _total_and_metrics(statistics, energy_weight, force_weight, stress_weight):
 
 
 @eqx.filter_jit
-def loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="huber"):
+def loss(
+    model, batch, energy_weight, force_weight, stress_weight, loss_type="huber", n_inner_edges=None
+):
     """Return globally normalized loss and MAEs for one padded batch."""
-    statistics = _loss_statistics(model, batch, loss_type)
+    statistics = _loss_statistics(model, batch, loss_type, n_inner_edges)
     return _total_and_metrics(statistics, energy_weight, force_weight, stress_weight)
 
 
-def _distributed_loss(model, batch, energy_weight, force_weight, stress_weight, loss_type="huber"):
+def _distributed_loss(
+    model, batch, energy_weight, force_weight, stress_weight, loss_type="huber", n_inner_edges=None
+):
     """Return a local loss contribution and globally weighted metrics.
 
     The local contribution is differentiated on each device and its gradients
@@ -184,7 +189,7 @@ def _distributed_loss(model, batch, energy_weight, force_weight, stress_weight, 
     component over one combined multi-device batch, including when devices
     contain different real graph and node counts.
     """
-    local = _loss_statistics(model, batch, loss_type)
+    local = _loss_statistics(model, batch, loss_type, n_inner_edges)
     global_statistics = jax.tree.map(lambda value: jax.lax.psum(value, axis_name="device"), local)
     total_loss, metrics = _total_and_metrics(
         global_statistics, energy_weight, force_weight, stress_weight
@@ -204,15 +209,24 @@ def _distributed_loss(model, batch, energy_weight, force_weight, stress_weight, 
 
 
 def evaluate(
-    model, dataloader, energy_weight=1.0, force_weight=1.0, stress_weight=1.0, loss_type="huber"
+    model,
+    dataloader,
+    energy_weight=1.0,
+    force_weight=1.0,
+    stress_weight=1.0,
+    loss_type="huber",
+    n_inner_edges=None,
 ):
     """Return loss and RMSE of energy and force in eV and eV/Å respectively"""
     total_metrics = defaultdict(int)
     total_count = 0
+    sort_batch = eqx.filter_jit(sort_inner_edges_first) if n_inner_edges is not None else None
     for batch in prefetch(dataloader):
+        if sort_batch is not None:
+            batch = sort_batch(batch)
         n_graphs = jnp.sum(jraph.get_graph_padding_mask(batch))
         val_loss, metrics = loss(
-            model, batch, energy_weight, force_weight, stress_weight, loss_type
+            model, batch, energy_weight, force_weight, stress_weight, loss_type, n_inner_edges
         )
         total_metrics["loss"] += val_loss * n_graphs
         for key, value in metrics.items():
@@ -430,7 +444,7 @@ def build_optimizer(config, model, steps_per_epoch):
     return optim, schedule
 
 
-def make_train_step(optim, config):
+def make_train_step(optim, config, n_inner_edges=None):
     """Build the exact pmapped step used for both training and capacity probes."""
 
     @functools.partial(eqx.filter_pmap, in_axes=(0, 0, None, 0, 0), axis_name="device")
@@ -444,6 +458,7 @@ def make_train_step(optim, config):
             config.force_weight,
             config.stress_weight,
             config.loss_type,
+            n_inner_edges,
         )
         # Each local loss is normalized by global real-sample counts, so a sum
         # produces the gradient of the equivalent combined batch.
@@ -478,12 +493,16 @@ def _batch_counts(batch):
 def load_datasets(config: TrainerConfig):
     """Construct the train and validation datasets shared by training and precomputation."""
 
+    zigzag_radii = config.model_config.zigzag_radii
+    inner_cutoff = min(zigzag_radii) if zigzag_radii is not None else None
+
     def make_dataset(path):
         return AtomPackDataset(
             file_path=path,
             atomic_numbers=config.atomic_numbers,
             cutoff=config.model_config.cutoff,
             backend="jax",
+            inner_cutoff=inner_cutoff,
         )
 
     if isinstance(config.train_path, tuple):
@@ -510,7 +529,21 @@ def train(run_config: TrainerConfig):
     if config.force_mode not in {"conservative", "direct"}:
         raise ValueError(f"force mode {config.force_mode!r} is not supported")
     validation_config = config.validation
+    # Step-keyed wave directories are shared across runs otherwise, so a rerun
+    # reads another run's cached benchmark artifacts at the same step.
     benchmark_config = config.benchmarks
+    if benchmark_config.mlip_arena is not None:
+        arena = benchmark_config.mlip_arena
+        benchmark_config = replace(
+            benchmark_config,
+            mlip_arena=replace(arena, output_dir=str(Path(arena.output_dir) / config.name)),
+        )
+    if benchmark_config.long_md is not None:
+        long_md = benchmark_config.long_md
+        benchmark_config = replace(
+            benchmark_config,
+            long_md=replace(long_md, output_dir=str(Path(long_md.output_dir) / config.name)),
+        )
     if config.batch_size < 1:
         raise ValueError("batch_size must be at least one")
     validate_validation_config(validation_config)
@@ -520,6 +553,9 @@ def train(run_config: TrainerConfig):
     metadata = model_metadata(config)
 
     num_devices = len(jax.devices())
+    inner_edge_fraction = (
+        config.inner_edge_fraction if config.model_config.zigzag_radii is not None else None
+    )
     per_device_train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -530,6 +566,7 @@ def train(run_config: TrainerConfig):
         avg_n_edges=config.avg_n_edges,
         seed=config.seed,
         num_workers=16,
+        inner_edge_fraction=inner_edge_fraction,
     )
     train_loader = ParallelLoader(per_device_train_loader, num_devices)
     val_loader = DataLoader(
@@ -541,10 +578,12 @@ def train(run_config: TrainerConfig):
         avg_n_nodes=config.avg_n_nodes,
         avg_n_edges=config.avg_n_edges,
         num_workers=16,
+        inner_edge_fraction=inner_edge_fraction,
     )
     n_graph = per_device_train_loader.n_graph
     n_node = per_device_train_loader.n_node
     n_edge = per_device_train_loader.n_edge
+    n_edge_inner = per_device_train_loader.n_edge_inner
 
     wandb_sync = (
         TriggerWandbSyncHook() if os.environ.get("WANDB_MODE") == "offline" else lambda: None
@@ -680,6 +719,7 @@ def train(run_config: TrainerConfig):
             config.force_weight,
             config.stress_weight,
             config.loss_type,
+            n_inner_edges=val_loader.n_edge_inner,
         )
 
         if val_metrics["loss"] < best_val_loss:
@@ -731,7 +771,11 @@ def train(run_config: TrainerConfig):
         print(f"model evaluations from step {trigger_step} logged at step {global_step}: {logs}")
         wandb_sync()
 
-    train_step = make_train_step(optim, config)
+    train_step = make_train_step(optim, config, n_edge_inner)
+    # the inner-first edge sort runs as its own small device program: host-side
+    # it starves the dataloader, and inside train_step's program it makes the
+    # XLA compile pathologically slow
+    sort_batches = eqx.filter_pmap(sort_inner_edges_first) if n_edge_inner is not None else None
     pending_evaluation: EvaluationWave | None = None
 
     for epoch in range(start_epoch, config.n_epochs):
@@ -741,6 +785,8 @@ def train(run_config: TrainerConfig):
         last_validation_step_in_epoch = None
         step_in_epoch = 0
         for step_in_epoch, batch in enumerate(prefetch(train_loader), start=1):
+            if sort_batches is not None:
+                batch = sort_batches(batch)
             batch_time = time.perf_counter() - start_time
             # Only log steps synchronize with the device; other steps dispatch
             # asynchronously so the host can keep feeding the accelerators.

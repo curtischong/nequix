@@ -40,6 +40,26 @@ class NequixConfig:
     mlp_init_scale: float = 4.0
     index_weights: bool = False
     layer_norm: bool = True
+    # Per-layer cutoff block tiled across layers, e.g. (6.0, 4.0, 4.0). The
+    # max must equal ``cutoff`` (the neighbor-list radius) and only one inner
+    # radius is supported. ``None`` uses ``cutoff`` for every layer.
+    zigzag_radii: tuple[float, ...] | None = None
+
+
+def layer_cutoffs(
+    cutoff: float, n_layers: int, zigzag_radii: tuple[float, ...] | None
+) -> tuple[float, ...]:
+    """Tile the zigzag block across layers; every layer uses ``cutoff`` when unset."""
+    if zigzag_radii is None:
+        return (cutoff,) * n_layers
+    radii = tuple(float(radius) for radius in zigzag_radii)
+    # the first layer carries the canonical avg_n_neighbors static and must see
+    # the full neighbor list
+    if radii[0] != cutoff or max(radii) != cutoff:
+        raise ValueError(f"zigzag_radii {radii} must start at the neighbor-list cutoff {cutoff}")
+    if len(set(radii)) > 2:
+        raise ValueError(f"zigzag_radii {radii} supports a single inner radius")
+    return tuple(radii[i % len(radii)] for i in range(n_layers))
 
 
 @dataclass(frozen=True)
@@ -81,6 +101,10 @@ class LongMDEvalConfig:
     seed: int = 0
     # An optional prefix subset makes timing/smoke runs inexpensive.
     max_systems: int | None = None
+    # Roll each worker's systems in one torch-sim batch, one forward per MD
+    # step, instead of serial per-system ASE dynamics. False keeps the serial
+    # ASE-calculator path.
+    batched: bool = True
 
 
 @dataclass(frozen=True)
@@ -139,8 +163,17 @@ class ModelMetadata:
             raise ValueError("invalid Nequix model metadata")
 
         model_values = values["model_config"]
+        if not isinstance(model_values, dict):
+            raise ValueError("invalid Nequix architecture metadata")
+        model_values = dict(model_values)
+        # zigzag_radii postdates existing checkpoints, whose headers omit it.
+        model_values.setdefault("zigzag_radii", None)
+        if model_values["zigzag_radii"] is not None:
+            model_values["zigzag_radii"] = tuple(
+                float(radius) for radius in model_values["zigzag_radii"]
+            )
         model_expected = {item.name for item in fields(NequixConfig)}
-        if not isinstance(model_values, dict) or set(model_values) != model_expected:
+        if set(model_values) != model_expected:
             raise ValueError("invalid Nequix architecture metadata")
 
         try:
@@ -197,6 +230,11 @@ class TrainerConfig:
     force_weight: float = 20.0
     stress_weight: float = 5.0
     force_mode: Literal["conservative", "direct"] = "conservative"
+    # zigzag_radii only: fraction of the batch edge budget reserved for edges
+    # within the inner radius. Inner layers process exactly this many edge
+    # slots, so it bounds their compute; batches whose inner edges overflow it
+    # are truncated with a warning.
+    inner_edge_fraction: float = 0.5
     # LoRA fine-tuning: freeze pre-trained linear weights and train low-rank
     # adapters of this rank on every linear layer. ``None`` trains all weights.
     lora_rank: int | None = None

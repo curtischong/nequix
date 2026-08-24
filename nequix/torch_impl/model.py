@@ -9,7 +9,7 @@ from e3nn import o3
 from e3nn.util.jit import compile_mode
 
 from nequix.torch_impl.layer_norm import RMSLayerNorm
-from nequix.config import ModelMetadata
+from nequix.config import ModelMetadata, layer_cutoffs
 
 
 def _broadcast(src: torch.Tensor, other: torch.Tensor, dim: int):
@@ -508,10 +508,14 @@ class NequixTorch(torch.nn.Module):
         atom_energies: Optional[Sequence[float]] = None,
         layer_norm: bool = False,
         kernel: bool = False,
+        zigzag_radii: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.lmax = lmax
         self.cutoff = cutoff
+        self.layer_cutoffs = layer_cutoffs(
+            cutoff, n_layers, tuple(zigzag_radii) if zigzag_radii is not None else None
+        )
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -540,7 +544,9 @@ class NequixTorch(torch.nn.Module):
                     radial_mlp_size=radial_mlp_size,
                     radial_mlp_layers=radial_mlp_layers,
                     mlp_init_scale=mlp_init_scale,
-                    avg_n_neighbors=avg_n_neighbors,
+                    # neighbor counts scale with the enclosed volume, so inner
+                    # layers normalize by a cubically smaller estimate
+                    avg_n_neighbors=avg_n_neighbors * (self.layer_cutoffs[i] / cutoff) ** 3,
                     index_weights=index_weights,
                     layer_norm=layer_norm,
                     kernel=kernel,
@@ -562,14 +568,17 @@ class NequixTorch(torch.nn.Module):
         features = torch.nn.functional.one_hot(species, self.n_species).to(displacements.dtype)
         r_norm = torch.linalg.norm(displacements, ord=2, dim=-1)
 
-        radial_basis = (
-            bessel_basis(r_norm, self.radial_basis_size, self.cutoff)
+        # edges beyond a layer's cutoff contribute zero through its envelope,
+        # so every layer can share the full neighbor list
+        radial_bases = {
+            layer_cutoff: bessel_basis(r_norm, self.radial_basis_size, layer_cutoff)
             * polynomial_cutoff(
                 r_norm,
-                self.cutoff,
+                layer_cutoff,
                 self.radial_polynomial_p,
             )[:, None]
-        )
+            for layer_cutoff in set(self.layer_cutoffs)
+        }
 
         # compute spherical harmonics of edge displacements
         sh = o3.spherical_harmonics(
@@ -579,12 +588,12 @@ class NequixTorch(torch.nn.Module):
             normalization="component",
         )
 
-        for layer in self.layers:
+        for layer, layer_cutoff in zip(self.layers, self.layer_cutoffs):
             features = layer(
                 features,
                 species,
                 sh,
-                radial_basis,
+                radial_bases[layer_cutoff],
                 senders,
                 receivers,
             )
@@ -688,6 +697,7 @@ def model_from_metadata(metadata: ModelMetadata, kernel: bool = False) -> Nequix
         avg_n_neighbors=metadata.avg_n_neighbors,
         atom_energies=metadata.atom_energies,
         kernel=kernel,
+        zigzag_radii=config.zigzag_radii,
     )
 
 

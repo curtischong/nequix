@@ -23,10 +23,11 @@ def preprocess_graph(
     atom_indices: dict[int, int],
     cutoff: float,
     targets: bool,
+    inner_cutoff: float | None = None,
 ) -> dict:
     cell = complete_cell(atoms.cell)  # avoids singular cell
-    src, dst, shift = matscipy.neighbours.neighbour_list(
-        "ijS", positions=atoms.positions, cell=cell, pbc=atoms.pbc, cutoff=cutoff
+    src, dst, distance, shift = matscipy.neighbours.neighbour_list(
+        "ijdS", positions=atoms.positions, cell=cell, pbc=atoms.pbc, cutoff=cutoff
     )
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
@@ -38,6 +39,8 @@ def preprocess_graph(
         "shifts": shift.astype(np.float32),
         "cell": atoms.cell.astype(np.float32) if atoms.pbc.all() else None,
     }
+    if inner_cutoff is not None:
+        graph_dict["inner"] = distance < inner_cutoff
     if targets:
         graph_dict["forces"] = atoms.get_forces().astype(np.float32)
         graph_dict["energy"] = np.array([atoms.get_potential_energy()]).astype(np.float32)
@@ -107,7 +110,8 @@ def dict_to_graphstuple(graph_dict: dict):
             "positions": graph_dict["positions"],
             "forces": graph_dict["forces"] if "forces" in graph_dict else None,
         },
-        edges={"shifts": graph_dict["shifts"]},
+        edges={"shifts": graph_dict["shifts"]}
+        | ({"inner": graph_dict["inner"]} if "inner" in graph_dict else {}),
         senders=graph_dict["senders"],
         receivers=graph_dict["receivers"],
         globals={
@@ -194,12 +198,18 @@ class AtomPackDataset(Dataset):
     """Random-access AtomPack dataset, reopened independently in each worker process."""
 
     def __init__(
-        self, file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
+        self,
+        file_path: str,
+        atomic_numbers: list[int],
+        cutoff: float = 5.0,
+        backend: str = "jax",
+        inner_cutoff: float | None = None,
     ):
         super().__init__(backend=backend)
         self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
         self.file_path = Path(file_path)
         self.cutoff = cutoff
+        self.inner_cutoff = inner_cutoff
         database = Database.open(str(self.file_path))
         self._length = len(database)
         del database
@@ -236,8 +246,8 @@ class AtomPackDataset(Dataset):
         pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
         raw_cell = np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
         cell = complete_cell(raw_cell)
-        src, dst, shift = matscipy.neighbours.neighbour_list(
-            "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
+        src, dst, distance, shift = matscipy.neighbours.neighbour_list(
+            "ijdS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
         )
 
         stress = molecule.stress
@@ -260,12 +270,30 @@ class AtomPackDataset(Dataset):
             "forces": np.asarray(molecule.forces, dtype=np.float32),
             "energy": np.array([molecule.energy], dtype=np.float32),
         }
+        if self.inner_cutoff is not None:
+            graph["inner"] = distance < self.inner_cutoff
         if stress is not None:
             graph["stress"] = stress.astype(np.float32)
         return graph
 
     def _get_graph_dict(self, idx: int):
         return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
+
+
+def _check_inner_budget(batch: jraph.GraphsTuple, n_edge_inner: int) -> jraph.GraphsTuple:
+    """Warn when a batch's inner edges overflow the inner edge budget.
+
+    The model sorts inner edges first on device (``sort_inner_edges_first``) and
+    truncates the overflow out of the inner layers (those edges keep their
+    outer-layer contributions); the warning signals the budget should grow.
+    """
+    n_inner = int(batch.edges["inner"].sum())
+    if n_inner > n_edge_inner:
+        print(
+            f"WARNING: {n_inner} inner edges exceed the {n_edge_inner} edge budget; "
+            "increase inner_edge_fraction"
+        )
+    return batch
 
 
 def _dataloader_worker(dataset, index_queue, output_queue):
@@ -297,6 +325,7 @@ class DataLoader:
         buffer_factor=1.1,
         num_workers=4,
         prefetch_factor=2,
+        inner_edge_fraction: float | None = None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -308,6 +337,11 @@ class DataLoader:
         self._generator = None  # created in __iter__
         self.n_node = max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes) + 1
         self.n_edge = max(batch_size * avg_n_edges * buffer_factor, max_n_edges)
+        self.n_edge_inner = (
+            int(round(self.n_edge * inner_edge_fraction))
+            if inner_edge_fraction is not None
+            else None
+        )
         self.n_graph = n_graph if n_graph is not None else batch_size + 1
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
@@ -400,6 +434,11 @@ class DataLoader:
             n_edge=self.n_edge,
             n_graph=self.n_graph,
         )
+        if self.n_edge_inner is not None:
+            batches = self._generator
+            self._generator = (
+                _check_inner_budget(batch, self.n_edge_inner) for batch in batches
+            )
         return self
 
     def __next__(self):

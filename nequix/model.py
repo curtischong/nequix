@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import jraph
 
 from nequix.layer_norm import RMSLayerNorm
-from nequix.config import ModelMetadata
+from nequix.config import ModelMetadata, layer_cutoffs
 
 
 def bessel_basis(x: jax.Array, num_basis: int, r_max: float) -> jax.Array:
@@ -294,12 +294,51 @@ class NequixConvolution(eqx.Module):
         )
 
 
+def sort_inner_edges_first(data: jraph.GraphsTuple) -> jraph.GraphsTuple:
+    """Reorder a batch on device so edges within the inner cutoff form a prefix.
+
+    Edge order is irrelevant to message passing, so this only enables inner
+    zigzag layers (``n_inner_edges``) to process a prefix of the edge slots.
+    Sorting ungroups edges from their graphs, so the batch gains a per-edge
+    graph index; the model must pair cells through it rather than positionally.
+    Callers run it as its own small device program: a host-side reorder starves
+    the dataloader, and inlining the sort into the training step's program
+    makes its XLA compile pathologically slow.
+    """
+    edge_graph_idx = jnp.repeat(
+        jnp.arange(data.n_edge.shape[0]),
+        data.n_edge,
+        total_repeat_length=data.senders.shape[0],
+    )
+    order = jnp.argsort(~data.edges["inner"], stable=True)
+    edges = {key: value[order] for key, value in data.edges.items()}
+    edges["graph"] = edge_graph_idx[order]
+    return data._replace(
+        senders=data.senders[order],
+        receivers=data.receivers[order],
+        edges=edges,
+    )
+
+
+def _cell_per_edge(data: jraph.GraphsTuple, cell: jax.Array) -> jax.Array:
+    """Map each edge to its graph's cell, robust to inner-first edge sorting."""
+    if "graph" in data.edges:
+        return cell[data.edges["graph"]]
+    return jnp.repeat(
+        cell,
+        data.n_edge,
+        axis=0,
+        total_repeat_length=data.edges["shifts"].shape[0],
+    )
+
+
 class Nequix(eqx.Module):
     lmax: int = eqx.field(static=True)
     n_species: int = eqx.field(static=True)
     radial_basis_size: int = eqx.field(static=True)
     radial_polynomial_p: float = eqx.field(static=True)
     cutoff: float = eqx.field(static=True)
+    layer_cutoffs: tuple[float, ...] = eqx.field(static=True)
     shift: float = eqx.field(static=True)
     scale: float = eqx.field(static=True)
 
@@ -327,9 +366,11 @@ class Nequix(eqx.Module):
         atom_energies: Optional[Sequence[float]] = None,
         layer_norm: bool = False,
         kernel: bool = False,
+        zigzag_radii: Optional[Sequence[float]] = None,
     ):
         self.lmax = lmax
         self.cutoff = cutoff
+        self.layer_cutoffs = layer_cutoffs(cutoff, n_layers, zigzag_radii)
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -358,7 +399,9 @@ class Nequix(eqx.Module):
                     radial_mlp_size=radial_mlp_size,
                     radial_mlp_layers=radial_mlp_layers,
                     mlp_init_scale=mlp_init_scale,
-                    avg_n_neighbors=avg_n_neighbors,
+                    # neighbor counts scale with the enclosed volume, so inner
+                    # layers normalize by a cubically smaller estimate
+                    avg_n_neighbors=avg_n_neighbors * (self.layer_cutoffs[i] / cutoff) ** 3,
                     index_weights=index_weights,
                     layer_norm=layer_norm,
                     kernel=kernel,
@@ -375,9 +418,10 @@ class Nequix(eqx.Module):
         species: jax.Array,
         senders: jax.Array,
         receivers: jax.Array,
+        n_inner_edges: Optional[int] = None,
     ):
         node_energies, _ = self.node_energies_and_penultimate_features(
-            displacements, species, senders, receivers
+            displacements, species, senders, receivers, n_inner_edges
         )
         return node_energies
 
@@ -387,12 +431,19 @@ class Nequix(eqx.Module):
         species: jax.Array,
         senders: jax.Array,
         receivers: jax.Array,
+        n_inner_edges: Optional[int] = None,
     ) -> tuple[jax.Array, e3nn.IrrepsArray]:
         """Return energies and the features feeding the final scalar convolution.
 
         The penultimate equivariant features are useful for auxiliary pre-training
         heads. Keeping those heads outside :class:`Nequix` lets training discard the
         auxiliary parameters and retain the conservative backbone.
+
+        With zigzag radii, inner layers stay correct on any edge ordering because
+        the cutoff envelope zeroes edges beyond their radius. ``n_inner_edges``
+        additionally restricts inner layers to the first ``n_inner_edges`` edges,
+        which saves their compute when the caller has sorted inner edges first
+        (see ``sort_inner_edges_first``).
         """
         # input features are one-hot encoded species
         features = e3nn.IrrepsArray(
@@ -403,14 +454,21 @@ class Nequix(eqx.Module):
         square_r_norm = jnp.sum(displacements**2, axis=-1)
         r_norm = jnp.where(square_r_norm == 0.0, 0.0, jnp.sqrt(square_r_norm))
 
-        radial_basis = (
-            bessel_basis(r_norm, self.radial_basis_size, self.cutoff)
-            * polynomial_cutoff(
-                r_norm,
-                self.cutoff,
-                self.radial_polynomial_p,
-            )[:, None]
-        )
+        edge_counts = {}
+        radial_bases = {}
+        for layer_cutoff in set(self.layer_cutoffs):
+            n_edges = r_norm.shape[0]
+            if layer_cutoff < self.cutoff and n_inner_edges is not None:
+                n_edges = min(n_inner_edges, n_edges)
+            edge_counts[layer_cutoff] = n_edges
+            radial_bases[layer_cutoff] = (
+                bessel_basis(r_norm[:n_edges], self.radial_basis_size, layer_cutoff)
+                * polynomial_cutoff(
+                    r_norm[:n_edges],
+                    layer_cutoff,
+                    self.radial_polynomial_p,
+                )[:, None]
+            )
 
         # compute spherical harmonics of edge displacements
         sh = e3nn.spherical_harmonics(
@@ -420,10 +478,21 @@ class Nequix(eqx.Module):
             normalization="component",
         )
 
-        for layer in self.layers[:-1]:
-            features = layer(features, species, sh, radial_basis, senders, receivers)
+        def apply_layer(layer, layer_cutoff, features):
+            n_edges = edge_counts[layer_cutoff]
+            return layer(
+                features,
+                species,
+                sh[:n_edges],
+                radial_bases[layer_cutoff],
+                senders[:n_edges],
+                receivers[:n_edges],
+            )
+
+        for layer, layer_cutoff in zip(self.layers[:-1], self.layer_cutoffs[:-1]):
+            features = apply_layer(layer, layer_cutoff, features)
         penultimate_features = features
-        features = self.layers[-1](features, species, sh, radial_basis, senders, receivers)
+        features = apply_layer(self.layers[-1], self.layer_cutoffs[-1], features)
 
         node_energies = self.readout(features)
 
@@ -437,13 +506,13 @@ class Nequix(eqx.Module):
 
         return node_energies.array, penultimate_features
 
-    def __call__(self, data: jraph.GraphsTuple):
+    def __call__(self, data: jraph.GraphsTuple, n_inner_edges: Optional[int] = None):
         if data.globals["cell"] is None:
             # compute forces and stress as gradient of total energy w.r.t positions
             def total_energy_fn(positions: jax.Array):
                 r = positions[data.senders] - positions[data.receivers]
                 node_energies = self.node_energies(
-                    r, data.nodes["species"], data.senders, data.receivers
+                    r, data.nodes["species"], data.senders, data.receivers, n_inner_edges
                 )
                 return jnp.sum(node_energies), node_energies
 
@@ -466,16 +535,10 @@ class Nequix(eqx.Module):
                 cell = data.globals["cell"] + jnp.einsum(
                     "bij,bjk->bik", data.globals["cell"], eps_sym
                 )
-                cell_per_edge = jnp.repeat(
-                    cell,
-                    data.n_edge,
-                    axis=0,
-                    total_repeat_length=data.edges["shifts"].shape[0],
-                )
-                offsets = jnp.einsum("ij,ijk->ik", data.edges["shifts"], cell_per_edge)
+                offsets = jnp.einsum("ij,ijk->ik", data.edges["shifts"], _cell_per_edge(data, cell))
                 r = positions[data.senders] - positions[data.receivers] + offsets
                 node_energies = self.node_energies(
-                    r, data.nodes["species"], data.senders, data.receivers
+                    r, data.nodes["species"], data.senders, data.receivers, n_inner_edges
                 )
                 return jnp.sum(node_energies), node_energies
 
@@ -510,43 +573,48 @@ class Nequix(eqx.Module):
 
 
 class DirectForceNequix(eqx.Module):
-    """Training-only direct-force head attached to a conservative Nequix backbone.
+    """Training-only direct force and stress heads on a conservative Nequix backbone.
 
-    The force head consumes the equivariant features immediately before the
-    backbone's final scalar-only convolution. It is intentionally separate from the
-    backbone so direct-force pre-training can hand its Nequix weights to conservative
-    fine-tuning.
+    Both heads consume the equivariant features immediately before the backbone's
+    final scalar-only convolution: forces as a per-node 1o readout, stress as a
+    per-node 0e+2e readout summed per graph (a symmetric rank-2 tensor's six
+    independent components) and normalized by cell volume. They are intentionally
+    separate from the backbone so direct pre-training can hand its Nequix weights
+    to conservative fine-tuning.
     """
 
     backbone: Nequix
     force_readout: e3nn.equinox.Linear
+    stress_readout: e3nn.equinox.Linear
 
     def __init__(self, backbone: Nequix, hidden_irreps: str, *, key: jax.Array):
         if len(backbone.layers) < 2:
             raise ValueError("direct-force pre-training requires at least two model layers")
-        force_irreps = e3nn.Irreps(hidden_irreps)
-        if force_irreps.count("1o") == 0:
+        head_irreps = e3nn.Irreps(hidden_irreps)
+        if head_irreps.count("1o") == 0:
             raise ValueError("direct-force pre-training requires 1o hidden features")
+        if head_irreps.count("0e") == 0 or head_irreps.count("2e") == 0:
+            raise ValueError("direct-stress pre-training requires 0e and 2e hidden features")
 
+        force_key, stress_key = jax.random.split(key)
         self.backbone = backbone
         self.force_readout = e3nn.equinox.Linear(
-            irreps_in=force_irreps,
+            irreps_in=head_irreps,
             irreps_out="1o",
-            key=key,
+            key=force_key,
+        )
+        self.stress_readout = e3nn.equinox.Linear(
+            irreps_in=head_irreps,
+            irreps_out="0e + 2e",
+            key=stress_key,
         )
 
-    def __call__(self, data: jraph.GraphsTuple):
+    def __call__(self, data: jraph.GraphsTuple, n_inner_edges: Optional[int] = None):
         positions = data.nodes["positions"]
         displacements = positions[data.senders] - positions[data.receivers]
         if data.globals["cell"] is not None:
-            cell_per_edge = jnp.repeat(
-                data.globals["cell"],
-                data.n_edge,
-                axis=0,
-                total_repeat_length=data.edges["shifts"].shape[0],
-            )
             displacements = displacements + jnp.einsum(
-                "ij,ijk->ik", data.edges["shifts"], cell_per_edge
+                "ij,ijk->ik", data.edges["shifts"], _cell_per_edge(data, data.globals["cell"])
             )
 
         node_energies, features = self.backbone.node_energies_and_penultimate_features(
@@ -554,6 +622,7 @@ class DirectForceNequix(eqx.Module):
             data.nodes["species"],
             data.senders,
             data.receivers,
+            n_inner_edges,
         )
         forces = self.force_readout(features).array
         forces = jnp.where(jraph.get_node_padding_mask(data)[:, None], forces, 0.0)
@@ -563,7 +632,25 @@ class DirectForceNequix(eqx.Module):
             num_segments=data.n_node.shape[0],
             indices_are_sorted=True,
         )
-        return graph_energies[:, 0], forces, None
+
+        if data.globals["cell"] is None:
+            stress = None
+        else:
+            graph_virial = jraph.segment_sum(
+                self.stress_readout(features).array,
+                node_graph_idx(data),
+                num_segments=data.n_node.shape[0],
+                indices_are_sorted=True,
+            )
+            # 1o x 1o symmetric change of basis: 0e+2e components to a 3x3 tensor
+            basis = e3nn.reduced_symmetric_tensor_product_basis("1o", 2).array
+            virial = jnp.einsum("ijk,gk->gij", basis, graph_virial)
+            det = jnp.abs(jnp.linalg.det(data.globals["cell"]))[:, None, None]
+            det = jnp.where(det > 0.0, det, 1.0)  # padded graphs have det = 0
+            graph_mask = jraph.get_graph_padding_mask(data)
+            stress = jnp.where(graph_mask[:, None, None], virial / det, 0.0)
+
+        return graph_energies[:, 0], forces, stress
 
 
 class LoRALinear(eqx.Module):
@@ -794,6 +881,7 @@ def model_from_metadata(
         avg_n_neighbors=metadata.avg_n_neighbors,
         atom_energies=metadata.atom_energies,
         kernel=kernel,
+        zigzag_radii=config.zigzag_radii,
     )
 
 

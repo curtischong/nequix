@@ -1,5 +1,6 @@
 import tempfile
 
+import ase
 import cloudpickle
 import e3nn_jax as e3nn
 import equinox as eqx
@@ -23,6 +24,7 @@ from nequix.model import (
     model_from_metadata,
     replace_normalization,
     save_model,
+    sort_inner_edges_first,
     weight_decay_mask,
 )
 from nequix.train import load_training_state
@@ -96,12 +98,89 @@ def test_model():
     assert stress is None
 
 
+def test_zigzag_radii_inner_budget_matches_full_edges():
+    from nequix.data import dict_to_graphstuple, preprocess_graph
+
+    # two periodic graphs with different cells: the batch-level sort ungroups
+    # edges from graphs, so this catches any positional edge-to-graph pairing
+    systems = [
+        ase.Atoms(
+            "CH3",
+            positions=[[0, 0, 0], [1.1, 0, 0], [0, 1.2, 0.2], [2.9, 2.9, 2.9]],
+            cell=np.eye(3) * 4.5,
+            pbc=True,
+        ),
+        ase.Atoms(
+            "C2H2",
+            positions=[[0.2, 0.1, 0], [1.4, 0, 0.3], [2.6, 1.9, 0.2], [0.1, 2.4, 2.2]],
+            cell=np.eye(3) * np.array([3.4, 3.9, 3.6]),
+            pbc=True,
+        ),
+    ]
+    graphs = [
+        preprocess_graph(atoms, {1: 0, 6: 1}, cutoff=4.0, targets=False, inner_cutoff=2.5)
+        for atoms in systems
+    ]
+    n_inner = sum(int(graph["inner"].sum()) for graph in graphs)
+    n_edges = sum(int(graph["n_edge"][0]) for graph in graphs)
+    assert 0 < n_inner < n_edges
+
+    batch = jraph.batch_np([dict_to_graphstuple(graph) for graph in graphs])
+    batch = jraph.pad_with_graphs(batch, n_node=10, n_edge=n_edges + 5, n_graph=3)
+    sorted_batch = sort_inner_edges_first(batch)
+    budget = n_inner + 2
+
+    kwargs = dict(
+        n_species=2,
+        lmax=2,
+        cutoff=4.0,
+        zigzag_radii=(4.0, 2.5, 2.5),
+        hidden_irreps="8x0e+8x1o+4x2e",
+        n_layers=3,
+        radial_basis_size=4,
+        radial_mlp_size=8,
+        radial_mlp_layers=2,
+    )
+    model = Nequix(jax.random.key(0), **kwargs)
+    assert model.layer_cutoffs == (4.0, 2.5, 2.5)
+
+    # the cutoff envelope zeroes outer edges in inner layers, so the sorted
+    # batch sliced to the budget must reproduce the unsorted full-edge output
+    # on real entries
+    energy, forces, stress = model(batch)
+    sliced_energy, sliced_forces, sliced_stress = model(sorted_batch, budget)
+    np.testing.assert_allclose(energy[:2], sliced_energy[:2], rtol=1e-4)
+    np.testing.assert_allclose(forces[:8], sliced_forces[:8], rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(stress[:2], sliced_stress[:2], rtol=1e-4, atol=1e-6)
+
+    direct = DirectForceNequix(model, kwargs["hidden_irreps"], key=jax.random.key(1))
+    direct_energy, direct_forces, direct_stress = direct(batch)
+    direct_sliced_energy, direct_sliced_forces, direct_sliced_stress = direct(sorted_batch, budget)
+    np.testing.assert_allclose(direct_energy[:2], direct_sliced_energy[:2], rtol=1e-4)
+    np.testing.assert_allclose(direct_forces[:8], direct_sliced_forces[:8], rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(direct_stress[:2], direct_sliced_stress[:2], rtol=1e-4, atol=1e-6)
+
+
+def test_zigzag_metadata_round_trip_and_legacy_headers(model_metadata):
+    from dataclasses import replace
+
+    zigzag = replace(
+        model_metadata,
+        model_config=replace(model_metadata.model_config, zigzag_radii=(4.0, 2.5, 2.5)),
+    )
+    assert ModelMetadata.from_header(zigzag.to_header()) == zigzag
+
+    legacy_header = model_metadata.to_header()
+    del legacy_header["metadata"]["model_config"]["zigzag_radii"]
+    assert ModelMetadata.from_header(legacy_header) == model_metadata
+
+
 def test_direct_force_training_head_reuses_conservative_backbone():
-    hidden_irreps = "8x0e+8x1o"
+    hidden_irreps = "8x0e+8x1o+4x2e"
     backbone = Nequix(
         jax.random.key(0),
         n_species=2,
-        lmax=1,
+        lmax=2,
         hidden_irreps=hidden_irreps,
         n_layers=2,
         radial_basis_size=4,
@@ -115,8 +194,15 @@ def test_direct_force_training_head_reuses_conservative_backbone():
 
     assert energy.shape == batch.globals["energy"].shape
     assert forces.shape == batch.nodes["forces"].shape
-    assert stress is None
+    assert stress.shape == batch.globals["cell"].shape
+    # a 0e+2e readout is a symmetric tensor by construction; padded graphs are zero
+    np.testing.assert_allclose(stress, np.swapaxes(stress, 1, 2), atol=1e-6)
+    np.testing.assert_allclose(stress[1], 0.0, atol=1e-6)
     assert conservative_backbone(model) is backbone
+
+    molecular = batch._replace(globals={**batch.globals, "cell": None})
+    _, _, molecular_stress = model(molecular)
+    assert molecular_stress is None
 
 
 def test_lora():

@@ -33,6 +33,21 @@ _MP = TrainerConfig(
     n_epochs=100,
 )
 
+# Zigzag counterpart of the official ~700k-parameter MPtrj model at matched
+# parameter count (707,578 vs 707,658): the (6, 4, 4) A block tiles to
+# [6, 4, 4, 6, 4] over 5 layers, costing 3.5 full-layer equivalents of edge
+# compute vs the baseline's 4, and the width is trimmed so the count matches.
+_MP_ZIGZAG = replace(
+    _MP,
+    name="nequix-mp-1-zigzag",
+    model_config=replace(
+        _MP.model_config,
+        hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
+        n_layers=5,
+        zigzag_radii=(6.0, 4.0, 4.0),
+    ),
+)
+
 _TRAINING_BENCHMARKS = BenchmarkConfig(
     mlip_arena=MLIPArenaConfig(
         tasks=("diatomics",),
@@ -100,6 +115,53 @@ _OMAT_CURRICULUM_CONSERVATIVE = replace(
         lmax=4,
         n_layers=10,
     ),
+)
+
+# Stress-head curriculum: the direct stage trains the 0e+2e stress readout on
+# OMat's stress labels (the original direct stage set stress_weight=0, leaving
+# them unused), then hands the backbone to conservative training as usual.
+# Batch sizes from single-GPU synthetic-batch probes at the 0.97 fraction:
+# direct 512 peaks at 40.0GB and 592 graphs/s (256: 556, 1024: 599 at 75.8GB);
+# conservative keeps 240 (320 gains 1% for 73GB). cuda_async hands the pool to
+# the synchronous step-20k benchmark waves, as in the zigzag/2x runs.
+_OMAT_DIRECT_STRESS = replace(
+    _OMAT_CURRICULUM_DIRECT,
+    name="nequix-omat-foundation-direct-stress",
+    stress_weight=5.0,
+    batch_size=512,
+    allocator="cuda_async",
+)
+
+_OMAT_CONSERVATIVE_STRESS = replace(
+    _OMAT_CURRICULUM_CONSERVATIVE,
+    name="nequix-omat-foundation-conservative-stress",
+    finetune_from="checkpoints/nequix-omat-foundation-direct-stress/best.pkl",
+    allocator="cuda_async",
+)
+
+
+# Zigzag counterpart of the direct foundation run at matched parameter count:
+# the (6, 4, 4) A block over 12 layers costs 8 full-layer equivalents of edge
+# compute vs the baseline's 10, and the width is trimmed so the count matches
+# (4.78M vs 4.82M). Inner edges are ~29% of the 6 A OMat edge list (p99.9
+# per-structure ratio 0.65), so the default 0.5 inner edge budget halves the
+# eight inner layers' edge slots with headroom against truncation.
+_ZIGZAG_MODEL = replace(
+    _OMAT_CURRICULUM_DIRECT.model_config,
+    hidden_irreps="172x0e + 85x1o + 43x2e + 43x3o",
+    lmax=4,
+    n_layers=12,
+    zigzag_radii=(6.0, 4.0, 4.0),
+)
+
+# cuda_async lets the trainer hand its pool back to the synchronous benchmark
+# wave's workers (see the 2x stages); under the default BFC pool the workers
+# cannot even create CUDA contexts and the step-20k wave kills training.
+_OMAT_DIRECT_ZIGZAG = replace(
+    _OMAT_CURRICULUM_DIRECT,
+    name="nequix-omat-foundation-direct-zigzag",
+    allocator="cuda_async",
+    model_config=_ZIGZAG_MODEL,
 )
 
 # The eSEN OAM fine-tuning mix: sAlex plus eight copies of MPtrj, sampled
@@ -174,6 +236,27 @@ _OAM_FOUNDATION_ESEN_LR = replace(
     learning_rate=2e-4,
     warmup_epochs=0.1,
     warmup_factor=0.2,
+)
+
+
+# Stage three of the stress-head curriculum, on the esen-lr schedule.
+_OAM_FOUNDATION_STRESS = replace(
+    _OAM_FOUNDATION_ESEN_LR,
+    name="nequix-oam-foundation-stress",
+    finetune_from="checkpoints/nequix-omat-foundation-conservative-stress/best.pkl",
+    allocator="cuda_async",
+)
+
+
+# Zigzag post-training: conservative fine-tune on the OAM mix straight from the
+# direct zigzag checkpoint (skipping the conservative OMat stage, like the 2ep
+# 2x run), on the esen-lr schedule.
+_OAM_FOUNDATION_ZIGZAG = replace(
+    _OAM_FOUNDATION_ESEN_LR,
+    name="nequix-oam-foundation-zigzag",
+    finetune_from="checkpoints/nequix-omat-foundation-direct-zigzag/best.pkl",
+    allocator="cuda_async",
+    model_config=_ZIGZAG_MODEL,
 )
 
 
@@ -262,6 +345,19 @@ _OMAT_FOUNDATION_CONSERVATIVE_2X = replace(
     ),
 )
 
+# Zigzag-radii variant of the direct 2x OMat stage: the (6, 4, 4) A block
+# tiles across the 10 layers, so six of them convolve only edges within 4 A.
+# Inner edges are ~29% of the 6 A OMat edge list (p99.9 per-structure ratio
+# 0.65), so the default 0.5 inner edge budget halves those layers' edge slots
+# with comfortable headroom against truncation.
+_OMAT_FOUNDATION_DIRECT_2X_ZIGZAG = replace(
+    _OMAT_FOUNDATION_DIRECT_2X,
+    name="nequix-omat-foundation-direct-2x-zigzag",
+    model_config=replace(
+        _OMAT_FOUNDATION_DIRECT_2X.model_config, zigzag_radii=(6.0, 4.0, 4.0)
+    ),
+)
+
 # Stage three keeps the esen-lr schedule but runs two OAM epochs like
 # TECE-OAM-RRA.
 _OAM_FOUNDATION_2X = replace(
@@ -279,17 +375,42 @@ _OAM_FOUNDATION_2X = replace(
     ),
 )
 
+# Conservative OAM training initialized straight from the direct 2x OMat
+# checkpoint: we can't afford the conservative OMat stage, so all conservative
+# training happens on the much smaller 8x MPtrj + sAlex mix instead. The
+# fine-tuning source is the mistyped 100-epoch run's best checkpoint (~30k
+# steps at peak LR from the same direct 2x model); a resume can't fix that
+# run's schedule because resume restores the pickled optimizer, so this run
+# restarts the step counter and anneals over a fresh two-epoch cosine.
+# Validation is the repo-default 20k cadence: each pass is a ~6.3h
+# single-device sweep of the full sAlex val set, which at 10k cadence was 37%
+# of wall clock.
+_OAM_CONSERVATIVE_2EP_2X = replace(
+    _OAM_FOUNDATION_2X,
+    name="nequix-oam-conservative-2ep-2x",
+    finetune_from="checkpoints/nequix-oam-conservative-100ep-2x/best.pkl",
+    validation=ValidationConfig(every_steps=20_000),
+)
+
 RUNS: list[TrainerConfig] = [
     _MP,
+    _MP_ZIGZAG,
     _OMAT,
     _OMAT_CURRICULUM_DIRECT,
     _OMAT_CURRICULUM_CONSERVATIVE,
+    _OMAT_DIRECT_STRESS,
+    _OMAT_CONSERVATIVE_STRESS,
+    _OAM_FOUNDATION_STRESS,
+    _OMAT_DIRECT_ZIGZAG,
+    _OAM_FOUNDATION_ZIGZAG,
     _OAM,
     _OAM_FOUNDATION,
     _OAM_FOUNDATION_ESEN_LR,
     _OAM_FOUNDATION_LORA,
     _OAM_FOUNDATION_LORA_R5,
     _OMAT_FOUNDATION_DIRECT_2X,
+    _OMAT_FOUNDATION_DIRECT_2X_ZIGZAG,
     _OMAT_FOUNDATION_CONSERVATIVE_2X,
     _OAM_FOUNDATION_2X,
+    _OAM_CONSERVATIVE_2EP_2X,
 ]

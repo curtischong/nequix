@@ -9,7 +9,7 @@ microseconds of arithmetic behind milliseconds of kernel-launch and Python
 overhead. Shard it across GPUs by launching one process per device; every shard
 resumes from its own file:
 
-    CUDA_VISIBLE_DEVICES=$i uv run --python 3.12 --extra mbd \
+    CUDA_VISIBLE_DEVICES=$i uv run --python 3.12 --extra mbd --extra torch-sim \
         python scripts/eval_matbench_discovery.py relax checkpoints/model.nqx \
         --shard-index $i --num-shards 8
 
@@ -106,7 +106,7 @@ def completed_ids(out_path: Path) -> set[str]:
     }
 
 
-def make_batcher(model: Any, shard_atoms: int) -> Any:
+def make_batcher(model: Any, shard_atoms: int, memory_padding: float) -> Any:
     """One in-flight autobatcher for the whole shard, probed once.
 
     The batcher keeps the GPU full by swapping a converged system out for a
@@ -125,6 +125,10 @@ def make_batcher(model: Any, shard_atoms: int) -> Any:
         model=model,
         memory_scales_with=model.memory_scales_with,
         max_atoms_to_try=max(1, min(MAX_PROBE_ATOMS, shard_atoms)),
+        # The probe measures a fresh allocator, but hours of relaxation fragment
+        # it and the conservative model's autograd peak varies with density;
+        # without headroom whole chunks die of OOM late in a shard.
+        max_memory_padding=memory_padding,
     )
 
 
@@ -178,6 +182,9 @@ def relax_chunk(
 
 
 def run_relaxations(args: argparse.Namespace) -> None:
+    # Reduces fragmentation over a multi-hour shard; must be set before the
+    # first CUDA allocation.
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     import torch
     from matbench_discovery.data import ase_atoms_from_zip
     from matbench_discovery.enums import DataFiles
@@ -208,19 +215,26 @@ def run_relaxations(args: argparse.Namespace) -> None:
     chunks = [
         shard[start : start + CHUNK_STRUCTURES] for start in range(0, len(shard), CHUNK_STRUCTURES)
     ]
-    batcher = make_batcher(model, sum(len(atoms) for atoms in shard))
+    batcher = make_batcher(model, sum(len(atoms) for atoms in shard), args.memory_padding)
     with out_path.open("a") as out_file:
         for chunk in tqdm(chunks, desc=f"relax shard {args.shard_index + 1}/{args.num_shards}"):
             try:
                 records = relax_chunk(chunk, model, args.fmax, args.max_steps, batcher)
-            except Exception as error:  # one bad chunk must not kill a shard
-                records = [
-                    {
-                        "material_id": atoms.info["material_id"],
-                        "error": f"{type(error).__name__}: {error}",
-                    }
-                    for atoms in chunk
-                ]
+            except Exception:
+                # One pathological structure (e.g. a collapsing cell whose
+                # neighbor list outgrows memory) poisons its whole chunk;
+                # relaxing singly isolates it to its own error record.
+                records = []
+                for atoms in chunk:
+                    try:
+                        records += relax_chunk([atoms], model, args.fmax, args.max_steps, False)
+                    except Exception as error:
+                        records.append(
+                            {
+                                "material_id": atoms.info["material_id"],
+                                "error": f"{type(error).__name__}: {error}",
+                            }
+                        )
             for record in records:
                 out_file.write(json.dumps(record) + "\n")
             out_file.flush()
@@ -506,6 +520,12 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--fmax", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument(
+        "--memory-padding",
+        type=float,
+        default=0.8,
+        help="fraction of the autobatcher's probed GPU capacity to actually use",
+    )
     parser.add_argument(
         "--limit",
         type=int,

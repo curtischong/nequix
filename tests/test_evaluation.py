@@ -83,3 +83,35 @@ def test_long_md_evaluation_writes_metrics(tmp_path):
     assert np.isfinite(metrics["drift_mev_per_atom_ps"])
     saved = json.loads((tmp_path / "results.json").read_text())
     assert saved["systems"][0]["name"] == "argon"
+
+
+def test_long_md_evaluation_batched_writes_metrics(tmp_path, jax_model_path):
+    pytest.importorskip("torch_sim")
+    import torch
+
+    from nequix.evaluation import run_long_md_evaluation_batched
+    from nequix.torch_sim import NequixTorchSimModel
+
+    atoms = Atoms(
+        "Ar2", positions=[[0.0, 0.0, 0.0], [3.8, 0.0, 0.0]], cell=[8.0] * 3, pbc=True
+    )
+    config = LongMDEvalConfig(
+        output_dir=str(tmp_path),
+        steps=25,
+        time_step_fs=1.0,
+        save_frequency=1,
+        relaxation_steps=2,
+    )
+    model = NequixTorchSimModel(jax_model_path, use_kernel=False, dtype=torch.float32)
+
+    metrics = run_long_md_evaluation_batched(
+        config,
+        model,
+        systems=[("argon-a", atoms, 20.0), ("argon-b", atoms.copy(), 40.0)],
+    )
+
+    assert metrics["successful_systems"] == 2
+    assert metrics["failed_systems"] == 0
+    assert np.isfinite(metrics["drift_mev_per_atom_ps"])
+    saved = json.loads((tmp_path / "results.json").read_text())
+    assert {item["name"] for item in saved["systems"]} == {"argon-a", "argon-b"}

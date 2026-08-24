@@ -95,7 +95,7 @@ def test_parallel_loader_uses_only_complete_device_groups():
 class _ToyModel(eqx.Module):
     scale: jax.Array
 
-    def __call__(self, batch):
+    def __call__(self, batch, n_inner_edges=None):
         energy = self.scale * batch.globals["feature"]
         forces = self.scale * batch.nodes["positions"]
         return energy, forces, None

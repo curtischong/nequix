@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from pathlib import Path
 from typing import Any
 
@@ -337,6 +337,212 @@ def run_long_md_evaluation(
     return summary
 
 
+@dataclass
+class _BatchedMDSystem:
+    """One system's live integrator state inside a batched NVE rollout."""
+
+    name: str
+    atoms: Atoms  # template carrying cell/pbc/species
+    temperature_kelvin: float
+    q: np.ndarray  # positions, float64, ASE units
+    p: np.ndarray  # momenta, float64
+    masses: np.ndarray  # (n_atoms, 1)
+    converged: bool
+    forces: np.ndarray | None = None
+    potential_energy: float = 0.0
+    energies: list[float] = dataclass_field(default_factory=list)
+    times_ps: list[float] = dataclass_field(default_factory=list)
+    error: str | None = None
+
+
+def run_long_md_evaluation_batched(
+    config: LongMDEvalConfig,
+    model: Any,
+    *,
+    systems: Sequence[tuple[str, Atoms, float]] | None = None,
+) -> dict[str, float]:
+    """The eSEN NVE conservation evaluation with one forward per MD step.
+
+    The integrator is the serial path's velocity Verlet, kept per-system in
+    float64 on the host; only the force evaluation crosses systems, through a
+    ``NequixTorchSimModel`` forward over the concatenated batch. A system whose
+    state turns non-finite retires to an error row while the rest of the batch
+    keeps integrating, matching the serial path's per-system error rows.
+    """
+    import torch
+    import torch_sim as ts
+
+    steps, time_step_fs = long_md_protocol(config)
+    systems = list(systems) if systems is not None else load_long_md_systems(config)
+    if config.max_systems is not None:
+        systems = systems[: config.max_systems]
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    dt = time_step_fs * units.fs
+    dt2 = dt / 2
+
+    # batched positions-only LBFGS, standing in for the serial path's ASE LBFGS
+    relax_state = ts.optimize(
+        [atoms.copy() for _, atoms, _ in systems],
+        model=model,
+        optimizer=ts.Optimizer.lbfgs,
+        convergence_fn=ts.generate_force_convergence_fn(
+            force_tol=config.relaxation_fmax, include_cell_forces=False
+        ),
+        max_steps=config.relaxation_steps,
+    )
+    force_norms = torch.linalg.norm(relax_state.forces, dim=-1)
+    converged_per_system = [
+        bool(force_norms[relax_state.system_idx == index].max() <= config.relaxation_fmax)
+        for index in range(len(systems))
+    ]
+
+    # the shared rng draws in system order, like the serial loop
+    rng = np.random.RandomState(config.seed)
+    all_systems: list[_BatchedMDSystem] = []
+    for atoms, converged, (name, _, temperature) in zip(
+        relax_state.to_atoms(), converged_per_system, systems
+    ):
+        MaxwellBoltzmannDistribution(atoms, temperature_K=temperature, rng=rng)
+        all_systems.append(
+            _BatchedMDSystem(
+                name=name,
+                atoms=atoms,
+                temperature_kelvin=temperature,
+                q=atoms.get_positions(),
+                p=atoms.get_momenta(),
+                masses=atoms.get_masses()[:, None],
+                converged=converged,
+            )
+        )
+    live = list(all_systems)
+
+    def make_state(members: Sequence[_BatchedMDSystem]) -> Any:
+        atoms_list = []
+        for system in members:
+            atoms = system.atoms.copy()
+            atoms.set_positions(system.q)
+            atoms_list.append(atoms)
+        return ts.initialize_state(atoms_list, model.device, model.dtype)
+
+    state = make_state(live) if live else None
+
+    def evaluate() -> None:
+        """Refresh every live system's forces, retiring the non-finite ones."""
+        nonlocal state
+        retired = [
+            system
+            for system in live
+            if not (np.isfinite(system.q).all() and np.isfinite(system.p).all())
+        ]
+        for system in retired:
+            system.error = "ValueError: non-finite positions or momenta"
+            live.remove(system)
+        if not live:
+            return
+        if retired:
+            state = make_state(live)
+        state.positions = torch.as_tensor(
+            np.concatenate([system.q for system in live]),
+            dtype=model.dtype,
+            device=model.device,
+        )
+        try:
+            output = model(state)
+        except Exception as error:
+            # A whole-batch failure (an OOM, say) cannot be attributed to one
+            # system, so it fails them all rather than guessing.
+            for system in live:
+                system.error = f"{type(error).__name__}: {error}"
+            live.clear()
+            return
+        energies = output["energy"].double().cpu().numpy()
+        forces = output["forces"].double().cpu().numpy()
+        offset = 0
+        rebuild = False
+        for index, system in enumerate(list(live)):
+            count = len(system.masses)
+            system.potential_energy = float(energies[index])
+            system.forces = forces[offset : offset + count].copy()
+            offset += count
+            if not np.isfinite(system.forces).all():
+                system.error = "ValueError: non-finite forces"
+                live.remove(system)
+                rebuild = True
+        if rebuild and live:
+            state = make_state(live)
+
+    def record(step: int) -> None:
+        for system in live:
+            kinetic = float(np.sum(system.p**2 / (2.0 * system.masses)))
+            system.energies.append(
+                (system.potential_energy + kinetic) / len(system.masses)
+            )
+            system.times_ps.append(step * time_step_fs / 1000.0)
+
+    evaluate()
+    record(0)
+    for step in range(1, steps + 1):
+        if not live:
+            break
+        for system in live:
+            system.p = system.p + dt2 * system.forces
+            system.q = system.q + dt * system.p / system.masses
+        # like ASE's VelocityVerlet: one evaluation per step, at the
+        # post-drift positions
+        evaluate()
+        for system in live:
+            system.p = system.p + dt2 * system.forces
+        if step % config.save_frequency == 0:
+            record(step)
+    if live and steps % config.save_frequency:
+        record(steps)
+
+    runtime_per_system = (time.perf_counter() - started) / max(len(all_systems), 1)
+    results = []
+    for system in all_systems:
+        result: dict[str, Any] = {
+            "name": system.name,
+            "temperature_K": system.temperature_kelvin,
+            "converged": system.converged,
+            "runtime_seconds": runtime_per_system,
+        }
+        if system.error is None:
+            result["drift_mev_per_atom_ps"] = _energy_drift(system.energies, system.times_ps)
+        else:
+            result["converged"] = False
+            result["error"] = system.error
+        results.append(result)
+
+    summary = _long_md_summary(results)
+    (output_dir / "results.json").write_text(
+        json.dumps({"summary": summary, "systems": results}, indent=2, allow_nan=True)
+    )
+    return summary
+
+
+def _long_md_dispatch(
+    config: LongMDEvalConfig,
+    calculator_kwargs: dict[str, Any],
+    *,
+    systems: Sequence[tuple[str, Atoms, float]] | None = None,
+) -> dict[str, float]:
+    """Run one worker's MD systems, batched through torch-sim when configured."""
+    if config.batched:
+        import torch
+
+        from nequix.torch_sim import NequixTorchSimModel
+
+        model = NequixTorchSimModel(
+            calculator_kwargs["model_path"],
+            use_kernel=calculator_kwargs.get("use_kernel", True),
+            dtype=torch.float32,
+        )
+        return run_long_md_evaluation_batched(config, model, systems=systems)
+    return run_long_md_evaluation(config, NequixCalculator(**calculator_kwargs), systems=systems)
+
+
 def _system_cost(path: Path) -> int:
     """The atom count from an xyz header, a proxy for per-step cost."""
     with path.open() as handle:
@@ -614,7 +820,10 @@ def launch_model_evaluations(
     task_dir = arena_dir / "diatomics"
     md_dir = Path(long_md.output_dir) / f"step-{step}"
     md_config = replace(long_md, output_dir=str(md_dir))
-    md_payloads = _long_md_payloads(md_config, calculator_kwargs, slots)
+    # a batched worker rolls all of its GPU's systems in one forward per step,
+    # so MD gets one worker per GPU instead of MPS-shared slots
+    md_slots = cuda_device_ids() if long_md.batched else slots
+    md_payloads = _long_md_payloads(md_config, calculator_kwargs, md_slots)
     payloads = _diatomics_payloads(elements, calculator_kwargs, slots, task_dir) + md_payloads
     started = time.perf_counter()
     processes = _spawn_evaluation_workers(payloads, md_dir / "workers")
@@ -657,15 +866,17 @@ def run_model_evaluations(
         checkpoint = md_dir / "model.nqx"
         save_model(checkpoint, model, metadata)
         md_config = replace(long_md, output_dir=str(md_dir))
-        if len(slots) > 1:
+        md_slots = cuda_device_ids() if long_md.batched else slots
+        if len(md_slots) > 1:
             md_metrics = run_long_md_evaluation_parallel(
                 md_config,
                 calculator_kwargs={"model_path": checkpoint, "use_kernel": kernel},
-                gpus=slots,
+                gpus=md_slots,
             )
         else:
-            calculator_instance = NequixCalculator(checkpoint, use_kernel=kernel)
-            md_metrics = run_long_md_evaluation(md_config, calculator_instance)
+            md_metrics = _long_md_dispatch(
+                md_config, {"model_path": str(checkpoint), "use_kernel": kernel}
+            )
         metrics.update({f"long_md/{key}": value for key, value in md_metrics.items()})
     return metrics
 
@@ -693,7 +904,7 @@ def _worker_main(payload_path: str) -> None:
             for name, path, temperature in _long_md_specifications(config)
             if name in names
         ]
-        run_long_md_evaluation(config, NequixCalculator(**calculator_kwargs), systems=systems)
+        _long_md_dispatch(config, calculator_kwargs, systems=systems)
 
 
 if __name__ == "__main__":
