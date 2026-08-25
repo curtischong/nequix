@@ -42,7 +42,7 @@ _MP = TrainerConfig(
 
 # Zigzag counterpart of the official ~700k-parameter MPtrj model at matched
 # parameter count (707,578 vs 707,658): the (6, 4, 4) A block tiles to
-# [6, 4, 4, 6, 4] over 5 layers, costing 3.5 full-layer equivalents of edge
+# [6, 4, 4, 6, 4, 4] over 6 layers, costing 3.5 full-layer equivalents of edge
 # compute vs the baseline's 4, and the width is trimmed so the count matches.
 _MP_ZIGZAG = replace(
     _MP,
@@ -52,6 +52,17 @@ _MP_ZIGZAG = replace(
         # hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
         n_layers=6,
         zigzag_radii=(6.0, 4.0, 4.0),
+    ),
+)
+
+_MP_ZIGZAG2 = replace(
+    _MP,
+    name="nequix-mp-1-zigzag2",
+    model_config=replace(
+        _MP.model_config,
+        hidden_irreps="64x0e + 52x1o + 32x2e + 16x3o",
+        n_layers=4,
+        zigzag_radii=(6.0, 4.0),
     ),
 )
 
