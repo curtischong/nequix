@@ -565,7 +565,7 @@ def train(run_config: TrainerConfig):
         avg_n_nodes=config.avg_n_nodes,
         avg_n_edges=config.avg_n_edges,
         seed=config.seed,
-        num_workers=16,
+        num_workers=config.num_workers,
         inner_edge_fraction=inner_edge_fraction,
     )
     train_loader = ParallelLoader(per_device_train_loader, num_devices)
@@ -577,7 +577,7 @@ def train(run_config: TrainerConfig):
         max_n_edges=config.max_n_edges,
         avg_n_nodes=config.avg_n_nodes,
         avg_n_edges=config.avg_n_edges,
-        num_workers=16,
+        num_workers=config.num_workers,
         inner_edge_fraction=inner_edge_fraction,
     )
     n_graph = per_device_train_loader.n_graph

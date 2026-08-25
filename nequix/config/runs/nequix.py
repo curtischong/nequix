@@ -15,9 +15,16 @@ from nequix.config.models import (
 )
 
 
+# Batch size from single-H100 probes (real train step + real loader, GPM
+# counters): graphs/s plateaus from 384 (852) through 704 (874) while SM
+# activity sits at 87-91%; 512 is within 2% of the peak at 59.6GB of the
+# 77.3GB pool. The zigzag variant plateaus at the same point (630 graphs/s,
+# 70.3GB, 90% SM active). Four devices at 512 consume ~3400 graphs/s, more
+# than 16 loader workers produce (3024/s); 32 workers produce 3786/s.
 _MP = TrainerConfig(
     name="nequix-mp-1",
-    batch_size=64,
+    batch_size=512,
+    num_workers=32,
     train_path="data/mptrj.atp",
     valid_frac=0.05,
     dataset_name="mptrj",
@@ -42,7 +49,7 @@ _MP_ZIGZAG = replace(
     name="nequix-mp-1-zigzag",
     model_config=replace(
         _MP.model_config,
-        hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
+        # hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
         n_layers=6,
         zigzag_radii=(6.0, 4.0, 4.0),
     ),

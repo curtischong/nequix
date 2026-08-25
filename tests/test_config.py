@@ -64,7 +64,7 @@ def test_omat_foundation_curriculum_configs():
     direct = RUNS["nequix-omat-foundation-direct"]
     conservative = RUNS["nequix-omat-foundation-conservative"]
 
-    assert mp.batch_size == 64
+    assert mp.batch_size == 512
     assert omat.batch_size == 128
     assert oam.batch_size == 74
     assert omat.validation.every_steps == 20_000

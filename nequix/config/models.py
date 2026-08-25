@@ -240,6 +240,8 @@ class TrainerConfig:
     lora_rank: int | None = None
     lora_alpha: float | None = None  # defaults to 2 * lora_rank
     loss_type: str = "mae"
+    # Dataloader worker processes; one loader feeds every local device.
+    num_workers: int = 16
     log_every: int = 100
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     benchmarks: BenchmarkConfig = field(default_factory=BenchmarkConfig)
