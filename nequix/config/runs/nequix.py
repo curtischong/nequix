@@ -43,9 +43,22 @@ _MP_ZIGZAG = replace(
     model_config=replace(
         _MP.model_config,
         hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
-        n_layers=5,
+        n_layers=6,
         zigzag_radii=(6.0, 4.0, 4.0),
     ),
+)
+
+# Best trial from the one-factor-at-a-time sweep in scripts/tune_zigzag_700k.py
+# (9 trials, 2 epochs on 5% of MPtrj, seed 0). Learning rate was the only axis
+# that moved validation force MAE outside the noise: 0.03 reached 0.1292 eV/A
+# vs the base 0.01 at 0.1351 and 0.003 at 0.1455. Depth and width did not pay
+# for themselves -- 8 layers bought 0.0014 eV/A for 63% more step time and 79%
+# more parameters, and 6 layers and 1.5x width were no better than the base --
+# so both stay put and the parameter count remains matched at 707,578.
+_MP_ZIGZAG_TUNED = replace(
+    _MP_ZIGZAG,
+    name="nequix-mp-1-zigzag-tuned",
+    learning_rate=0.03,
 )
 
 _TRAINING_BENCHMARKS = BenchmarkConfig(
@@ -395,6 +408,7 @@ _OAM_CONSERVATIVE_2EP_2X = replace(
 RUNS: list[TrainerConfig] = [
     _MP,
     _MP_ZIGZAG,
+    _MP_ZIGZAG_TUNED,
     _OMAT,
     _OMAT_CURRICULUM_DIRECT,
     _OMAT_CURRICULUM_CONSERVATIVE,

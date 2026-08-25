@@ -10,6 +10,7 @@ from nequix.config import PFTTrainerConfig, RUNS, TrainerConfig, checkpoint_dir,
 EXPECTED_RUNS = {
     "nequix-mp-1": TrainerConfig,
     "nequix-mp-1-zigzag": TrainerConfig,
+    "nequix-mp-1-zigzag-tuned": TrainerConfig,
     "nequix-mp-1-pft": PFTTrainerConfig,
     "nequix-mp-1-pft-no-cotrain": PFTTrainerConfig,
     "nequix-oam-1": TrainerConfig,
