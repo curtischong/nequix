@@ -47,15 +47,33 @@ def test_data_loader_uses_ordered_jraph_dynamic_batches():
         batch_size=2,
         num_workers=0,
     )
-    loader._start_workers = lambda: None
-    loader.make_generator = lambda: iter(graphs)
 
+    assert _batch_identifiers(loader) == [[0], [1, 2], [3, 4]]
+
+
+def _batch_identifiers(loader):
     identifiers = []
     for batch in loader:
         mask = np.asarray(jraph.get_graph_padding_mask(batch))
         identifiers.append(np.asarray(batch.globals["identifier"])[mask].tolist())
+    return identifiers
 
-    assert identifiers == [[0], [1, 2], [3, 4]]
+
+def test_data_loader_workers_batch_interleaved_shards_in_order():
+    graphs = [_graph(index, n_node) for index, n_node in enumerate((6, 4, 5, 3, 2, 1, 7))]
+    loader = DataLoader(
+        graphs,
+        max_n_nodes=9,
+        max_n_edges=0,
+        avg_n_nodes=0,
+        avg_n_edges=0,
+        batch_size=2,
+        num_workers=3,
+    )
+
+    # shards [0, 3, 6], [1, 4], [2, 5] are batched independently and read round-robin
+    assert _batch_identifiers(loader) == [[0, 3], [1, 4], [2, 5], [6]]
+    loader.shutdown()
 
 
 def test_data_loader_shutdown_stops_workers():
@@ -90,6 +108,17 @@ def test_parallel_loader_uses_only_complete_device_groups():
         identifiers.extend(np.asarray(batch.globals["identifier"])[np.asarray(masks)].tolist())
 
     assert sorted(identifiers) == [0, 1]
+
+
+def test_parallel_loader_places_groups_on_devices():
+    class Loader:
+        def __iter__(self):
+            return iter([_padded([_graph(0, 1)], n_graph=2, n_node=2)])
+
+    (batch,) = list(ParallelLoader(Loader(), 1, jax.devices()[:1]))
+    assert isinstance(batch.nodes["positions"], jax.Array)
+    assert batch.nodes["positions"].shape == (1, 2, 3)
+    assert np.asarray(batch.globals["identifier"]).tolist() == [[0, 0]]
 
 
 class _ToyModel(eqx.Module):

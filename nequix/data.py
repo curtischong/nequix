@@ -1,4 +1,5 @@
 import bisect
+import mmap
 import multiprocessing
 import os
 import queue
@@ -296,12 +297,85 @@ def _check_inner_budget(batch: jraph.GraphsTuple, n_edge_inner: int) -> jraph.Gr
     return batch
 
 
-def _dataloader_worker(dataset, index_queue, output_queue):
+def _batches(
+    dataset,
+    indices: np.ndarray,
+    n_node: int,
+    n_edge: int,
+    n_graph: int,
+    n_edge_inner: int | None,
+    abort=None,
+):
+    """Dynamically batch ``dataset[indices]`` in order, stopping early once ``abort`` is set."""
+
+    def graphs():
+        for index in indices:
+            if abort is not None and abort.is_set():
+                return
+            yield dataset[index]
+
+    for batch in jraph.dynamically_batch(graphs(), n_node=n_node, n_edge=n_edge, n_graph=n_graph):
+        if n_edge_inner is not None:
+            _check_inner_budget(batch, n_edge_inner)
+        yield batch
+
+
+_SHM_DIR = Path("/dev/shm")
+_SHM_ALIGN = 64
+
+
+def _share_batch(batch: jraph.GraphsTuple, name: str) -> tuple:
+    """Write a batch's arrays into a fresh shared-memory file and return its handle."""
+    leaves, treedef = jax.tree_util.tree_flatten(batch)
+    leaves = [np.ascontiguousarray(leaf) for leaf in leaves]
+    layout = []
+    size = 0
+    for leaf in leaves:
+        layout.append((leaf.shape, leaf.dtype.str, size))
+        size += -(-leaf.nbytes // _SHM_ALIGN) * _SHM_ALIGN
+    fd = os.open(_SHM_DIR / name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.ftruncate(fd, max(size, 1))
+    shared = mmap.mmap(fd, max(size, 1))
+    os.close(fd)
+    for leaf, (shape, dtype, offset) in zip(leaves, layout):
+        if leaf.size:
+            np.frombuffer(shared, dtype=dtype, count=leaf.size, offset=offset)[...] = leaf.ravel()
+    shared.close()
+    skeleton = jax.tree_util.tree_unflatten(treedef, range(len(leaves)))
+    return name, skeleton, layout
+
+
+def _receive_batch(handle: tuple) -> jraph.GraphsTuple:
+    """Map a shared batch as zero-copy array views; the mapping lives as long as they do."""
+    name, skeleton, layout = handle
+    fd = os.open(_SHM_DIR / name, os.O_RDWR)
+    os.unlink(_SHM_DIR / name)
+    shared = mmap.mmap(fd, os.fstat(fd).st_size)
+    os.close(fd)
+    arrays = [
+        np.frombuffer(shared, dtype=dtype, count=int(np.prod(shape)), offset=offset).reshape(shape)
+        for shape, dtype, offset in layout
+    ]
+    return jax.tree_util.tree_map(lambda index: arrays[index], skeleton)
+
+
+def _discard_batch(handle: tuple) -> None:
+    os.unlink(_SHM_DIR / handle[0])
+
+
+def _dataloader_worker(
+    dataset, index_queue, output_queue, abort, n_node, n_edge, n_graph, n_edge_inner
+):
+    """Batch every shard of indices the parent sends, ending each shard with ``None``."""
+    count = 0
     while True:
-        index = index_queue.get()
-        if index is None:
+        indices = index_queue.get()
+        if indices is None:
             break
-        output_queue.put((index, dataset[index]))
+        for batch in _batches(dataset, indices, n_node, n_edge, n_graph, n_edge_inner, abort):
+            output_queue.put(_share_batch(batch, f"nequix-{os.getpid()}-{count}"))
+            count += 1
+        output_queue.put(None)
     # allow exit without flushing queued results, otherwise a mid-iteration
     # shutdown deadlocks the join on unflushed results
     output_queue.cancel_join_thread()
@@ -310,6 +384,11 @@ def _dataloader_worker(dataset, index_queue, output_queue):
 # multiprocess data loader with dynamic batching, based on
 # https://teddykoker.com/2020/12/dataloader/
 # https://github.com/google-deepmind/jraph/blob/51f5990/jraph/ogb_examples/data_utils.py
+# Each worker dynamically batches its own interleaved shard of the epoch's index
+# order and hands whole padded batches over through /dev/shm, so the parent only
+# round-robins the worker queues and maps the arrays: per-graph work in the
+# parent capped MPtrj loading at ~4.8k graphs/s however many workers fed it,
+# and pickling the padded batches through pipes at ~8.4k.
 class DataLoader:
     def __init__(
         self,
@@ -333,7 +412,6 @@ class DataLoader:
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.idxs = np.arange(len(self.dataset))
-        self.idx = 0
         self._generator = None  # created in __iter__
         self.n_node = max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes) + 1
         self.n_edge = max(batch_size * avg_n_edges * buffer_factor, max_n_edges)
@@ -344,16 +422,19 @@ class DataLoader:
         )
         self.n_graph = n_graph if n_graph is not None else batch_size + 1
         self.num_workers = num_workers
+        # batches buffered per worker
         self.prefetch_factor = prefetch_factor
 
         self._started = False
-        self.index_queue = None
-        self.output_queue = None
+        self.abort = None
+        self.index_queues = []
+        self.output_queues = []
         self.workers = []
-        self.prefetch_idx = 0
+        # workers still batching a shard whose ``None`` end marker we have not read
+        self._pending: set[int] = set()
 
     def _start_workers(self):
-        if self._started:
+        if self._started or self.num_workers == 0:
             return
 
         # Workers start once training is already iterating, by which point JAX
@@ -363,82 +444,84 @@ class DataLoader:
         # process (see __getstate__), so it pickles cheaply to each worker.
         self._started = True
         ctx = multiprocessing.get_context("forkserver")
-        self.index_queue = ctx.Queue()
-        self.output_queue = ctx.Queue()
+        self.abort = ctx.Event()
 
         for _ in range(self.num_workers):
+            index_queue = ctx.Queue()
+            output_queue = ctx.Queue(maxsize=self.prefetch_factor)
             worker = ctx.Process(
                 target=_dataloader_worker,
-                args=(self.dataset, self.index_queue, self.output_queue),
+                args=(
+                    self.dataset,
+                    index_queue,
+                    output_queue,
+                    self.abort,
+                    self.n_node,
+                    self.n_edge,
+                    self.n_graph,
+                    self.n_edge_inner,
+                ),
             )
             worker.daemon = True
             worker.start()
+            self.index_queues.append(index_queue)
+            self.output_queues.append(output_queue)
             self.workers.append(worker)
+
+    def _drain_pending(self):
+        """Abort and discard the shards of an epoch that was not iterated to its end."""
+        if not self._pending:
+            return
+        self.abort.set()
+        for worker in self._pending:
+            while (handle := self.output_queues[worker].get()) is not None:
+                _discard_batch(handle)
+        self._pending = set()
+        self.abort.clear()
 
     def shutdown(self):
         if not self._started:
             return
-        for _ in self.workers:
-            self.index_queue.put(None)
+        self._drain_pending()
+        for index_queue in self.index_queues:
+            index_queue.put(None)
         for worker in self.workers:
             worker.join()
-        self.index_queue.close()
-        self.output_queue.close()
-        self.workers = []
+        for q in (*self.index_queues, *self.output_queues):
+            q.close()
+        self.index_queues, self.output_queues, self.workers = [], [], []
         self._started = False
 
     def set_epoch(self, epoch):
         self.rng = np.random.default_rng(seed=hash((self.seed, epoch)) % 2**32)
 
-    def _prefetch(self):
-        prefetch_limit = self.idx + self.prefetch_factor * self.num_workers * self.batch_size
-        while self.prefetch_idx < len(self.dataset) and self.prefetch_idx < prefetch_limit:
-            self.index_queue.put(self.idxs[self.prefetch_idx])
-            self.prefetch_idx += 1
-
     def make_generator(self):
-        cache = {}
-        self.prefetch_idx = 0
+        if self.num_workers == 0:
+            yield from _batches(
+                self.dataset, self.idxs, self.n_node, self.n_edge, self.n_graph, self.n_edge_inner
+            )
+            return
 
-        while True:
-            if self.idx >= len(self.dataset):
-                return
+        self._drain_pending()
+        for worker, index_queue in enumerate(self.index_queues):
+            index_queue.put(self.idxs[worker :: self.num_workers])
+        self._pending = set(range(self.num_workers))
 
-            self._prefetch()
-
-            real_idx = self.idxs[self.idx]
-
-            if real_idx in cache:
-                item = cache[real_idx]
-                del cache[real_idx]
-            else:
-                while True:
-                    (index, data) = self.output_queue.get()
-                    if index == real_idx:
-                        item = data
-                        break
-                    else:
-                        cache[index] = data
-
-            yield item
-            self.idx += 1
+        active = list(range(self.num_workers))
+        while active:
+            for worker in list(active):
+                handle = self.output_queues[worker].get()
+                if handle is None:
+                    active.remove(worker)
+                    self._pending.discard(worker)
+                else:
+                    yield _receive_batch(handle)
 
     def __iter__(self):
         self._start_workers()
-        self.idx = 0
         if self.shuffle:
             self.idxs = self.rng.permutation(np.arange(len(self.dataset)))
-        self._generator = jraph.dynamically_batch(
-            self.make_generator(),
-            n_node=self.n_node,
-            n_edge=self.n_edge,
-            n_graph=self.n_graph,
-        )
-        if self.n_edge_inner is not None:
-            batches = self._generator
-            self._generator = (
-                _check_inner_budget(batch, self.n_edge_inner) for batch in batches
-            )
+        self._generator = self.make_generator()
         return self
 
     def __next__(self):
@@ -446,17 +529,32 @@ class DataLoader:
 
 
 class ParallelLoader:
-    def __init__(self, loader: DataLoader, n: int):
+    """Group consecutive batches into one per-device stacked batch.
+
+    With ``devices`` the group is placed on them directly (``device_put_sharded``),
+    so the host-to-device copy happens wherever the loader is iterated (the
+    prefetch thread) instead of inside the training step's dispatch, and the
+    per-device arrays are never stacked on the host.
+    """
+
+    def __init__(self, loader: DataLoader, n: int, devices: list | None = None):
         self.loader = loader
         self.n = n
+        self.devices = devices
+        if devices is not None and len(devices) != n:
+            raise ValueError(f"{len(devices)} devices for {n} batches per step")
 
     def __iter__(self):
         it = iter(self.loader)
         while True:
             try:
-                yield jax.tree.map(lambda *x: np.stack(x), *[next(it) for _ in range(self.n)])
+                batches = [next(it) for _ in range(self.n)]
             except StopIteration:
                 return
+            if self.devices is None:
+                yield jax.tree.map(lambda *x: np.stack(x), *batches)
+            else:
+                yield jax.device_put_sharded(batches, self.devices)
 
 
 # simple threaded prefetching for dataloader (lets us build our dyanamic batches async)

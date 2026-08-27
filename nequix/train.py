@@ -568,7 +568,7 @@ def train(run_config: TrainerConfig):
         num_workers=config.num_workers,
         inner_edge_fraction=inner_edge_fraction,
     )
-    train_loader = ParallelLoader(per_device_train_loader, num_devices)
+    train_loader = ParallelLoader(per_device_train_loader, num_devices, jax.devices())
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,

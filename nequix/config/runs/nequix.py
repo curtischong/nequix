@@ -47,6 +47,7 @@ _MP = TrainerConfig(
 _MP_ZIGZAG = replace(
     _MP,
     name="nequix-mp-1-zigzag",
+    batch_size=512,  # this is for 4 GPUs.
     model_config=replace(
         _MP.model_config,
         # hidden_irreps="104x0e + 52x1o + 26x2e + 26x3o",
@@ -55,9 +56,18 @@ _MP_ZIGZAG = replace(
     ),
 )
 
+# Smaller (383k) two-radius zigzag on all 8 GPUs. Single-H100 probes (real
+# train step + loader, GPM counters) show graphs/s flat from 512 (1215, 37GB)
+# to 1152 (1286, 73.8GB; 1280 OOMs), so the smallest plateau batch keeps the
+# most optimizer steps at the same LR. Eight devices at 512 want ~9700
+# graphs/s; the loader that batched in the parent process capped at ~4.8k
+# however many workers fed it, worker-side batching pickled through pipes at
+# 8.4k, and the /dev/shm hand-off delivers 17k at 16 workers and 34k at 32.
 _MP_ZIGZAG2 = replace(
     _MP,
     name="nequix-mp-1-zigzag2",
+    batch_size=512,
+    num_workers=32,
     model_config=replace(
         _MP.model_config,
         hidden_irreps="64x0e + 52x1o + 32x2e + 16x3o",
@@ -426,6 +436,7 @@ _OAM_CONSERVATIVE_2EP_2X = replace(
 RUNS: list[TrainerConfig] = [
     _MP,
     _MP_ZIGZAG,
+    _MP_ZIGZAG2,
     _MP_ZIGZAG_TUNED,
     _OMAT,
     _OMAT_CURRICULUM_DIRECT,
