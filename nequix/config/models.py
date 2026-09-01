@@ -24,7 +24,7 @@ def load_atom_energies(name: str) -> dict[int, float]:
 
 MP_ATOM_ENERGIES = load_atom_energies("mp")
 OMAT_ATOM_ENERGIES = load_atom_energies("omat")
-OAM_ATOM_ENERGIES = load_atom_energies("oam")
+OAM_ATOM_ENERGIES = load_atom_energies("mptrj_salex")
 
 
 @dataclass

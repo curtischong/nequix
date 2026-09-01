@@ -117,7 +117,11 @@ def main() -> None:
         nargs="+",
         help='atompack file(s), each optionally "path.atp:REPEAT" (e.g. data/mptrj.atp:8)',
     )
-    parser.add_argument("--atom-energies", required=True, help="atom energies name: mp, omat, oam")
+    parser.add_argument(
+        "--atom-energies",
+        required=True,
+        help="atom energies name: a file stem in nequix/config/atom_energies (e.g. mp, omat, mptrj_salex)",
+    )
     parser.add_argument("--cutoff", type=float, default=5.0)
     parser.add_argument(
         "--sample-frac",

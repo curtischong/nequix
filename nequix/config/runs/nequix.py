@@ -213,9 +213,10 @@ OAM_TRAIN_PATHS = ("data/mptrj.atp",) * 8 + ("data/salex/train.atp",)
 
 # Stats for the 8x MPtrj + sAlex mix from
 # scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp
-# --atom-energies oam --cutoff 6.0 --sample-frac 0.005; the script's
+# --atom-energies mptrj_salex --cutoff 6.0 --sample-frac 0.005; the script's
 # default cutoff is 5.0, not the model's 6.0. The cutoff-independent
-# shift/scale/node stats come from the full-dataset run. Sampled runs
+# shift/scale/node stats come from the full-dataset run, with shift being the
+# mix-weighted mean residual of the mptrj_salex least-squares fit. Sampled runs
 # underestimate max_n_*; MPtrj is in the mix, so its full-dataset max at
 # this cutoff is a floor.
 _OAM_MIX_STATS = dict(
@@ -224,7 +225,7 @@ _OAM_MIX_STATS = dict(
     avg_n_nodes=21.74594045063158,
     max_n_edges=34704,
     max_n_nodes=444,
-    shift=-4.089559490159454,
+    shift=0.09007828628698575,
     scale=0.7653674612006598,
 )
 
@@ -394,9 +395,7 @@ _OMAT_FOUNDATION_CONSERVATIVE_2X = replace(
 _OMAT_FOUNDATION_DIRECT_2X_ZIGZAG = replace(
     _OMAT_FOUNDATION_DIRECT_2X,
     name="nequix-omat-foundation-direct-2x-zigzag",
-    model_config=replace(
-        _OMAT_FOUNDATION_DIRECT_2X.model_config, zigzag_radii=(6.0, 4.0, 4.0)
-    ),
+    model_config=replace(_OMAT_FOUNDATION_DIRECT_2X.model_config, zigzag_radii=(6.0, 4.0, 4.0)),
 )
 
 # Stage three keeps the esen-lr schedule but runs two OAM epochs like

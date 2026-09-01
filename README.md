@@ -380,7 +380,7 @@ mirror `train_path`) and copy the output into the config:
 
 ```bash
 uv run python scripts/compute_dataset_stats.py data/mptrj.atp:8 data/salex/train.atp \
-    --atom-energies oam --sample-frac 0.05
+    --atom-energies mptrj_salex --sample-frac 0.05
 ```
 
 Then run the fine-tune:
