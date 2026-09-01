@@ -1,18 +1,21 @@
-import multiprocessing
-from abc import ABC, abstractmethod
-import queue
 import bisect
+import mmap
+import multiprocessing
+import os
+import queue
 import threading
+from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Callable
 
 import ase
-import ase.db
+from atompack import Database
 from ase.geometry import complete_cell
+from ase.stress import voigt_6_to_full_3x3_stress
 import jax
 import jraph
 import matscipy.neighbours
 import numpy as np
-import yaml
 from tqdm import tqdm
 
 
@@ -21,10 +24,11 @@ def preprocess_graph(
     atom_indices: dict[int, int],
     cutoff: float,
     targets: bool,
+    inner_cutoff: float | None = None,
 ) -> dict:
     cell = complete_cell(atoms.cell)  # avoids singular cell
-    src, dst, shift = matscipy.neighbours.neighbour_list(
-        "ijS", positions=atoms.positions, cell=cell, pbc=atoms.pbc, cutoff=cutoff
+    src, dst, distance, shift = matscipy.neighbours.neighbour_list(
+        "ijdS", positions=atoms.positions, cell=cell, pbc=atoms.pbc, cutoff=cutoff
     )
     graph_dict = {
         "n_node": np.array([len(atoms)]).astype(np.int32),
@@ -36,6 +40,8 @@ def preprocess_graph(
         "shifts": shift.astype(np.float32),
         "cell": atoms.cell.astype(np.float32) if atoms.pbc.all() else None,
     }
+    if inner_cutoff is not None:
+        graph_dict["inner"] = distance < inner_cutoff
     if targets:
         graph_dict["forces"] = atoms.get_forces().astype(np.float32)
         graph_dict["energy"] = np.array([atoms.get_potential_energy()]).astype(np.float32)
@@ -105,7 +111,8 @@ def dict_to_graphstuple(graph_dict: dict):
             "positions": graph_dict["positions"],
             "forces": graph_dict["forces"] if "forces" in graph_dict else None,
         },
-        edges={"shifts": graph_dict["shifts"]},
+        edges={"shifts": graph_dict["shifts"]}
+        | ({"inner": graph_dict["inner"]} if "inner" in graph_dict else {}),
         senders=graph_dict["senders"],
         receivers=graph_dict["receivers"],
         globals={
@@ -144,6 +151,21 @@ class Dataset(ABC):
         n_tr = int(round(n * (1 - valid_frac)))
         return IndexDataset(self, perm[:n_tr]), IndexDataset(self, perm[n_tr:])
 
+    def subset(self, fraction: float, seed: int = 0):
+        """Return a deterministic random fraction of this dataset."""
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"dataset fraction must be in (0, 1], got {fraction}")
+        if fraction == 1.0:
+            return self
+
+        size = int(len(self) * fraction)
+        if size == 0:
+            raise ValueError(
+                f"dataset fraction {fraction} selects no items from a dataset of size {len(self)}"
+            )
+        indices = np.random.default_rng(seed).permutation(len(self))[:size]
+        return IndexDataset(self, indices)
+
 
 class IndexDataset(Dataset):
     def __init__(self, base: Dataset, indices: np.ndarray):
@@ -173,50 +195,200 @@ class ConcatDataset(Dataset):
         return self.datasets[ds_idx]._get_graph_dict(idx)
 
 
-# aselmdb dataset for loading omat/omal/odac/salex databases from fairchem
-# based on https://github.com/facebookresearch/fairchem/blob/ccc1416/src/fairchem/core/datasets/ase_datasets.py#L382
-class AseDBDataset(Dataset):
+class AtomPackDataset(Dataset):
+    """Random-access AtomPack dataset, reopened independently in each worker process."""
+
     def __init__(
-        self, file_path: str, atomic_numbers: list[int], cutoff: float = 5.0, backend: str = "jax"
+        self,
+        file_path: str,
+        atomic_numbers: list[int],
+        cutoff: float = 5.0,
+        backend: str = "jax",
+        inner_cutoff: float | None = None,
     ):
         super().__init__(backend=backend)
         self.atomic_indices = atomic_numbers_to_indices(atomic_numbers)
         self.file_path = Path(file_path)
         self.cutoff = cutoff
-        if self.file_path.is_dir():
-            files = sorted(self.file_path.rglob("*.aselmdb"))
-            self.dbs = [ase.db.connect(fp, readonly=True, use_lock_file=False) for fp in files]
-        else:
-            self.dbs = [ase.db.connect(file_path, readonly=True, use_lock_file=False)]
-        self.db_ids = [db.ids for db in self.dbs]
-        self.id_cumulative = np.cumsum([len(ids) for ids in self.db_ids])
+        self.inner_cutoff = inner_cutoff
+        database = Database.open(str(self.file_path))
+        self._length = len(database)
+        del database
+        self._database = None
+        self._database_pid = None
 
     def __len__(self):
-        return self.id_cumulative[-1]
+        return self._length
 
-    def _get_graph_dict(self, idx: int):
-        db_idx = bisect.bisect(self.id_cumulative, idx)
-        if db_idx > 0:
-            idx = idx - self.id_cumulative[db_idx - 1]
-        atoms = self.dbs[db_idx]._get_row(self.db_ids[db_idx][idx]).toatoms()
-        graph = preprocess_graph(atoms, self.atomic_indices, self.cutoff, True)
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_database"] = None
+        state["_database_pid"] = None
+        return state
+
+    def _get_database(self):
+        pid = os.getpid()
+        if self._database is None or self._database_pid != pid:
+            self._database = Database.open(str(self.file_path))
+            self._database_pid = pid
+        return self._database
+
+    def _get_molecule(self, idx: int):
+        return self._get_database().get_molecule(idx)
+
+    def _molecule_to_graph_dict(self, molecule, idx: int):
+        if molecule.energy is None or molecule.forces is None:
+            raise ValueError(
+                f"AtomPack training record {idx} in {self.file_path} must contain energy and forces"
+            )
+
+        positions = np.asarray(molecule.positions)
+        atomic_numbers = np.asarray(molecule.atomic_numbers)
+        pbc = np.asarray(molecule.pbc if molecule.pbc is not None else (False, False, False))
+        raw_cell = np.asarray(molecule.cell) if molecule.cell is not None else np.zeros((3, 3))
+        cell = complete_cell(raw_cell)
+        src, dst, distance, shift = matscipy.neighbours.neighbour_list(
+            "ijdS", positions=positions, cell=cell, pbc=pbc, cutoff=self.cutoff
+        )
+
+        stress = molecule.stress
+        if stress is not None:
+            stress = np.asarray(stress)
+            if stress.shape == (6,):
+                stress = voigt_6_to_full_3x3_stress(stress)
+
+        graph = {
+            "n_node": np.array([len(atomic_numbers)], dtype=np.int32),
+            "n_edge": np.array([len(src)], dtype=np.int32),
+            "senders": dst.astype(np.int32),
+            "receivers": src.astype(np.int32),
+            "species": np.array(
+                [self.atomic_indices[int(number)] for number in atomic_numbers], dtype=np.int32
+            ),
+            "positions": positions.astype(np.float32),
+            "shifts": shift.astype(np.float32),
+            "cell": raw_cell.astype(np.float32) if pbc.all() else None,
+            "forces": np.asarray(molecule.forces, dtype=np.float32),
+            "energy": np.array([molecule.energy], dtype=np.float32),
+        }
+        if self.inner_cutoff is not None:
+            graph["inner"] = distance < self.inner_cutoff
+        if stress is not None:
+            graph["stress"] = stress.astype(np.float32)
         return graph
 
+    def _get_graph_dict(self, idx: int):
+        return self._molecule_to_graph_dict(self._get_molecule(idx), idx)
 
-def _dataloader_worker(dataset, index_queue, output_queue):
+
+def _check_inner_budget(batch: jraph.GraphsTuple, n_edge_inner: int) -> jraph.GraphsTuple:
+    """Warn when a batch's inner edges overflow the inner edge budget.
+
+    The model sorts inner edges first on device (``sort_inner_edges_first``) and
+    truncates the overflow out of the inner layers (those edges keep their
+    outer-layer contributions); the warning signals the budget should grow.
+    """
+    n_inner = int(batch.edges["inner"].sum())
+    if n_inner > n_edge_inner:
+        print(
+            f"WARNING: {n_inner} inner edges exceed the {n_edge_inner} edge budget; "
+            "increase inner_edge_fraction"
+        )
+    return batch
+
+
+def _batches(
+    dataset,
+    indices: np.ndarray,
+    n_node: int,
+    n_edge: int,
+    n_graph: int,
+    n_edge_inner: int | None,
+    abort=None,
+):
+    """Dynamically batch ``dataset[indices]`` in order, stopping early once ``abort`` is set."""
+
+    def graphs():
+        for index in indices:
+            if abort is not None and abort.is_set():
+                return
+            yield dataset[index]
+
+    for batch in jraph.dynamically_batch(graphs(), n_node=n_node, n_edge=n_edge, n_graph=n_graph):
+        if n_edge_inner is not None:
+            _check_inner_budget(batch, n_edge_inner)
+        yield batch
+
+
+_SHM_DIR = Path("/dev/shm")
+_SHM_ALIGN = 64
+
+
+def _share_batch(batch: jraph.GraphsTuple, name: str) -> tuple:
+    """Write a batch's arrays into a fresh shared-memory file and return its handle."""
+    leaves, treedef = jax.tree_util.tree_flatten(batch)
+    leaves = [np.ascontiguousarray(leaf) for leaf in leaves]
+    layout = []
+    size = 0
+    for leaf in leaves:
+        layout.append((leaf.shape, leaf.dtype.str, size))
+        size += -(-leaf.nbytes // _SHM_ALIGN) * _SHM_ALIGN
+    fd = os.open(_SHM_DIR / name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.ftruncate(fd, max(size, 1))
+    shared = mmap.mmap(fd, max(size, 1))
+    os.close(fd)
+    for leaf, (shape, dtype, offset) in zip(leaves, layout):
+        if leaf.size:
+            np.frombuffer(shared, dtype=dtype, count=leaf.size, offset=offset)[...] = leaf.ravel()
+    shared.close()
+    skeleton = jax.tree_util.tree_unflatten(treedef, range(len(leaves)))
+    return name, skeleton, layout
+
+
+def _receive_batch(handle: tuple) -> jraph.GraphsTuple:
+    """Map a shared batch as zero-copy array views; the mapping lives as long as they do."""
+    name, skeleton, layout = handle
+    fd = os.open(_SHM_DIR / name, os.O_RDWR)
+    os.unlink(_SHM_DIR / name)
+    shared = mmap.mmap(fd, os.fstat(fd).st_size)
+    os.close(fd)
+    arrays = [
+        np.frombuffer(shared, dtype=dtype, count=int(np.prod(shape)), offset=offset).reshape(shape)
+        for shape, dtype, offset in layout
+    ]
+    return jax.tree_util.tree_map(lambda index: arrays[index], skeleton)
+
+
+def _discard_batch(handle: tuple) -> None:
+    os.unlink(_SHM_DIR / handle[0])
+
+
+def _dataloader_worker(
+    dataset, index_queue, output_queue, abort, n_node, n_edge, n_graph, n_edge_inner
+):
+    """Batch every shard of indices the parent sends, ending each shard with ``None``."""
+    count = 0
     while True:
-        try:
-            index = index_queue.get(timeout=0)
-        except queue.Empty:
-            continue
-        if index is None:
+        indices = index_queue.get()
+        if indices is None:
             break
-        output_queue.put((index, dataset[index]))
+        for batch in _batches(dataset, indices, n_node, n_edge, n_graph, n_edge_inner, abort):
+            output_queue.put(_share_batch(batch, f"nequix-{os.getpid()}-{count}"))
+            count += 1
+        output_queue.put(None)
+    # allow exit without flushing queued results, otherwise a mid-iteration
+    # shutdown deadlocks the join on unflushed results
+    output_queue.cancel_join_thread()
 
 
 # multiprocess data loader with dynamic batching, based on
 # https://teddykoker.com/2020/12/dataloader/
 # https://github.com/google-deepmind/jraph/blob/51f5990/jraph/ogb_examples/data_utils.py
+# Each worker dynamically batches its own interleaved shard of the epoch's index
+# order and hands whole padded batches over through /dev/shm, so the parent only
+# round-robins the worker queues and maps the arrays: per-graph work in the
+# parent capped MPtrj loading at ~4.8k graphs/s however many workers fed it,
+# and pickling the padded batches through pipes at ~8.4k.
 class DataLoader:
     def __init__(
         self,
@@ -232,6 +404,7 @@ class DataLoader:
         buffer_factor=1.1,
         num_workers=4,
         prefetch_factor=2,
+        inner_edge_fraction: float | None = None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -239,91 +412,116 @@ class DataLoader:
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.idxs = np.arange(len(self.dataset))
-        self.idx = 0
         self._generator = None  # created in __iter__
         self.n_node = max(batch_size * avg_n_nodes * buffer_factor, max_n_nodes) + 1
         self.n_edge = max(batch_size * avg_n_edges * buffer_factor, max_n_edges)
+        self.n_edge_inner = (
+            int(round(self.n_edge * inner_edge_fraction))
+            if inner_edge_fraction is not None
+            else None
+        )
         self.n_graph = n_graph if n_graph is not None else batch_size + 1
         self.num_workers = num_workers
+        # batches buffered per worker
         self.prefetch_factor = prefetch_factor
 
         self._started = False
-        self.index_queue = None
-        self.output_queue = None
+        self.abort = None
+        self.index_queues = []
+        self.output_queues = []
         self.workers = []
-        self.prefetch_idx = 0
+        # workers still batching a shard whose ``None`` end marker we have not read
+        self._pending: set[int] = set()
 
     def _start_workers(self):
-        if self._started:
+        if self._started or self.num_workers == 0:
             return
 
-        # NB: we can use fork here, only because we are not using jax
-        # in the workers (data is just numpy arrays)
-        # multiprocessing.set_start_method("spawn", force=True)
+        # Workers start once training is already iterating, by which point JAX
+        # has initialized its multithreaded runtime. Forking that runtime
+        # deadlocks the workers (and the parent) on inherited locks, so fork
+        # from a clean forkserver instead. The dataset reopens its database per
+        # process (see __getstate__), so it pickles cheaply to each worker.
         self._started = True
-        self.index_queue = multiprocessing.Queue()
-        self.output_queue = multiprocessing.Queue()
+        ctx = multiprocessing.get_context("forkserver")
+        self.abort = ctx.Event()
 
         for _ in range(self.num_workers):
-            worker = multiprocessing.Process(
+            index_queue = ctx.Queue()
+            output_queue = ctx.Queue(maxsize=self.prefetch_factor)
+            worker = ctx.Process(
                 target=_dataloader_worker,
-                args=(self.dataset, self.index_queue, self.output_queue),
+                args=(
+                    self.dataset,
+                    index_queue,
+                    output_queue,
+                    self.abort,
+                    self.n_node,
+                    self.n_edge,
+                    self.n_graph,
+                    self.n_edge_inner,
+                ),
             )
             worker.daemon = True
             worker.start()
+            self.index_queues.append(index_queue)
+            self.output_queues.append(output_queue)
             self.workers.append(worker)
+
+    def _drain_pending(self):
+        """Abort and discard the shards of an epoch that was not iterated to its end."""
+        if not self._pending:
+            return
+        self.abort.set()
+        for worker in self._pending:
+            while (handle := self.output_queues[worker].get()) is not None:
+                _discard_batch(handle)
+        self._pending = set()
+        self.abort.clear()
+
+    def shutdown(self):
+        if not self._started:
+            return
+        self._drain_pending()
+        for index_queue in self.index_queues:
+            index_queue.put(None)
+        for worker in self.workers:
+            worker.join()
+        for q in (*self.index_queues, *self.output_queues):
+            q.close()
+        self.index_queues, self.output_queues, self.workers = [], [], []
+        self._started = False
 
     def set_epoch(self, epoch):
         self.rng = np.random.default_rng(seed=hash((self.seed, epoch)) % 2**32)
 
-    def _prefetch(self):
-        prefetch_limit = self.idx + self.prefetch_factor * self.num_workers * self.batch_size
-        while self.prefetch_idx < len(self.dataset) and self.prefetch_idx < prefetch_limit:
-            self.index_queue.put(self.idxs[self.prefetch_idx])
-            self.prefetch_idx += 1
-
     def make_generator(self):
-        cache = {}
-        self.prefetch_idx = 0
+        if self.num_workers == 0:
+            yield from _batches(
+                self.dataset, self.idxs, self.n_node, self.n_edge, self.n_graph, self.n_edge_inner
+            )
+            return
 
-        while True:
-            if self.idx >= len(self.dataset):
-                return
+        self._drain_pending()
+        for worker, index_queue in enumerate(self.index_queues):
+            index_queue.put(self.idxs[worker :: self.num_workers])
+        self._pending = set(range(self.num_workers))
 
-            self._prefetch()
-
-            real_idx = self.idxs[self.idx]
-
-            if real_idx in cache:
-                item = cache[real_idx]
-                del cache[real_idx]
-            else:
-                while True:
-                    try:
-                        (index, data) = self.output_queue.get(timeout=0)
-                    except queue.Empty:
-                        continue
-
-                    if index == real_idx:
-                        item = data
-                        break
-                    else:
-                        cache[index] = data
-
-            yield item
-            self.idx += 1
+        active = list(range(self.num_workers))
+        while active:
+            for worker in list(active):
+                handle = self.output_queues[worker].get()
+                if handle is None:
+                    active.remove(worker)
+                    self._pending.discard(worker)
+                else:
+                    yield _receive_batch(handle)
 
     def __iter__(self):
         self._start_workers()
-        self.idx = 0
         if self.shuffle:
             self.idxs = self.rng.permutation(np.arange(len(self.dataset)))
-        self._generator = jraph.dynamically_batch(
-            self.make_generator(),
-            n_node=self.n_node,
-            n_edge=self.n_edge,
-            n_graph=self.n_graph,
-        )
+        self._generator = self.make_generator()
         return self
 
     def __next__(self):
@@ -331,17 +529,32 @@ class DataLoader:
 
 
 class ParallelLoader:
-    def __init__(self, loader: DataLoader, n: int):
+    """Group consecutive batches into one per-device stacked batch.
+
+    With ``devices`` the group is placed on them directly (``device_put_sharded``),
+    so the host-to-device copy happens wherever the loader is iterated (the
+    prefetch thread) instead of inside the training step's dispatch, and the
+    per-device arrays are never stacked on the host.
+    """
+
+    def __init__(self, loader: DataLoader, n: int, devices: list | None = None):
         self.loader = loader
         self.n = n
+        self.devices = devices
+        if devices is not None and len(devices) != n:
+            raise ValueError(f"{len(devices)} devices for {n} batches per step")
 
     def __iter__(self):
         it = iter(self.loader)
         while True:
             try:
-                yield jax.tree.map(lambda *x: np.stack(x), *[next(it) for _ in range(self.n)])
+                batches = [next(it) for _ in range(self.n)]
             except StopIteration:
                 return
+            if self.devices is None:
+                yield jax.tree.map(lambda *x: np.stack(x), *batches)
+            else:
+                yield jax.device_put_sharded(batches, self.devices)
 
 
 # simple threaded prefetching for dataloader (lets us build our dyanamic batches async)
@@ -384,90 +597,36 @@ def prefetch(loader, queue_size=4):
         thread.join(timeout=1.0)
 
 
-# based on https://github.com/ACEsuit/mace/blob/d39cc6b/mace/data/utils.py#L300
-def average_atom_energies(dataset: Dataset) -> list[float]:
-    """Compute the average energy of each species in the dataset."""
-    atomic_indices = dataset.atomic_indices
-    A = np.zeros((len(dataset), len(atomic_indices)), dtype=np.float32)
-    B = np.zeros((len(dataset),), dtype=np.float32)
-    for i, graph in tqdm(enumerate(dataset), total=len(dataset)):
-        A[i] = np.bincount(graph.nodes["species"], minlength=len(atomic_indices))
-        B[i] = graph.globals["energy"][0]
-    E0s = np.linalg.lstsq(A, B, rcond=None)[0].tolist()
-    idx_to_atomic_number = {v: k for k, v in atomic_indices.items()}
-    atom_energies = {idx_to_atomic_number[i]: e0 for i, e0 in enumerate(E0s)}
-    print("computed energies, add to config yml file to avoid recomputing:")
-    print(yaml.dump({"atom_energies": atom_energies}))
-    return E0s
+def write_atompack_database(
+    input_path: str | Path,
+    output_path: str | Path,
+    glob_pattern: str,
+    read_molecules: Callable,
+    n_workers: int = 16,
+):
+    """Convert input files into one AtomPack database, in parallel across files.
 
+    ``read_molecules`` must be a picklable top-level function that maps one input
+    file path to a list of AtomPack molecules.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if output_path.suffix != ".atp":
+        raise ValueError(f"AtomPack output path must end in .atp: {output_path}")
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1")
 
-def dataset_stats(dataset: Dataset, atom_energies: list[float], num_workers: int = 16) -> dict:
-    """Compute the statistics of the dataset."""
-    atom_energies = np.array(atom_energies)
-    num_graphs = len(dataset)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_paths = sorted(input_path.rglob(glob_pattern)) if input_path.is_dir() else [input_path]
+    if not file_paths:
+        raise ValueError(f"no {glob_pattern} files found in {input_path}")
 
-    sum_energy_per_atom = 0.0
-    sum_force_sq = 0.0
-    num_force_components = 0
-    sum_neighbors = 0.0
-    sum_nodes = 0
-    sum_edges = 0
-    max_nodes = 0
-    max_edges = 0
-
-    # use DataLoader so we can parallelize workers to compute stats
-    loader = DataLoader(
-        dataset,
-        max_n_nodes=1,
-        max_n_edges=1,
-        avg_n_nodes=1,
-        avg_n_edges=1,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=1,
-    )
-    loader._start_workers()
-    loader.idx = 0
-    iterator = loader.make_generator()
-
-    try:
-        for graph in tqdm(prefetch(iterator), total=num_graphs):
-            n_node = int(np.asarray(graph.n_node).item())
-            n_edge = int(np.asarray(graph.n_edge).item())
-
-            sum_nodes += n_node
-            sum_edges += n_edge
-            if n_node > max_nodes:
-                max_nodes = n_node
-            if n_edge > max_edges:
-                max_edges = n_edge
-
-            graph_e0 = np.sum(atom_energies[graph.nodes["species"]])
-            energy_per_atom = float((graph.globals["energy"][0] - graph_e0) / n_node)
-            sum_energy_per_atom += energy_per_atom
-            sum_force_sq += float(np.sum(graph.nodes["forces"] ** 2))
-            num_force_components += graph.nodes["forces"].size
-            sum_neighbors += n_edge / n_node
-    finally:
-        for _ in loader.workers:
-            loader.index_queue.put(None)
-        for w in loader.workers:
-            w.join(timeout=1.0)
-
-    mean = sum_energy_per_atom / num_graphs
-    rms = float(np.sqrt(sum_force_sq / num_force_components))
-    avg_n_neighbors = sum_neighbors / num_graphs
-
-    stats = {
-        "shift": float(mean),
-        "scale": float(rms),
-        "avg_n_neighbors": float(avg_n_neighbors),
-        "avg_n_nodes": float(sum_nodes / num_graphs),
-        "avg_n_edges": float(sum_edges / num_graphs),
-        "max_n_nodes": int(max_nodes),
-        "max_n_edges": int(max_edges),
-    }
-    print("computed dataset statistics, add to config yml file to avoid recomputing:")
-    print(yaml.dump(stats))
-    return stats
+    database = Database(str(output_path), overwrite=True)
+    if n_workers == 1 or len(file_paths) == 1:
+        for molecules in tqdm(map(read_molecules, file_paths), total=len(file_paths)):
+            database.add_molecules(molecules)
+    else:
+        with multiprocessing.Pool(min(n_workers, len(file_paths))) as pool:
+            for molecules in tqdm(pool.imap(read_molecules, file_paths), total=len(file_paths)):
+                database.add_molecules(molecules)
+    database.flush()

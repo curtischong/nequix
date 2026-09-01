@@ -14,19 +14,15 @@ from nequix.data import atomic_numbers_to_indices, dict_to_graphstuple, preproce
 from nequix.model import load_model
 
 
-def load_nequix_mp_1():
-    model, config = load_model("models/nequix-mp-1.nqx")
-    return eqx.filter_jit(model), config
-
-
 @pytest.mark.skipif(not jax.default_backend() == "gpu", reason="gpu not available")
 @pytest.mark.benchmark(warmup=True, warmup_iterations=4, min_rounds=8)
 @pytest.mark.parametrize("size", (1, 2, 3, 4, 5, 6, 7))
 # @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("dtype", ["float32"])
-def test_inference(benchmark, size: int, dtype: str):
-    model, config = load_nequix_mp_1()
-    batch = create_batch(size, config)
+def test_inference(benchmark, jax_model_path, size: int, dtype: str):
+    model, metadata = load_model(jax_model_path)
+    model = eqx.filter_jit(model)
+    batch = create_batch(size, metadata)
     log_bench_info(benchmark, dtype, batch, model)
 
     def run_benchmark():
@@ -45,17 +41,16 @@ def test_inference(benchmark, size: int, dtype: str):
         run_benchmark()
 
 
-def create_batch(size: int, config: dict) -> jraph.GraphsTuple:
+def create_batch(size: int, metadata) -> jraph.GraphsTuple:
     atoms = ase.build.bulk("C", "diamond", a=3.567, cubic=True)
     atoms = atoms.repeat((size, size, size))
 
-    # TODO: extract from model
-    atomic_indices = atomic_numbers_to_indices(config["atomic_numbers"])
-    cutoff = config["cutoff"]
+    atomic_indices = atomic_numbers_to_indices(metadata.atomic_numbers)
+    cutoff = metadata.model_config.cutoff
 
     graph = preprocess_graph(atoms, atomic_indices, cutoff, targets=False)
     graph = dict_to_graphstuple(graph)
-    batch = jraph.pad_with_graphs(graph, n_node=graph.n_node + 1, n_edge=graph.n_edge)
+    batch = jraph.pad_with_graphs(graph, n_node=int(graph.n_node[0]) + 1, n_edge=int(graph.n_edge[0]))
     return batch
 
 

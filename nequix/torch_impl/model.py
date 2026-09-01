@@ -1,5 +1,5 @@
-import json
 import math
+from pathlib import Path
 from typing import Callable, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -9,6 +9,7 @@ from e3nn import o3
 from e3nn.util.jit import compile_mode
 
 from nequix.torch_impl.layer_norm import RMSLayerNorm
+from nequix.config import ModelMetadata, layer_cutoffs
 
 
 def _broadcast(src: torch.Tensor, other: torch.Tensor, dim: int):
@@ -507,10 +508,14 @@ class NequixTorch(torch.nn.Module):
         atom_energies: Optional[Sequence[float]] = None,
         layer_norm: bool = False,
         kernel: bool = False,
+        zigzag_radii: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.lmax = lmax
         self.cutoff = cutoff
+        self.layer_cutoffs = layer_cutoffs(
+            cutoff, n_layers, tuple(zigzag_radii) if zigzag_radii is not None else None
+        )
         self.n_species = n_species
         self.radial_basis_size = radial_basis_size
         self.radial_polynomial_p = radial_polynomial_p
@@ -539,7 +544,9 @@ class NequixTorch(torch.nn.Module):
                     radial_mlp_size=radial_mlp_size,
                     radial_mlp_layers=radial_mlp_layers,
                     mlp_init_scale=mlp_init_scale,
-                    avg_n_neighbors=avg_n_neighbors,
+                    # neighbor counts scale with the enclosed volume, so inner
+                    # layers normalize by a cubically smaller estimate
+                    avg_n_neighbors=avg_n_neighbors * (self.layer_cutoffs[i] / cutoff) ** 3,
                     index_weights=index_weights,
                     layer_norm=layer_norm,
                     kernel=kernel,
@@ -561,14 +568,17 @@ class NequixTorch(torch.nn.Module):
         features = torch.nn.functional.one_hot(species, self.n_species).to(displacements.dtype)
         r_norm = torch.linalg.norm(displacements, ord=2, dim=-1)
 
-        radial_basis = (
-            bessel_basis(r_norm, self.radial_basis_size, self.cutoff)
+        # edges beyond a layer's cutoff contribute zero through its envelope,
+        # so every layer can share the full neighbor list
+        radial_bases = {
+            layer_cutoff: bessel_basis(r_norm, self.radial_basis_size, layer_cutoff)
             * polynomial_cutoff(
                 r_norm,
-                self.cutoff,
+                layer_cutoff,
                 self.radial_polynomial_p,
             )[:, None]
-        )
+            for layer_cutoff in set(self.layer_cutoffs)
+        }
 
         # compute spherical harmonics of edge displacements
         sh = o3.spherical_harmonics(
@@ -578,12 +588,12 @@ class NequixTorch(torch.nn.Module):
             normalization="component",
         )
 
-        for layer in self.layers:
+        for layer, layer_cutoff in zip(self.layers, self.layer_cutoffs):
             features = layer(
                 features,
                 species,
                 sh,
-                radial_basis,
+                radial_bases[layer_cutoff],
                 senders,
                 receivers,
             )
@@ -654,70 +664,70 @@ class NequixTorch(torch.nn.Module):
         return node_energies[:, 0], -minus_forces, stress
 
 
-def get_optimizer_param_groups(model, weight_decay):
-    decay_params = []
-    no_decay_params = []
+def save_model(path: str | Path, model: torch.nn.Module, metadata: ModelMetadata) -> None:
+    """Save model weights with the current strict metadata schema."""
+    import json
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue  # Skip frozen parameters
-
-        # Apply weight decay to weights of Linear layers only
-        # Exclude biases and all LayerNorm/BatchNorm parameters
-        if "bias" in name:
-            no_decay_params.append(param)
-        # weight does o3.Linear and weights does MLP
-        elif "weight" or "weights" in name:
-            # Linear layer weights
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
-
-    param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-    return param_groups
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_dict = {key: value for key, value in model.state_dict().items() if ".tp." not in key}
+    with path.open("wb") as f:
+        f.write((json.dumps(metadata.to_header()) + "\n").encode())
+        torch.save(state_dict, f)
 
 
-def save_model(path: str, model: torch.nn.Module, config: dict):
-    """Save a model and its config to a file."""
-    with open(path, "wb") as f:
-        config_str = json.dumps(config)
-        f.write((config_str + "\n").encode())
-        torch.save(model.state_dict(), f)
+def model_from_metadata(metadata: ModelMetadata, kernel: bool = False) -> NequixTorch:
+    """Construct an unfitted NequixTorch with the architecture a metadata header describes."""
+    config = metadata.model_config
+    return NequixTorch(
+        n_species=len(metadata.atomic_numbers),
+        hidden_irreps=config.hidden_irreps,
+        lmax=config.lmax,
+        cutoff=config.cutoff,
+        n_layers=config.n_layers,
+        radial_basis_size=config.radial_basis_size,
+        radial_mlp_size=config.radial_mlp_size,
+        radial_mlp_layers=config.radial_mlp_layers,
+        radial_polynomial_p=config.radial_polynomial_p,
+        mlp_init_scale=config.mlp_init_scale,
+        index_weights=config.index_weights,
+        layer_norm=config.layer_norm,
+        shift=metadata.shift,
+        scale=metadata.scale,
+        avg_n_neighbors=metadata.avg_n_neighbors,
+        atom_energies=metadata.atom_energies,
+        kernel=kernel,
+        zigzag_radii=config.zigzag_radii,
+    )
 
 
-def load_model(path: str, use_kernel=False) -> tuple[NequixTorch, dict]:
-    """Load a model and its config from a file."""
+def load_model(
+    path: str | Path, use_kernel: bool = False
+) -> tuple[NequixTorch, ModelMetadata]:
+    """Load weights written with the current Nequix model format."""
+    import json
+
     with open(path, "rb") as f:
-        config = json.loads(f.readline().decode())
-        model = NequixTorch(
-            n_species=len(config["atomic_numbers"]),
-            hidden_irreps=config["hidden_irreps"],
-            lmax=config["lmax"],
-            cutoff=config["cutoff"],
-            n_layers=config["n_layers"],
-            radial_basis_size=config["radial_basis_size"],
-            radial_mlp_size=config["radial_mlp_size"],
-            radial_mlp_layers=config["radial_mlp_layers"],
-            radial_polynomial_p=config["radial_polynomial_p"],
-            mlp_init_scale=config["mlp_init_scale"],
-            index_weights=config["index_weights"],
-            layer_norm=config["layer_norm"],
-            shift=config["shift"],
-            scale=config["scale"],
-            avg_n_neighbors=config["avg_n_neighbors"],
-            atom_energies=[config["atom_energies"][str(n)] for n in config["atomic_numbers"]],
-            kernel=use_kernel,
-        )
-        state_dict = torch.load(f, map_location="cpu")
+        try:
+            metadata = ModelMetadata.from_header(json.loads(f.readline().decode()))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid Nequix model header") from error
+        model = model_from_metadata(metadata, use_kernel)
+        state_dict = torch.load(f, map_location="cpu", weights_only=True)
+        if not isinstance(state_dict, dict):
+            raise ValueError("invalid Nequix Torch state dictionary")
 
         # filter out tp weights since these can be recomputed, and aren't used
         # in the kernel version
-        state_dict = {k: v for k, v in state_dict.items() if ".tp." not in k}
-        # allow missing .tp. weights for the non kernel version
-        model.load_state_dict(state_dict, strict=False)
+        complete_state = model.state_dict()
+        expected_keys = {key for key in complete_state if ".tp." not in key}
+        if set(state_dict) != expected_keys:
+            missing = sorted(expected_keys - set(state_dict))
+            unexpected = sorted(set(state_dict) - expected_keys)
+            raise ValueError(
+                f"invalid Nequix Torch weights; missing={missing}, unexpected={unexpected}"
+            )
+        complete_state.update(state_dict)
+        model.load_state_dict(complete_state, strict=True)
 
-        return model, config
+        return model, metadata

@@ -1,35 +1,25 @@
-import multiprocessing
 import argparse
-from pathlib import Path
 
-import ase.db
 import ase.io
-import numpy as np
-from tqdm import tqdm
+from atompack import from_ase
+
+from nequix.data import write_atompack_database
 
 
-def save_atoms_to_ase_db(args):
-    db_file, file_list, worker_id = args
-    with ase.db.connect(db_file) as db:
-        for file in tqdm(file_list, position=worker_id):
-            atoms_list = ase.io.read(file, index=":")
-            for atoms in atoms_list:
-                db.write(atoms, data=atoms.info)
+def read_molecules(file_path):
+    atoms_list = ase.io.read(file_path, index=":")
+    molecules = [from_ase(atoms, copy_info=False, copy_arrays=False) for atoms in atoms_list]
+    # Magnetic moments are not training targets, and ASE represents them as a
+    # scalar for one-atom structures but an array otherwise. AtomPack requires
+    # one schema per property, so discard this unused, shape-varying result.
+    for molecule in molecules:
+        if molecule.has_property("magmoms"):
+            molecule.delete_property("magmoms")
+    return molecules
 
 
 def preprocess(file_path, output_path, n_workers=16):
-    file_path = Path(file_path)
-    output_path = Path(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
-    if file_path.is_dir():
-        file_paths = sorted(file_path.rglob("*.extxyz"))
-        chunks = np.array_split(file_paths, n_workers)
-        db_files = [output_path / f"data_{i:04d}.aselmdb" for i in range(n_workers)]
-        tasks = [(db_files[i], chunks[i], i) for i in range(n_workers) if len(chunks[i])]
-        with multiprocessing.Pool(n_workers) as p:
-            p.map(save_atoms_to_ase_db, tasks)
-    else:
-        save_atoms_to_ase_db((output_path / "data_0000.aselmdb", [file_path], 0))
+    write_atompack_database(file_path, output_path, "*.extxyz", read_molecules, n_workers)
 
 
 def main():

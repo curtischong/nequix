@@ -1,0 +1,445 @@
+entries:
+  5ed046e62851407038344d845e071211e18d466245b6da7abe3bc94af33c874b:
+    metadata:
+      dataset: omat24
+      dataset_size: 100824585
+      memory_limit_gb: 40.0
+      probe_samples: 300000
+      run: nequix-omat-1
+    probes:
+    - edge_utilization: 0.03719806763285024
+      edges_per_second: 15041.665327927703
+      error: null
+      final_loss: 58.81661605834961
+      graph_utilization: 1.0
+      graphs_per_second: 22.58356865293093
+      node_utilization: 0.059322033898305086
+      nodes_per_second: 289.43453446397484
+      peak_memory_bytes: 1064320768
+      shape:
+        batch_size: 1
+        n_edge: 17940
+        n_graph: 2
+        n_node: 237
+      status: ok
+      timed_graphs_per_second:
+      - 21.799514968011163
+      - 22.58356865293093
+      - 24.11954453866457
+    - edge_utilization: 0.05956893348197696
+      edges_per_second: 23096.027055275063
+      error: null
+      final_loss: 44.21949768066406
+      graph_utilization: 1.0
+      graphs_per_second: 45.596827804004384
+      node_utilization: 0.1016949152542373
+      nodes_per_second: 547.1619336480526
+      peak_memory_bytes: 1064320256
+      shape:
+        batch_size: 2
+        n_edge: 17940
+        n_graph: 3
+        n_node: 237
+      status: ok
+      timed_graphs_per_second:
+      - 32.310242314971035
+      - 45.596827804004384
+      - 47.03875164007141
+    - edge_utilization: 0.08376068376068375
+      edges_per_second: 31944.13418798957
+      error: null
+      final_loss: 38.2775993347168
+      graph_utilization: 1.0
+      graphs_per_second: 67.0185425517152
+      node_utilization: 0.13559322033898305
+      nodes_per_second: 616.4267025036221
+      peak_memory_bytes: 1064320512
+      shape:
+        batch_size: 3
+        n_edge: 17940
+        n_graph: 4
+        n_node: 237
+      status: ok
+      timed_graphs_per_second:
+      - 51.368891875301834
+      - 69.14314759305101
+      - 67.0185425517152
+    - edge_utilization: 0.12954292084726868
+      edges_per_second: 56149.40977297135
+      error: null
+      final_loss: 45.085018157958984
+      graph_utilization: 1.0
+      graphs_per_second: 119.18347724258115
+      node_utilization: 0.16101694915254236
+      nodes_per_second: 858.5079252733732
+      peak_memory_bytes: 1064320256
+      shape:
+        batch_size: 5
+        n_edge: 17940
+        n_graph: 6
+        n_node: 237
+      status: ok
+      timed_graphs_per_second:
+      - 109.8384385230269
+      - 119.18347724258115
+      - 119.23721184352405
+    - edge_utilization: 0.16417688591601634
+      edges_per_second: 70984.5295592247
+      error: null
+      final_loss: 45.6214599609375
+      graph_utilization: 1.0
+      graphs_per_second: 192.76179106374664
+      node_utilization: 0.2542372881355932
+      nodes_per_second: 1445.7134329781
+      peak_memory_bytes: 1064319488
+      shape:
+        batch_size: 8
+        n_edge: 17940
+        n_graph: 9
+        n_node: 237
+      status: ok
+      timed_graphs_per_second:
+      - 179.14930984444842
+      - 192.76179106374664
+      - 198.83999226300523
+    - edge_utilization: 0.2773318468970643
+      edges_per_second: 99421.53575231519
+      error: null
+      final_loss: 54.23371124267578
+      graph_utilization: 1.0
+      graphs_per_second: 277.594494153801
+      node_utilization: 0.38202247191011235
+      nodes_per_second: 1942.8528427618012
+      peak_memory_bytes: 1072992256
+      shape:
+        batch_size: 13
+        n_edge: 17940
+        n_graph: 14
+        n_node: 268
+      status: ok
+      timed_graphs_per_second:
+      - 221.55339435002998
+      - 290.5800473017021
+      - 277.594494153801
+    - edge_utilization: 0.4878112225938313
+      edges_per_second: 181737.90208752823
+      error: null
+      final_loss: 40.61014175415039
+      graph_utilization: 1.0
+      graphs_per_second: 461.7101311200209
+      node_utilization: 0.4245939675174014
+      nodes_per_second: 3691.0772080496595
+      peak_memory_bytes: 1109160960
+      shape:
+        batch_size: 21
+        n_edge: 17940
+        n_graph: 22
+        n_node: 432
+      status: ok
+      timed_graphs_per_second:
+      - 430.6256742724603
+      - 461.7101311200209
+      - 483.49203315707956
+    - edge_utilization: 0.4511349191937534
+      edges_per_second: 255118.84184647325
+      error: null
+      final_loss: 38.61448287963867
+      graph_utilization: 1.0
+      graphs_per_second: 689.0677085171664
+      node_utilization: 0.41117478510028654
+      nodes_per_second: 5916.318890325802
+      peak_memory_bytes: 1699821824
+      shape:
+        batch_size: 34
+        n_edge: 27535
+        n_graph: 35
+        n_node: 699
+      status: ok
+      timed_graphs_per_second:
+      - 668.8779001755228
+      - 689.0677085171664
+      - 761.950160117717
+    - edge_utilization: 0.28930760084148904
+      edges_per_second: 176147.24902717758
+      error: null
+      final_loss: 50.81694030761719
+      graph_utilization: 1.0
+      graphs_per_second: 892.6380862863729
+      node_utilization: 0.27742711151187255
+      nodes_per_second: 4907.1121059637435
+      peak_memory_bytes: 2687426816
+      shape:
+        batch_size: 54
+        n_edge: 43732
+        n_graph: 55
+        n_node: 1110
+      status: ok
+      timed_graphs_per_second:
+      - 852.0634441726925
+      - 901.3063051770141
+      - 892.6380862863729
+    - edge_utilization: 0.39675315041088155
+      edges_per_second: 390779.2275150699
+      error: null
+      final_loss: 39.04388427734375
+      graph_utilization: 1.0
+      graphs_per_second: 1095.3332105565482
+      node_utilization: 0.318430484814186
+      nodes_per_second: 7756.487502662068
+      peak_memory_bytes: 4263695872
+      shape:
+        batch_size: 86
+        n_edge: 69647
+        n_graph: 87
+        n_node: 1768
+      status: ok
+      timed_graphs_per_second:
+      - 1065.8122305771678
+      - 1127.7419921129454
+      - 1095.3332105565482
+    - edge_utilization: 0.4674540682414698
+      edges_per_second: 522511.78308812995
+      error: null
+      final_loss: 33.79868698120117
+      graph_utilization: 1.0
+      graphs_per_second: 1322.1839897711957
+      node_utilization: 0.35696649029982364
+      nodes_per_second: 9571.46236073496
+      peak_memory_bytes: 6849127168
+      shape:
+        batch_size: 138
+        n_edge: 111760
+        n_graph: 139
+        n_node: 2836
+      status: ok
+      timed_graphs_per_second:
+      - 1322.1839897711957
+      - 1316.8742334405408
+      - 1342.9889367739079
+    - edge_utilization: 0.4150654546064063
+      edges_per_second: 554531.3191527926
+      error: null
+      final_loss: 33.51372528076172
+      graph_utilization: 1.0
+      graphs_per_second: 1515.1483269763114
+      node_utilization: 0.32768112750495487
+      nodes_per_second: 10253.542629745785
+      peak_memory_bytes: 10894898176
+      shape:
+        batch_size: 221
+        n_edge: 178979
+        n_graph: 222
+        n_node: 4542
+      status: ok
+      timed_graphs_per_second:
+      - 1473.3634077853178
+      - 1544.1430712470803
+      - 1515.1483269763114
+    - edge_utilization: 0.24787749834315811
+      edges_per_second: 302324.81128034135
+      error: null
+      final_loss: 38.00373458862305
+      graph_utilization: 1.0
+      graphs_per_second: 1565.5892161643262
+      node_utilization: 0.24232425992118045
+      nodes_per_second: 7827.946080821631
+      peak_memory_bytes: 17423862016
+      shape:
+        batch_size: 354
+        n_edge: 286690
+        n_graph: 355
+        n_node: 7275
+      status: ok
+      timed_graphs_per_second:
+      - 1551.4091991891726
+      - 1619.8423368130898
+      - 1565.5892161643262
+    - edge_utilization: 0.24066349608039908
+      edges_per_second: 342068.041451843
+      error: null
+      final_loss: 46.72711944580078
+      graph_utilization: 1.0
+      graphs_per_second: 1736.8221420397863
+      node_utilization: 0.2394463072822629
+      nodes_per_second: 8328.35406886154
+      peak_memory_bytes: 27889225728
+      shape:
+        batch_size: 566
+        n_edge: 458380
+        n_graph: 567
+        n_node: 11632
+      status: ok
+      timed_graphs_per_second:
+      - 1665.670813772308
+      - 1736.8221420397863
+      - 1737.5373795534495
+    - edge_utilization: 0.0
+      edges_per_second: 0.0
+      error: "Traceback (most recent call last):\n  File \"/data/curtis/dev/nequix/nequix/autobatch_probe.py\"\
+        , line 136, in main\n    result = run_probe(payload[\"config\"], payload[\"\
+        train_dataset\"], shape)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\
+        \  File \"/data/curtis/dev/nequix/nequix/autobatch_probe.py\", line 83, in\
+        \ run_probe\n    train_step(model, ema_model, step, opt_state, batches[index\
+        \ % len(batches)])\n  File \"/data/curtis/dev/nequix/.venv/lib/python3.12/site-packages/equinox/_vmap_pmap.py\"\
+        , line 502, in __call__\n    return self._call(False, args, kwargs)\n    \
+        \       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/curtis/dev/nequix/.venv/lib/python3.12/site-packages/equinox/_module/_prebuilt.py\"\
+        , line 33, in __call__\n    return self.__func__(self.__self__, *args, **kwargs)\n\
+        \           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/curtis/dev/nequix/.venv/lib/python3.12/site-packages/equinox/_vmap_pmap.py\"\
+        , line 498, in _call\n    out = cached(dynamic)\n          ^^^^^^^^^^^^^^^\n\
+        jaxlib.xla_extension.XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory while\
+        \ trying to allocate 40055093160 bytes.\n--------------------\nFor simplicity,\
+        \ JAX has removed its internal frames from the traceback of the following\
+        \ exception. Set JAX_TRACEBACK_FILTERING=off to include these.\n"
+      final_loss: null
+      graph_utilization: 0.0
+      graphs_per_second: 0.0
+      node_utilization: 0.0
+      nodes_per_second: 0.0
+      peak_memory_bytes: 0
+      shape:
+        batch_size: 906
+        n_edge: 733733
+        n_graph: 907
+        n_node: 18619
+      status: oom
+      timed_graphs_per_second: []
+    - edge_utilization: 0.24289491748477846
+      edges_per_second: 344822.86096056434
+      error: null
+      final_loss: 46.57653045654297
+      graph_utilization: 1.0
+      graphs_per_second: 1746.3621974216667
+      node_utilization: 0.23971506323035058
+      nodes_per_second: 8731.810987108332
+      peak_memory_bytes: 29909596672
+      shape:
+        batch_size: 608
+        n_edge: 492394
+        n_graph: 609
+        n_node: 12495
+      status: ok
+      timed_graphs_per_second:
+      - 1731.356544762686
+      - 1746.3621974216667
+      - 1756.3231922930647
+    - edge_utilization: 0.2864140956239481
+      edges_per_second: 344542.32019322156
+      error: null
+      final_loss: 42.72496795654297
+      graph_utilization: 1.0
+      graphs_per_second: 1744.7691277267702
+      node_utilization: 0.2879104998255843
+      nodes_per_second: 8723.845638633851
+      peak_memory_bytes: 32094545664
+      shape:
+        batch_size: 651
+        n_edge: 527218
+        n_graph: 652
+        n_node: 13379
+      status: ok
+      timed_graphs_per_second:
+      - 1752.9502703460241
+      - 1744.7691277267702
+      - 1735.2814315240419
+    - edge_utilization: 0.2848982239074037
+      edges_per_second: 369668.912277046
+      error: null
+      final_loss: 39.721435546875
+      graph_utilization: 1.0
+      graphs_per_second: 1770.201951804545
+      node_utilization: 0.2875032184069471
+      nodes_per_second: 8851.009759022725
+      peak_memory_bytes: 34141165568
+      shape:
+        batch_size: 693
+        n_edge: 561232
+        n_graph: 694
+        n_node: 14242
+      status: ok
+      timed_graphs_per_second:
+      - 1762.3141326582067
+      - 1770.201951804545
+      - 1811.6873064140034
+    - edge_utilization: 0.27676034913945446
+      edges_per_second: 364176.8513927472
+      error: null
+      final_loss: 38.010398864746094
+      graph_utilization: 1.0
+      graphs_per_second: 1794.0987985775903
+      node_utilization: 0.2849334391254518
+      nodes_per_second: 9093.795382605309
+      peak_memory_bytes: 36198868992
+      shape:
+        batch_size: 736
+        n_edge: 596056
+        n_graph: 737
+        n_node: 15125
+      status: ok
+      timed_graphs_per_second:
+      - 1794.0987985775903
+      - 1818.759076521062
+      - 1786.466336314212
+    - edge_utilization: 0.2721238294308631
+      edges_per_second: 343087.0067342631
+      error: null
+      final_loss: 40.15308380126953
+      graph_utilization: 1.0
+      graphs_per_second: 1779.4613294399517
+      node_utilization: 0.2834625969477108
+      nodes_per_second: 9158.050338145971
+      peak_memory_bytes: 37956713728
+      shape:
+        batch_size: 778
+        n_edge: 630071
+        n_graph: 779
+        n_node: 15989
+      status: ok
+      timed_graphs_per_second:
+      - 1763.6287974684612
+      - 1793.684822344432
+      - 1779.4613294399517
+    - edge_utilization: 0.2739710781401575
+      edges_per_second: 367911.8685882366
+      error: null
+      final_loss: 39.29929733276367
+      graph_utilization: 1.0
+      graphs_per_second: 1800.3507302054065
+      node_utilization: 0.2804022681919665
+      nodes_per_second: 9001.753651027033
+      peak_memory_bytes: 38035284736
+      shape:
+        batch_size: 821
+        n_edge: 664895
+        n_graph: 822
+        n_node: 16872
+      status: ok
+      timed_graphs_per_second:
+      - 1800.3507302054065
+      - 1846.7127809268718
+      - 1775.4130331240103
+    - edge_utilization: 0.2736989603319841
+      edges_per_second: 363119.3912814812
+      error: null
+      final_loss: 40.54924392700195
+      graph_utilization: 1.0
+      graphs_per_second: 1770.7636021693975
+      node_utilization: 0.27386188489154545
+      nodes_per_second: 8853.818010846988
+      peak_memory_bytes: 38322920192
+      shape:
+        batch_size: 863
+        n_edge: 698909
+        n_graph: 864
+        n_node: 17735
+      status: ok
+      timed_graphs_per_second:
+      - 1770.7636021693975
+      - 1796.7923678187801
+      - 1751.2276692519056
+    shape:
+      batch_size: 821
+      n_edge: 664895
+      n_graph: 822
+      n_node: 16872
+    warning: null
+schema: 4

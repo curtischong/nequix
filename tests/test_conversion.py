@@ -1,5 +1,3 @@
-import tempfile
-
 import numpy as np
 import torch
 
@@ -12,25 +10,28 @@ from tests.test_model import dummy_graph as dummy_graph_jax
 from tests.torch_impl.test_model_torch import dummy_graph as dummy_graph_torch
 
 
-def test_conversion():
-    jax_model, jax_config = load_model_jax("./models/nequix-mp-1.nqx")
-    torch_model, torch_config = convert_model_jax_to_torch(jax_model, jax_config, use_kernel=False)
-
-    tmp_file_torch = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-    save_model_torch(tmp_file_torch.name, torch_model, torch_config)
-
-    torch_model_loaded, torch_config_loaded = load_model_torch(tmp_file_torch.name)
-    jax_model_converted, jax_config_converted = convert_model_torch_to_jax(
-        torch_model_loaded, torch_config_loaded, use_kernel=False
+def test_conversion(jax_model_path, tmp_path):
+    jax_model, metadata = load_model_jax(jax_model_path)
+    torch_model, torch_metadata = convert_model_jax_to_torch(
+        jax_model, metadata, use_kernel=False
     )
 
-    tmp_file_jax = tempfile.NamedTemporaryFile(suffix=".nqx", delete=False)
-    save_model_jax(tmp_file_jax.name, jax_model_converted, jax_config_converted)
+    torch_path = tmp_path / "converted.pt"
+    save_model_torch(torch_path, torch_model, torch_metadata)
 
-    jax_model_loaded, jax_config_loaded = load_model_jax(tmp_file_jax.name)
-    torch_model_converted, torch_config_converted = convert_model_jax_to_torch(
-        jax_model_converted, jax_config_converted, use_kernel=False
+    torch_model_loaded, torch_metadata_loaded = load_model_torch(torch_path)
+    jax_model_converted, jax_metadata_converted = convert_model_torch_to_jax(
+        torch_model_loaded, torch_metadata_loaded, use_kernel=False
     )
+
+    jax_path = tmp_path / "converted.nqx"
+    save_model_jax(jax_path, jax_model_converted, jax_metadata_converted)
+
+    jax_model_loaded, jax_metadata_loaded = load_model_jax(jax_path)
+    torch_model_converted, torch_metadata_converted = convert_model_jax_to_torch(
+        jax_model_loaded, jax_metadata_loaded, use_kernel=False
+    )
+    assert torch_metadata_converted == metadata
 
     graph_jax = dummy_graph_jax()
 

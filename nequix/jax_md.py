@@ -27,7 +27,7 @@ def nequix_neighbor_list(
     Args:
       displacement_fn: Displacement function from ``jax_md.space``.
       box: Box matrix with columns as lattice vectors, shape ``(dim, dim)``.
-      model: Pre-trained nequix model with ``cutoff`` and ``node_energies`` attributes.
+      model: Trained nequix model with ``cutoff`` and ``node_energies`` attributes.
         Typically obtained from ``nequix.calculator.NequixCalculator(...).model``.
       species: Species indices, shape ``(N,)``.
       neighbor_list_fn: Neighbor list constructor. Defaults to ``custom_partition.neighbor_list_multi_image``
